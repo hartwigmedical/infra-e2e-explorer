@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 import { ChevronRight, History } from "lucide-react";
+import { toast } from "sonner";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
 import StatusBadge from "~/components/StatusBadge";
 import StatusMark from "~/components/StatusMark";
@@ -10,6 +11,7 @@ import TagFilter from "~/components/TagFilter";
 import { statusKindFromRunToken, statusKindFromScenario, statusLabel } from "~/lib/status";
 import { scenarioHistoryPath } from "~/lib/format";
 import { cn } from "~/lib/utils";
+import { fireCelebration } from "~/lib/celebrate";
 
 interface RunRow {
   run_id: string;
@@ -18,6 +20,11 @@ interface RunRow {
   failed_count: number | null;
   total_count: number | null;
   is_nightly: boolean;
+  /** run_id of the newest run in the currently-loaded `runs` table (folded
+   *  into this query as a scalar subquery - see the celebration effect
+   *  below). The window `runs` is materialized from is always anchored at
+   *  "now", so it always contains the actual newest run. */
+  newest_run_id: string | null;
 }
 
 interface ScenarioRow {
@@ -289,7 +296,8 @@ export default function RunDetail() {
     error: runError,
   } = useE2eQuery<RunRow>(
     runId
-      ? `SELECT run_id, run_time, status_token, failed_count, total_count, is_nightly
+      ? `SELECT run_id, run_time, status_token, failed_count, total_count, is_nightly,
+                (SELECT max(run_id) FROM runs) AS newest_run_id
          FROM runs WHERE run_id = ${runIdLit}`
       : null,
     [runId]
@@ -418,6 +426,24 @@ export default function RunDetail() {
 
   const run = runRows[0];
   const combinedError = dataError ?? runError ?? scenariosError;
+
+  // Fire a celebration when this run is BOTH the newest run loaded AND a
+  // success. Not persisted anywhere - a fresh mount (e.g. a page refresh)
+  // celebrates again by design. `celebratedRef` only guards against firing
+  // twice within the same mount (React strict-mode's double-invoke, or any
+  // other double-render).
+  const celebratedRef = useRef(false);
+  useEffect(() => {
+    if (!run || celebratedRef.current) return;
+
+    const isNewest = run.newest_run_id != null && run.newest_run_id === runId;
+    const isSuccess = run.status_token === "ok";
+    if (!isNewest || !isSuccess) return;
+
+    celebratedRef.current = true;
+    fireCelebration();
+    toast.success("🎉 All green — the latest run passed!");
+  }, [run, runId]);
 
   if (dataStatus === "error" || runError || scenariosError) {
     return (

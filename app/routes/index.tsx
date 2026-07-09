@@ -210,7 +210,6 @@ export default function Index() {
               <th className="px-3 py-2 font-medium">Run</th>
               <th className="px-3 py-2 font-medium">Type</th>
               <th className="px-3 py-2 font-medium">Status</th>
-              <th className="px-3 py-2 font-medium">Failed / Total</th>
               <th className="px-3 py-2 font-medium">Scenarios</th>
               <th className="px-3 py-2 font-medium">Report</th>
             </tr>
@@ -219,7 +218,7 @@ export default function Index() {
             {runs.length === 0 && !runsLoading && (
               <tr>
                 <td
-                  colSpan={6}
+                  colSpan={5}
                   className="px-3 py-6 text-center text-muted-foreground"
                 >
                   No runs found.
@@ -264,16 +263,6 @@ export default function Index() {
                       <StatusBadge
                         kind={statusKindFromRunToken(run.status_token)}
                       />
-                    </Link>
-                  </td>
-                  <td className="p-0">
-                    <Link
-                      to={`/runs/${encodeURIComponent(run.run_id)}`}
-                      className="block px-3 py-2 font-mono group-hover:bg-muted/40"
-                    >
-                      {run.failed_count != null && run.total_count != null
-                        ? `${run.failed_count} / ${run.total_count}`
-                        : "—"}
                     </Link>
                   </td>
                   <td className="p-0">

@@ -122,6 +122,9 @@ export interface E2eDataContextValue {
   windowLabel: string;
   /** True while a `loadMore` re-materialization is in flight. */
   loadingMore: boolean;
+  /** Increments each time the tables are rebuilt in place (soft load-more), so
+   *  useE2eQuery consumers re-run and pick up the wider window. */
+  dataVersion: number;
   /** True while there are runs older than the current window (`runCount <
    *  totalRuns`) - i.e. whether "Load more" should be offered. */
   hasMore: boolean;
@@ -180,6 +183,10 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
   const [totalRuns, setTotalRuns] = useState(0);
   const [windowIndex, setWindowIndex] = useState(DEFAULT_WINDOW_INDEX);
   const [loadingMore, setLoadingMore] = useState(false);
+  // Bumped whenever the tables are rebuilt in place (soft load-more) so mounted
+  // useE2eQuery consumers re-run without runsReady/detailsReady flipping (which
+  // would blank them). See loadMore + useE2eQuery.
+  const [dataVersion, setDataVersion] = useState(0);
   const [error, setError] = useState<Error | null>(null);
 
   const startedRef = useRef(false);
@@ -190,16 +197,32 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
   const windowIndexRef = useRef(DEFAULT_WINDOW_INDEX);
 
   const runInit = useCallback(
-    async (database: AsyncDuckDB, windowIndexArg?: number) => {
+    async (
+      database: AsyncDuckDB,
+      windowIndexArg?: number,
+      opts?: { soft?: boolean },
+    ) => {
+      // soft = load-more: rebuild the tables for a wider window WITHOUT blanking
+      // the UI. Leave status/runsReady/detailsReady + counts/label as-is (so
+      // every useE2eQuery keeps its current rows), rebuild in place, then set the
+      // new counts/label + bump dataVersion at the end for a seamless swap-in.
+      const soft = opts?.soft ?? false;
+      const prevWindowIndex = windowIndexRef.current;
       if (windowIndexArg != null) windowIndexRef.current = windowIndexArg;
-      setStatus("loading");
-      setRunsReady(false);
-      setDetailsReady(false);
-      setStepsFallback(false);
-      setError(null);
-      setWindowIndex(windowIndexRef.current);
+      if (!soft) {
+        setStatus("loading");
+        setRunsReady(false);
+        setDetailsReady(false);
+        setStepsFallback(false);
+        setError(null);
+        setWindowIndex(windowIndexRef.current);
+      }
 
       const since = sinceCutoff(windowIndexRef.current);
+
+      let nextDataSource: E2eDataSource = "local";
+      let nextRunCount = 0;
+      let nextTotal = 0;
 
       const conn = await database.connect();
       try {
@@ -222,9 +245,9 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
             .map((r) => r.cucumberUrl)
             .filter((u): u is string => typeof u === "string" && u.length > 0);
 
-          setDataSource("api");
-          setRunCount(apiResponse.runs.length);
-          setTotalRuns(apiResponse.total);
+          nextDataSource = "api";
+          nextRunCount = apiResponse.runs.length;
+          nextTotal = apiResponse.total;
         } else {
           // LOCAL mode: fetch the full synced manifest (unchanged), then filter
           // client-side to the current rolling window so the same month-window
@@ -254,9 +277,9 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
             new URL(entry.file, dataBase).toString(),
           );
 
-          setDataSource("local");
-          setRunCount(manifest.length);
-          setTotalRuns(fullManifest.length);
+          nextDataSource = "local";
+          nextRunCount = manifest.length;
+          nextTotal = fullManifest.length;
         }
 
         // Creating the views is cheap/lazy - no file reads happen until something
@@ -268,8 +291,13 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
           `CREATE OR REPLACE TABLE runs AS SELECT * FROM v_runs;`,
         );
 
-        setRunsReady(true);
-        setStatus("runs-ready");
+        if (!soft) {
+          setDataSource(nextDataSource);
+          setRunCount(nextRunCount);
+          setTotalRuns(nextTotal);
+          setRunsReady(true);
+          setStatus("runs-ready");
+        }
 
         // ---- STAGE 2: heavy, reads all report files exactly once ----
         try {
@@ -304,11 +332,32 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
           setStepsFallback(true);
         }
 
-        setDetailsReady(true);
-        setStatus("ready");
+        if (soft) {
+          // Soft (load-more) done: publish the wider window's source/counts/label
+          // and bump dataVersion so consumers re-query and swap in the new rows
+          // in place (no blanking).
+          setDataSource(nextDataSource);
+          setRunCount(nextRunCount);
+          setTotalRuns(nextTotal);
+          setWindowIndex(windowIndexRef.current);
+          setDataVersion((v) => v + 1);
+        } else {
+          setDetailsReady(true);
+          setStatus("ready");
+        }
       } catch (e) {
-        setError(e instanceof Error ? e : new Error(String(e)));
-        setStatus("error");
+        if (soft) {
+          // Load-more failed: keep the current data on screen untouched; just
+          // undo the window bump so a retry starts from the right place.
+          windowIndexRef.current = prevWindowIndex;
+          console.warn(
+            "[E2eDataProvider] load-more failed; keeping current data:",
+            e,
+          );
+        } else {
+          setError(e instanceof Error ? e : new Error(String(e)));
+          setStatus("error");
+        }
       } finally {
         await conn.close();
       }
@@ -342,7 +391,7 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
     );
     if (nextIndex === windowIndexRef.current) return;
     setLoadingMore(true);
-    void runInit(dbRef.current, nextIndex).finally(() =>
+    void runInit(dbRef.current, nextIndex, { soft: true }).finally(() =>
       setLoadingMore(false),
     );
   }, [runInit, hasMore]);
@@ -362,6 +411,7 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
     totalRuns,
     windowLabel: WINDOW_STEPS[windowIndex]?.label ?? "",
     loadingMore,
+    dataVersion,
     hasMore,
     loadMore,
     error,
@@ -399,7 +449,7 @@ export function useE2eQuery<T = any>(
   sql: string | null,
   deps: any[],
 ): UseE2eQueryResult<T> {
-  const { query, runsReady } = useE2eData();
+  const { query, runsReady, dataVersion } = useE2eData();
   const [rows, setRows] = useState<T[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
@@ -429,7 +479,7 @@ export function useE2eQuery<T = any>(
         setLoading(false);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sql, runsReady, query, ...deps]);
+  }, [sql, runsReady, dataVersion, query, ...deps]);
 
   return { rows, loading, error };
 }
