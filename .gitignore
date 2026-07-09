@@ -1,0 +1,8 @@
+node_modules
+/build
+/.react-router
+public/data
+*.local
+.DS_Store
+.idea
+.vscode
