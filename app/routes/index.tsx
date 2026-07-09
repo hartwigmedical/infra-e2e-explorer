@@ -107,7 +107,7 @@ export default function Index() {
     runCount,
     detailsReady,
     dataSource,
-    monthsBack,
+    windowLabel,
     loadingMore,
     hasMore,
     loadMore,
@@ -169,8 +169,7 @@ export default function Index() {
         <div>
           <h1 className="text-lg font-semibold">Recent Runs</h1>
           <p className="text-sm text-muted-foreground">
-            {runCount} run{runCount === 1 ? "" : "s"} · past {monthsBack} month
-            {monthsBack === 1 ? "" : "s"}
+            {runCount} run{runCount === 1 ? "" : "s"} · {windowLabel}
             {dataSource === "api" && (
               <span className="ml-2 rounded-full bg-sky-500/15 px-2 py-0.5 text-xs font-medium text-sky-600 dark:text-sky-400">
                 Live

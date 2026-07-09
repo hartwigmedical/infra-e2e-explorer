@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import type { AsyncDuckDB } from "@duckdb/duckdb-wasm";
-import { format, subMonths } from "date-fns";
+import { format, subDays } from "date-fns";
 import { useDuckDBContext } from "~/contexts/DuckDBContext";
 import { buildE2eViewsSql } from "~/lib/e2e-views";
 import { queryE2e } from "~/lib/e2e-data";
@@ -43,12 +43,24 @@ interface ApiRunsResponse {
   warning?: string;
 }
 
-/** Default rolling window, in months back from today, for both API and LOCAL mode. */
-export const DEFAULT_MONTHS_BACK = 1;
+/** Rolling-window presets (widest last), for both API and LOCAL mode. The
+ *  default is the past week (fast to load); `loadMore` steps to the next wider
+ *  window. */
+export const WINDOW_STEPS: { label: string; days: number | null }[] = [
+  { label: "past week", days: 7 },
+  { label: "past month", days: 30 },
+  { label: "past 3 months", days: 90 },
+  { label: "past year", days: 365 },
+  { label: "all time", days: null },
+];
+export const DEFAULT_WINDOW_INDEX = 0;
 
-/** `since` cutoff (YYYY-MM-DD) for a rolling window of `monthsBack` months. */
-function sinceCutoff(monthsBack: number): string {
-  return format(subMonths(new Date(), monthsBack), "yyyy-MM-dd");
+/** `since` cutoff (YYYY-MM-DD) for a given window preset. "all time" (days=null)
+ *  uses a far-past date so the server's `since` path still returns everything. */
+function sinceCutoff(windowIndex: number): string {
+  const days = WINDOW_STEPS[windowIndex]?.days ?? null;
+  if (days == null) return "2000-01-01";
+  return format(subDays(new Date(), days), "yyyy-MM-dd");
 }
 
 /**
@@ -97,7 +109,7 @@ export interface E2eDataContextValue {
    *  (e.g. signing not configured - the expected local dev outcome today). */
   dataSource: E2eDataSource | null;
   /** Number of runs currently loaded into the `runs` table (i.e. runs whose
-   *  date falls within the current `monthsBack` rolling window). */
+   *  date falls within the current window preset). */
   runCount: number;
   /** Total runs available at the source, regardless of the current window.
    *  In API mode this is the grand total across the whole bucket (see
@@ -105,17 +117,17 @@ export interface E2eDataContextValue {
    *  Compare against `runCount` (via `hasMore`) to tell whether older runs
    *  exist beyond the current window. */
   totalRuns: number;
-  /** How many months back from today the current window reaches (starts at
-   *  `DEFAULT_MONTHS_BACK`, grows by 1 each `loadMore()` call). */
-  monthsBack: number;
+  /** Human label for the current window preset (e.g. "past week"); widens one
+   *  step per `loadMore()` call. See WINDOW_STEPS. */
+  windowLabel: string;
   /** True while a `loadMore` re-materialization is in flight. */
   loadingMore: boolean;
   /** True while there are runs older than the current window (`runCount <
    *  totalRuns`) - i.e. whether "Load more" should be offered. */
   hasMore: boolean;
-  /** Grow the window by one month (recomputing the `since` cutoff) and
-   *  re-materialize every table. Works in both API and LOCAL mode. No-op
-   *  once `hasMore` is false. */
+  /** Widen the window to the next preset (recomputing the `since` cutoff) and
+   *  re-materialize every table. Works in both API and LOCAL mode. No-op once
+   *  `hasMore` is false or the widest preset is already reached. */
   loadMore: () => void;
   error: Error | null;
   /** Re-run the full init sequence (stage 1 + stage 2) from scratch, keeping
@@ -166,28 +178,28 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
   const [dataSource, setDataSource] = useState<E2eDataSource | null>(null);
   const [runCount, setRunCount] = useState(0);
   const [totalRuns, setTotalRuns] = useState(0);
-  const [monthsBack, setMonthsBack] = useState(DEFAULT_MONTHS_BACK);
+  const [windowIndex, setWindowIndex] = useState(DEFAULT_WINDOW_INDEX);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<Error | null>(null);
 
   const startedRef = useRef(false);
   const dbRef = useRef<AsyncDuckDB | null>(null);
-  // Current rolling-window size, in months back from today. Persists across
-  // `reload()` calls so retrying doesn't silently shrink what `loadMore` had
-  // grown it to. Used to compute the `since` cutoff in both API and LOCAL mode.
-  const monthsBackRef = useRef(DEFAULT_MONTHS_BACK);
+  // Current window preset index (into WINDOW_STEPS). Persists across `reload()`
+  // calls so retrying doesn't silently shrink what `loadMore` had grown it to.
+  // Used to compute the `since` cutoff in both API and LOCAL mode.
+  const windowIndexRef = useRef(DEFAULT_WINDOW_INDEX);
 
   const runInit = useCallback(
-    async (database: AsyncDuckDB, monthsBackArg?: number) => {
-      if (monthsBackArg) monthsBackRef.current = monthsBackArg;
+    async (database: AsyncDuckDB, windowIndexArg?: number) => {
+      if (windowIndexArg != null) windowIndexRef.current = windowIndexArg;
       setStatus("loading");
       setRunsReady(false);
       setDetailsReady(false);
       setStepsFallback(false);
       setError(null);
-      setMonthsBack(monthsBackRef.current);
+      setWindowIndex(windowIndexRef.current);
 
-      const since = sinceCutoff(monthsBackRef.current);
+      const since = sinceCutoff(windowIndexRef.current);
 
       const conn = await database.connect();
       try {
@@ -317,16 +329,20 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
 
   const hasMore = runCount < totalRuns;
 
-  // Grow the rolling window by one month and re-run the full init sequence
-  // against the recomputed `since` cutoff. Works the same way in both API and
-  // LOCAL mode (see runInit above). A full re-materialize is simple and
+  // Widen the rolling window to the next preset and re-run the full init
+  // sequence against the recomputed `since` cutoff. Works the same way in both
+  // API and LOCAL mode (see runInit above). A full re-materialize is simple and
   // correct; see the module doc comment for why that's an acceptable tradeoff
-  // here. No-op once every available run is already loaded.
+  // here. No-op once every available run is loaded or the widest preset is hit.
   const loadMore = useCallback(() => {
     if (!dbRef.current || !hasMore) return;
-    const nextMonthsBack = monthsBackRef.current + 1;
+    const nextIndex = Math.min(
+      windowIndexRef.current + 1,
+      WINDOW_STEPS.length - 1,
+    );
+    if (nextIndex === windowIndexRef.current) return;
     setLoadingMore(true);
-    void runInit(dbRef.current, nextMonthsBack).finally(() =>
+    void runInit(dbRef.current, nextIndex).finally(() =>
       setLoadingMore(false),
     );
   }, [runInit, hasMore]);
@@ -344,7 +360,7 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
     dataSource,
     runCount,
     totalRuns,
-    monthsBack,
+    windowLabel: WINDOW_STEPS[windowIndex]?.label ?? "",
     loadingMore,
     hasMore,
     loadMore,

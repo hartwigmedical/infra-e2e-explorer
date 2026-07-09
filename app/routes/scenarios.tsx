@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
-import { Search, X } from "lucide-react";
+import { Search } from "lucide-react";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
 import Spinner from "~/components/Spinner";
 import StatusMark from "~/components/StatusMark";
@@ -189,10 +189,12 @@ function TagChips({ tags, className }: { tags: string[] | null | undefined; clas
 
 function HistoryStrip({
   rows,
+  scenarioId,
   hoveredRunId,
   onHoverRun,
 }: {
   rows: HistoryRow[];
+  scenarioId: string;
   hoveredRunId: string | null;
   onHoverRun: (runId: string | null) => void;
 }) {
@@ -206,7 +208,7 @@ function HistoryStrip({
         return (
           <Link
             key={row.run_id}
-            to={`/runs/${encodeURIComponent(row.run_id)}`}
+            to={`/runs/${encodeURIComponent(row.run_id)}?scenario=${encodeURIComponent(scenarioId)}`}
             onMouseEnter={() => onHoverRun(row.run_id)}
             onMouseLeave={() => onHoverRun(null)}
             title={`${row.run_id}\n${formatRunDateTime(row.run_id)}\n${statusLabel(kind)} · ${formatDuration(row.duration_s)}${row.is_nightly ? "" : " · manual"}`}
@@ -232,15 +234,13 @@ interface StepGridRow {
 function StepGrid({
   runIds,
   stepRows,
-  onCellClick,
-  selectedCellKey,
+  scenarioId,
   hoveredRunId,
   onHoverRun,
 }: {
   runIds: string[];
   stepRows: StepHistoryRow[];
-  onCellClick: (cell: StepHistoryRow | null) => void;
-  selectedCellKey: string | null;
+  scenarioId: string;
   hoveredRunId: string | null;
   onHoverRun: (runId: string | null) => void;
 }) {
@@ -305,33 +305,22 @@ function StepGrid({
               {runIds.map((runId) => {
                 const cell = row.cells.get(runId);
                 const kind = cell ? statusKindFromScenario(cell.status) : "unknown";
-                const cellKey = `${runId}::${row.step_ordinal}`;
-                const clickable = !!cell?.has_error;
                 const isHoveredCol = hoveredRunId === runId;
+                const label = cell ? statusLabel(kind) : "no data";
                 return (
                   <td
                     key={runId}
-                    onMouseEnter={() => onHoverRun(runId)}
-                    onMouseLeave={() => onHoverRun(null)}
                     className={cn("border-b p-0.5 text-center", isHoveredCol && "bg-accent")}
                   >
-                    <button
-                      type="button"
-                      disabled={!clickable}
-                      onClick={() => onCellClick(clickable ? (cell as StepHistoryRow) : null)}
-                      title={
-                        cell
-                          ? `${runId}\n${statusLabel(kind)}${cell.has_error ? " (click for error)" : ""}`
-                          : `${runId}\nstep not present`
-                      }
-                      className={cn(
-                        "mx-auto block",
-                        clickable && "cursor-pointer ring-offset-1 hover:ring-2 hover:ring-red-400",
-                        selectedCellKey === cellKey && "ring-2 ring-foreground"
-                      )}
+                    <Link
+                      to={`/runs/${encodeURIComponent(runId)}?scenario=${encodeURIComponent(scenarioId)}&step=${row.step_ordinal}`}
+                      onMouseEnter={() => onHoverRun(runId)}
+                      onMouseLeave={() => onHoverRun(null)}
+                      title={`${row.step_label} · ${runId} · ${label} — open run detail`}
+                      className="mx-auto block transition-transform hover:scale-125"
                     >
                       <StatusMark kind={kind} shape="square" size={16} title="" />
-                    </button>
+                    </Link>
                   </td>
                 );
               })}
@@ -357,11 +346,6 @@ function ScenarioDetailPanel({
   onHoverRun: (runId: string | null) => void;
 }) {
   const { detailsReady } = useE2eData();
-  const [errorCell, setErrorCell] = useState<StepHistoryRow | null>(null);
-
-  useEffect(() => {
-    setErrorCell(null);
-  }, [selected.feature_uri, selected.scenario_id, nightlyOnly]);
 
   const { rows: historyRows, loading: historyLoading } = useE2eQuery<HistoryRow>(
     detailsReady ? buildHistorySql(selected.feature_uri, selected.scenario_id, nightlyOnly) : null,
@@ -380,8 +364,6 @@ function ScenarioDetailPanel({
     const passed = historyRows.filter((r) => r.status === "passed").length;
     return passed / historyRows.length;
   }, [historyRows]);
-
-  const selectedCellKey = errorCell ? `${errorCell.run_id}::${errorCell.step_ordinal}` : null;
 
   return (
     <div className="space-y-4">
@@ -414,7 +396,12 @@ function ScenarioDetailPanel({
             <Spinner size={13} /> Loading history…
           </div>
         ) : (
-          <HistoryStrip rows={historyRows} hoveredRunId={hoveredRunId} onHoverRun={onHoverRun} />
+          <HistoryStrip
+            rows={historyRows}
+            scenarioId={selected.scenario_id}
+            hoveredRunId={hoveredRunId}
+            onHoverRun={onHoverRun}
+          />
         )}
       </div>
 
@@ -430,35 +417,10 @@ function ScenarioDetailPanel({
           <StepGrid
             runIds={runIds}
             stepRows={stepRows}
-            onCellClick={setErrorCell}
-            selectedCellKey={selectedCellKey}
+            scenarioId={selected.scenario_id}
             hoveredRunId={hoveredRunId}
             onHoverRun={onHoverRun}
           />
-        )}
-
-        {errorCell && (
-          <div className="mt-3 rounded border border-red-500/20 bg-red-500/5 p-3">
-            <div className="mb-1.5 flex items-center justify-between gap-2">
-              <p className="text-xs font-medium text-red-700 dark:text-red-300">
-                {errorCell.step_label}
-                <span className="ml-2 font-mono text-[11px] text-muted-foreground">
-                  {errorCell.run_id}
-                </span>
-              </p>
-              <button
-                type="button"
-                onClick={() => setErrorCell(null)}
-                className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-muted"
-                aria-label="Close"
-              >
-                <X size={14} />
-              </button>
-            </div>
-            <pre className="max-h-64 overflow-auto rounded bg-background p-2 text-xs whitespace-pre-wrap text-red-700 dark:text-red-300">
-              {errorCell.error_message ?? "(no error message)"}
-            </pre>
-          </div>
         )}
       </div>
     </div>

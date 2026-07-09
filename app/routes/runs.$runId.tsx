@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { Link, useParams } from "react-router";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link, useParams, useSearchParams } from "react-router";
 import { ChevronRight, History } from "lucide-react";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
 import StatusBadge from "~/components/StatusBadge";
@@ -50,6 +50,16 @@ function sqlLit(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
+/** Decode a URL search-param value, tolerating malformed percent-escapes. */
+function safeDecodeURIComponent(value: string | null): string | null {
+  if (value == null) return null;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function formatDate(runId: string): string {
   return runId.slice(0, 10);
 }
@@ -87,8 +97,16 @@ function TypeBadge({ isNightly }: { isNightly: boolean }) {
 // Order for surfacing failures first within a feature's scenario list.
 const STATUS_SORT_RANK: Record<string, number> = { failed: 0, skipped: 1, passed: 2 };
 
-function StepList({ steps }: { steps: StepRow[] }) {
+function StepList({
+  steps,
+  focusStepOrdinal,
+}: {
+  steps: StepRow[];
+  /** Step ordinal to scroll to, highlight, and (if failed) auto-expand the error for. One-time per value change. */
+  focusStepOrdinal?: number | null;
+}) {
   const [openErrors, setOpenErrors] = useState<Set<number>>(new Set());
+  const stepRefs = useRef<Map<number, HTMLLIElement>>(new Map());
 
   const toggleError = (ordinal: number) => {
     setOpenErrors((prev) => {
@@ -99,6 +117,19 @@ function StepList({ steps }: { steps: StepRow[] }) {
     });
   };
 
+  // Resolve the step focus once its target step is present in `steps` (which
+  // may still be loading when this component first mounts). Guarded against
+  // an unknown ordinal - no match just means no highlight/scroll, no crash.
+  useEffect(() => {
+    if (focusStepOrdinal == null) return;
+    const step = steps.find((s) => s.step_ordinal === focusStepOrdinal);
+    if (!step) return;
+    if (step.has_error) {
+      setOpenErrors((prev) => (prev.has(focusStepOrdinal) ? prev : new Set(prev).add(focusStepOrdinal)));
+    }
+    stepRefs.current.get(focusStepOrdinal)?.scrollIntoView({ block: "center" });
+  }, [focusStepOrdinal, steps]);
+
   if (steps.length === 0) {
     return <p className="px-4 py-3 text-xs text-muted-foreground">No steps recorded.</p>;
   }
@@ -108,8 +139,19 @@ function StepList({ steps }: { steps: StepRow[] }) {
       {steps.map((step) => {
         const kind = statusKindFromScenario(step.status);
         const errorOpen = openErrors.has(step.step_ordinal);
+        const isFocused = focusStepOrdinal === step.step_ordinal;
         return (
-          <li key={step.step_ordinal} className="px-4 py-1.5 text-sm">
+          <li
+            key={step.step_ordinal}
+            ref={(el) => {
+              if (el) stepRefs.current.set(step.step_ordinal, el);
+              else stepRefs.current.delete(step.step_ordinal);
+            }}
+            className={cn(
+              "px-4 py-1.5 text-sm",
+              isFocused && "rounded bg-accent ring-1 ring-inset ring-ring"
+            )}
+          >
             <div className="flex items-center gap-2">
               <StatusMark kind={kind} shape="dot" size={9} title={statusLabel(kind)} />
               <span className="flex-1 truncate">{step.step_label}</span>
@@ -144,16 +186,31 @@ function ScenarioRow_({
   onToggle,
   steps,
   stepsLoading,
+  isFocused,
+  focusStepOrdinal,
 }: {
   scenario: ScenarioRow;
   isOpen: boolean;
   onToggle: () => void;
   steps: StepRow[];
   stepsLoading: boolean;
+  /** True when this scenario is the one targeted by the run detail's `?scenario=` param. */
+  isFocused?: boolean;
+  /** Step ordinal targeted by the `?step=` param, only meaningful when `isFocused`. */
+  focusStepOrdinal?: number | null;
 }) {
   const kind = statusKindFromScenario(scenario.status);
+  const rowRef = useRef<HTMLLIElement | null>(null);
+
+  // Scroll the focused scenario into view once (on mount if already focused,
+  // or when it becomes focused via a param change) - guarded so plain
+  // expand/collapse interactions never trigger a re-scroll.
+  useEffect(() => {
+    if (isFocused) rowRef.current?.scrollIntoView({ block: "center" });
+  }, [isFocused]);
+
   return (
-    <li>
+    <li ref={rowRef} className={cn(isFocused && "rounded-md bg-accent/60 ring-2 ring-ring")}>
       <div className="flex w-full items-center gap-1 px-4 py-2 text-sm hover:bg-muted/40">
         <button
           type="button"
@@ -197,7 +254,7 @@ function ScenarioRow_({
               <Spinner size={12} /> Loading steps…
             </div>
           ) : (
-            <StepList steps={steps} />
+            <StepList steps={steps} focusStepOrdinal={isFocused ? focusStepOrdinal : null} />
           )}
         </div>
       )}
@@ -214,6 +271,17 @@ export default function RunDetail() {
   const [failuresOnly, setFailuresOnly] = useState(false);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [openScenario, setOpenScenario] = useState<string | null>(null);
+
+  // Cross-navigation focus: `?scenario=<scenario_id>&step=<step_ordinal>`,
+  // e.g. from the Scenarios step-history grid/history-strip. `scenario_id` is
+  // a Cucumber element id ("<feature-name-slug>;<scenario-name-slug>"), which
+  // already embeds the feature and is unique within a single run's report -
+  // no feature_uri is needed to disambiguate it here.
+  const [searchParams] = useSearchParams();
+  const focusScenarioId = safeDecodeURIComponent(searchParams.get("scenario"));
+  const focusStepParam = searchParams.get("step");
+  const focusStepOrdinal =
+    focusStepParam != null && /^\d+$/.test(focusStepParam) ? Number(focusStepParam) : null;
 
   const {
     rows: runRows,
@@ -251,6 +319,24 @@ export default function RunDetail() {
     [detailsReady, runId]
   );
 
+  // Resolve the focused scenario from the run's own scenario list (not the
+  // filtered view) so it can be exempted from "failures only"/tag filters
+  // below, and so its identity is available before scenarios finish loading.
+  const focusedScenario = useMemo(() => {
+    if (!focusScenarioId) return null;
+    return scenarios.find((s) => s.scenario_id === focusScenarioId) ?? null;
+  }, [scenarios, focusScenarioId]);
+  const focusedScenarioKey = focusedScenario
+    ? `${focusedScenario.feature_uri}::${focusedScenario.scenario_id}`
+    : null;
+
+  // Auto-expand the focused scenario once it resolves (initial load, or the
+  // `?scenario=` param changing) - not on every re-render, so a user who
+  // manually collapses it afterwards isn't fought by this effect.
+  useEffect(() => {
+    if (focusedScenarioKey) setOpenScenario(focusedScenarioKey);
+  }, [focusedScenarioKey]);
+
   const stepsByScenario = useMemo(() => {
     const map = new Map<string, StepRow[]>();
     for (const step of allSteps) {
@@ -285,6 +371,10 @@ export default function RunDetail() {
 
   const featureGroups = useMemo(() => {
     const filtered = scenarios.filter((s) => {
+      // The scenario targeted by `?scenario=` must always render, regardless
+      // of the current filters - e.g. a passed scenario opened from a green
+      // step-history cell must still show even with "Failures only" checked.
+      if (focusedScenarioKey && `${s.feature_uri}::${s.scenario_id}` === focusedScenarioKey) return true;
       if (failuresOnly && s.status !== "failed" && s.status !== "skipped") return false;
       // Union semantics: keep the scenario if it has ANY of the selected tags.
       // tag_names comes back from duckdb-wasm as a list-like value, not a plain
@@ -324,7 +414,7 @@ export default function RunDetail() {
       if (worstA !== worstB) return worstA - worstB;
       return a.feature_name.localeCompare(b.feature_name);
     });
-  }, [scenarios, failuresOnly, selectedTags]);
+  }, [scenarios, failuresOnly, selectedTags, focusedScenarioKey]);
 
   const run = runRows[0];
   const combinedError = dataError ?? runError ?? scenariosError;
@@ -463,6 +553,7 @@ export default function RunDetail() {
               <ul className="divide-y">
                 {group.scenarios.map((scenario) => {
                   const key = `${scenario.feature_uri}::${scenario.scenario_id}`;
+                  const isFocused = focusedScenarioKey === key;
                   return (
                     <ScenarioRow_
                       key={key}
@@ -471,6 +562,8 @@ export default function RunDetail() {
                       onToggle={() => setOpenScenario(openScenario === key ? null : key)}
                       steps={stepsByScenario.get(key) ?? []}
                       stepsLoading={stepsLoading && openScenario === key}
+                      isFocused={isFocused}
+                      focusStepOrdinal={focusStepOrdinal}
                     />
                   );
                 })}
