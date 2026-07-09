@@ -1,16 +1,26 @@
 /**
  * SQL for the four non-stored DuckDB views that expose the nested Cucumber
- * JSON e2e reports (served from /data) as clean, flat, queryable tables:
+ * JSON e2e reports as clean, flat, queryable tables. Two data sources feed
+ * these views (see app/contexts/E2eDataContext.tsx for how the active one is
+ * chosen):
  *
- *   v_runs       - one row per run, derived straight from runs.json (no report parsing)
+ *   - LOCAL mode: runs.json + report files served same-origin from /data.
+ *   - API  mode: the live `/api/runs` run list (registered into DuckDB-Wasm's
+ *     virtual filesystem via `registerFileText`, see E2eDataContext) plus
+ *     each run's signed `cucumberUrl` pointing at storage.googleapis.com.
+ *
+ * The views themselves don't care which mode produced their inputs - they
+ * just take a runs-JSON location and a list of report URLs:
+ *
+ *   v_runs       - one row per run, derived straight from the run list (no report parsing)
  *   v_features   - one row per (run, feature)
  *   v_scenarios  - one row per (run, scenario) - background elements excluded
  *   v_steps      - one row per (run, scenario, step)
  *
  * These are views, not materialized tables: every query against them re-reads
  * the underlying JSON via DuckDB's `read_json`, so there is nothing to keep in
- * sync when new runs land in runs.json - re-running buildE2eViewsSql() (or
- * just querying again after CREATE VIEW) always reflects the current manifest.
+ * sync when new runs land in the manifest - re-running buildE2eViewsSql() (or
+ * just querying again after CREATE VIEW) always reflects the current input.
  *
  * app/contexts/E2eDataContext.tsx creates these views once per session and
  * then materializes `runs`/`scenarios`/`steps` TABLEs on top of them, so the
@@ -64,10 +74,15 @@ const FEATURES_COLUMNS = `{'uri': 'VARCHAR', 'name': 'VARCHAR', 'keyword': 'VARC
 /**
  * Build the full CREATE OR REPLACE VIEW script for all four views.
  *
- * @param runsJsonUrl - absolute URL to runs.json (the run manifest)
- * @param reportUrls - absolute URLs to each run's cucumber.json report. Order
- *   doesn't matter for correctness: run_id is recovered per-row from the
- *   source filename via `filename = true`, not from array position.
+ * @param runsJsonUrl - location of the run list, readable via DuckDB's
+ *   `read_json`. Either an absolute URL to runs.json (LOCAL mode) or the name
+ *   of a file registered into duckdb-wasm's virtual filesystem via
+ *   `registerFileText` (API mode) - `read_json` doesn't care which.
+ * @param reportUrls - absolute URLs to each run's cucumber.json report -
+ *   same-origin /data paths in LOCAL mode, signed storage.googleapis.com URLs
+ *   in API mode. Order doesn't matter for correctness: run_id is recovered
+ *   per-row from the source filename via `filename = true`, not from array
+ *   position.
  */
 export function buildE2eViewsSql(runsJsonUrl: string, reportUrls: string[]): string {
   const runsJsonLiteral = sqlStringLiteral(runsJsonUrl);
@@ -77,7 +92,7 @@ export function buildE2eViewsSql(runsJsonUrl: string, reportUrls: string[]): str
 -- runs overview straight from the manifest (no report parsing)
 CREATE OR REPLACE VIEW v_runs AS
 SELECT
-  run_id, file, source, updated, size_bytes,
+  run_id, source, updated, size_bytes,
   strptime(regexp_extract(run_id, '^(\\d{4}-\\d{2}-\\d{2})', 1), '%Y-%m-%d')      AS run_date,
   regexp_extract(run_id, '^\\d{4}-\\d{2}-\\d{2}-(\\d{4})', 1)                       AS run_time,
   CASE WHEN run_id LIKE '%-ok%' THEN 'ok'
@@ -87,9 +102,12 @@ SELECT
   (regexp_extract(run_id, '^\\d{4}-\\d{2}-\\d{2}-(\\d{4})', 1) IN ('0000','0100','0200')) AS is_nightly
 FROM read_json(${runsJsonLiteral});
 
--- one row per (run, feature)
+-- one row per (run, feature). run_id is recovered from the source filename -
+-- a single regex covers both LOCAL paths (".../runs/<id>/cucumber.json") and
+-- API-mode signed URLs (".../<id>/cucumber-parallel.json?X-Goog-..."): in
+-- both, the run_id is the path segment immediately before "/cucumber*.json".
 CREATE OR REPLACE VIEW v_features AS
-SELECT regexp_extract(filename, 'runs/([^/]+)/', 1) AS run_id,
+SELECT regexp_extract(filename, '([^/?]+)/cucumber[a-z-]*\\.json', 1) AS run_id,
        uri AS feature_uri, name AS feature_name, keyword AS feature_keyword,
        tags AS feature_tags, elements
 FROM read_json(${reportUrlArray}, filename = true, format = 'array',

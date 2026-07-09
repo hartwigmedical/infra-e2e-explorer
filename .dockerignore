@@ -1,0 +1,11 @@
+node_modules
+build
+.react-router
+public/data
+.git
+.idea
+.vscode
+*.local
+npm-debug.log*
+tmp
+.DS_Store

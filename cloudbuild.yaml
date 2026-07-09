@@ -1,0 +1,24 @@
+steps:
+  - id: 'Set release version'
+    name: 'node:24-alpine'
+    entrypoint: 'npm'
+    args: ['version', '${TAG_NAME}', '--no-git-tag-version', '--allow-same-version']
+
+  - id: 'Publish e2e-explorer-server docker image'
+    name: 'europe-west4-docker.pkg.dev/hmf-build/hmf-docker/docker-tag'
+    args:
+      - 'europe-west4-docker.pkg.dev/hmf-build/hmf-docker/e2e-explorer'
+      - '$TAG_NAME'
+      - 'Dockerfile.server'
+      - '--build-arg'
+      - 'SHORT_SHA=$SHORT_SHA'
+
+logsBucket: 'hmf-build-logs'
+# TODO: this build service account is copied from middle-layer/cloudbuild.yaml as a
+# placeholder pattern — verify/create the equivalent SA for e2e-explorer in hmf-build
+# before relying on this file (untested, not run as part of this change).
+serviceAccount: 'projects/hmf-build/serviceAccounts/e2e-explorer-build@hmf-build.iam.gserviceaccount.com'
+options:
+  logging: GCS_ONLY
+images:
+  - europe-west4-docker.pkg.dev/hmf-build/hmf-docker/e2e-explorer

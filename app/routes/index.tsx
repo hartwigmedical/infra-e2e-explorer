@@ -55,10 +55,16 @@ function formatRunTime(runTime: string | null | undefined): string {
 // Fallback instant (UTC ISO string) built from the run_id's embedded date and
 // the run_time column, used when `updated` is null so relativeTime/
 // absoluteDateTime still have something to work with.
-function fallbackInstant(runId: string, runTime: string | null | undefined): string | null {
+function fallbackInstant(
+  runId: string,
+  runTime: string | null | undefined,
+): string | null {
   const datePart = runId.slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) return null;
-  const timePart = runTime && runTime.length === 4 ? `${runTime.slice(0, 2)}:${runTime.slice(2, 4)}` : "00:00";
+  const timePart =
+    runTime && runTime.length === 4
+      ? `${runTime.slice(0, 2)}:${runTime.slice(2, 4)}`
+      : "00:00";
   return `${datePart}T${timePart}:00Z`;
 }
 
@@ -69,7 +75,7 @@ function TypeBadge({ isNightly }: { isNightly: boolean }) {
         "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium whitespace-nowrap",
         isNightly
           ? "bg-sky-500/15 text-sky-600 dark:text-sky-400"
-          : "bg-zinc-500/10 text-muted-foreground"
+          : "bg-zinc-500/10 text-muted-foreground",
       )}
     >
       {isNightly ? "Nightly" : "Manual"}
@@ -81,17 +87,31 @@ function ScenarioCounts({ counts }: { counts: ScenarioCountRow | undefined }) {
   if (!counts) return <span className="text-muted-foreground">—</span>;
   return (
     <span className="inline-flex items-center gap-1.5 font-mono text-xs">
-      <span className="text-emerald-600 dark:text-emerald-400">{counts.passed}</span>
+      <span className="text-emerald-600 dark:text-emerald-400">
+        {counts.passed}
+      </span>
       <span className="text-muted-foreground">/</span>
       <span className="text-red-600 dark:text-red-400">{counts.failed}</span>
       <span className="text-muted-foreground">/</span>
-      <span className="text-amber-600 dark:text-amber-400">{counts.skipped}</span>
+      <span className="text-amber-600 dark:text-amber-400">
+        {counts.skipped}
+      </span>
     </span>
   );
 }
 
 export default function Index() {
-  const { status, error, runCount, detailsReady } = useE2eData();
+  const {
+    status,
+    error,
+    runCount,
+    detailsReady,
+    dataSource,
+    monthsBack,
+    loadingMore,
+    hasMore,
+    loadMore,
+  } = useE2eData();
   const {
     rows: runs,
     loading: runsLoading,
@@ -99,7 +119,7 @@ export default function Index() {
   } = useE2eQuery<RunRow>(RUNS_SQL, []);
   const { rows: scenarioCounts } = useE2eQuery<ScenarioCountRow>(
     detailsReady ? SCENARIO_COUNTS_SQL : null,
-    [detailsReady]
+    [detailsReady],
   );
 
   const countsByRun = new Map(scenarioCounts.map((r) => [r.run_id, r]));
@@ -118,14 +138,17 @@ export default function Index() {
     .filter((v): v is number => v !== null);
 
   const latestPassRate =
-    nightlyPassRates.length > 0 ? nightlyPassRates[nightlyPassRates.length - 1] : null;
+    nightlyPassRates.length > 0
+      ? nightlyPassRates[nightlyPassRates.length - 1]
+      : null;
 
   const combinedError = error ?? runsError;
   if (status === "error" || runsError) {
     return (
       <div className="mx-auto max-w-5xl p-6">
         <p className="text-sm text-destructive">
-          Failed to load e2e data{combinedError ? `: ${combinedError.message}` : "."}
+          Failed to load e2e data
+          {combinedError ? `: ${combinedError.message}` : "."}
         </p>
       </div>
     );
@@ -145,10 +168,20 @@ export default function Index() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-lg font-semibold">Recent Runs</h1>
-          <p className="text-sm text-muted-foreground">{runCount} run(s)</p>
+          <p className="text-sm text-muted-foreground">
+            {runCount} run{runCount === 1 ? "" : "s"} · past {monthsBack} month
+            {monthsBack === 1 ? "" : "s"}
+            {dataSource === "api" && (
+              <span className="ml-2 rounded-full bg-sky-500/15 px-2 py-0.5 text-xs font-medium text-sky-600 dark:text-sky-400">
+                Live
+              </span>
+            )}
+          </p>
         </div>
         <div className="flex items-center gap-3 rounded-lg border bg-card px-4 py-2">
-          <span className="text-xs text-muted-foreground">Pass rate — nightly runs</span>
+          <span className="text-xs text-muted-foreground">
+            Pass rate — nightly runs
+          </span>
           {!detailsReady ? (
             <Spinner size={13} />
           ) : nightlyPassRates.length >= 2 ? (
@@ -158,11 +191,15 @@ export default function Index() {
                 className="text-emerald-500"
               />
               <span className="text-sm font-medium tabular-nums">
-                {latestPassRate !== null ? `${Math.round(latestPassRate * 100)}%` : "—"}
+                {latestPassRate !== null
+                  ? `${Math.round(latestPassRate * 100)}%`
+                  : "—"}
               </span>
             </>
           ) : (
-            <span className="text-sm text-muted-foreground">Not enough data</span>
+            <span className="text-sm text-muted-foreground">
+              Not enough data
+            </span>
           )}
         </div>
       </div>
@@ -182,75 +219,99 @@ export default function Index() {
           <tbody>
             {runs.length === 0 && !runsLoading && (
               <tr>
-                <td colSpan={6} className="px-3 py-6 text-center text-muted-foreground">
+                <td
+                  colSpan={6}
+                  className="px-3 py-6 text-center text-muted-foreground"
+                >
                   No runs found.
                 </td>
               </tr>
             )}
             {runs.map((run) => {
-              const instant = run.updated ?? fallbackInstant(run.run_id, run.run_time);
-              const primary = relativeTime(instant) || formatRunDate(run.run_id);
+              const instant =
+                run.updated ?? fallbackInstant(run.run_id, run.run_time);
+              const primary =
+                relativeTime(instant) || formatRunDate(run.run_id);
               const absolute =
-                absoluteDateTime(instant) || `${formatRunDate(run.run_id)} ${formatRunTime(run.run_time)}`;
+                absoluteDateTime(instant) ||
+                `${formatRunDate(run.run_id)} ${formatRunTime(run.run_time)}`;
               return (
-              <tr key={run.run_id} className="group border-t">
-                <td className="p-0">
-                  <Link
-                    to={`/runs/${encodeURIComponent(run.run_id)}`}
-                    title={run.run_id}
-                    className="block px-3 py-2 group-hover:bg-muted/40"
-                  >
-                    <div className="font-medium">{primary}</div>
-                    <div className="text-xs text-muted-foreground">{absolute}</div>
-                  </Link>
-                </td>
-                <td className="p-0">
-                  <Link
-                    to={`/runs/${encodeURIComponent(run.run_id)}`}
-                    className="block px-3 py-2 group-hover:bg-muted/40"
-                  >
-                    <TypeBadge isNightly={run.is_nightly} />
-                  </Link>
-                </td>
-                <td className="p-0">
-                  <Link
-                    to={`/runs/${encodeURIComponent(run.run_id)}`}
-                    className="block px-3 py-2 group-hover:bg-muted/40"
-                  >
-                    <StatusBadge kind={statusKindFromRunToken(run.status_token)} />
-                  </Link>
-                </td>
-                <td className="p-0">
-                  <Link
-                    to={`/runs/${encodeURIComponent(run.run_id)}`}
-                    className="block px-3 py-2 font-mono group-hover:bg-muted/40"
-                  >
-                    {run.failed_count != null && run.total_count != null
-                      ? `${run.failed_count} / ${run.total_count}`
-                      : "—"}
-                  </Link>
-                </td>
-                <td className="p-0">
-                  <Link
-                    to={`/runs/${encodeURIComponent(run.run_id)}`}
-                    className="block px-3 py-2 group-hover:bg-muted/40"
-                  >
-                    {detailsReady ? (
-                      <ScenarioCounts counts={countsByRun.get(run.run_id)} />
-                    ) : (
-                      <Spinner size={13} />
-                    )}
-                  </Link>
-                </td>
-                <td className="px-3 py-2">
-                  <CluecumberLink runId={run.run_id} />
-                </td>
-              </tr>
+                <tr key={run.run_id} className="group border-t">
+                  <td className="p-0">
+                    <Link
+                      to={`/runs/${encodeURIComponent(run.run_id)}`}
+                      title={run.run_id}
+                      className="block px-3 py-2 group-hover:bg-muted/40"
+                    >
+                      <div className="font-medium">{primary}</div>
+                      <div className="text-xs text-muted-foreground">
+                        {absolute}
+                      </div>
+                    </Link>
+                  </td>
+                  <td className="p-0">
+                    <Link
+                      to={`/runs/${encodeURIComponent(run.run_id)}`}
+                      className="block px-3 py-2 group-hover:bg-muted/40"
+                    >
+                      <TypeBadge isNightly={run.is_nightly} />
+                    </Link>
+                  </td>
+                  <td className="p-0">
+                    <Link
+                      to={`/runs/${encodeURIComponent(run.run_id)}`}
+                      className="block px-3 py-2 group-hover:bg-muted/40"
+                    >
+                      <StatusBadge
+                        kind={statusKindFromRunToken(run.status_token)}
+                      />
+                    </Link>
+                  </td>
+                  <td className="p-0">
+                    <Link
+                      to={`/runs/${encodeURIComponent(run.run_id)}`}
+                      className="block px-3 py-2 font-mono group-hover:bg-muted/40"
+                    >
+                      {run.failed_count != null && run.total_count != null
+                        ? `${run.failed_count} / ${run.total_count}`
+                        : "—"}
+                    </Link>
+                  </td>
+                  <td className="p-0">
+                    <Link
+                      to={`/runs/${encodeURIComponent(run.run_id)}`}
+                      className="block px-3 py-2 group-hover:bg-muted/40"
+                    >
+                      {detailsReady ? (
+                        <ScenarioCounts counts={countsByRun.get(run.run_id)} />
+                      ) : (
+                        <Spinner size={13} />
+                      )}
+                    </Link>
+                  </td>
+                  <td className="px-3 py-2">
+                    <CluecumberLink runId={run.run_id} />
+                  </td>
+                </tr>
               );
             })}
           </tbody>
         </table>
       </div>
+
+      {hasMore && (
+        <div className="flex justify-center">
+          <button
+            type="button"
+            onClick={loadMore}
+            disabled={loadingMore}
+            className="inline-flex items-center gap-2 rounded-lg border bg-card px-4 py-2 text-sm font-medium hover:bg-muted/50 disabled:opacity-60"
+          >
+            {loadingMore && <Spinner size={13} />}
+            {loadingMore ? "Loading…" : "Load more (older)"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

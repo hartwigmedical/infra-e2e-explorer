@@ -11,6 +11,11 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./"),
     },
   },
+  server: {
+    proxy: {
+      "/api": "http://127.0.0.1:3001",
+    },
+  },
   optimizeDeps: { exclude: ["@duckdb/duckdb-wasm"] },
   worker: { format: "es" },
 });

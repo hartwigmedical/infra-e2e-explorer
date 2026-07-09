@@ -1,0 +1,27 @@
+FROM node:24-alpine AS builder
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY . .
+
+RUN npm run build
+
+# ------- Production -------
+FROM node:24-alpine
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+COPY --from=builder /app/build/client ./build/client
+COPY server ./server
+
+# Signed URLs are produced via Application Default Credentials (workload
+# identity in Cloud Run / GKE) — no key file or hardcoded service account.
+EXPOSE 3001
+
+CMD ["node", "--import", "tsx/esm", "server/index.ts"]
