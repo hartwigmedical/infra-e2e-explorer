@@ -1,5 +1,9 @@
 # e2e-explorer
 
+> ⚠️ **Disclaimer:** this project is ~99% vibe-coded — built almost entirely through
+> AI prompting / pair-programming rather than hand-written line by line. Treat it
+> accordingly and review before relying on it.
+
 A browser-based explorer for the Cucumber end-to-end test results produced by the
 [`verification`](../verification) suite. It answers two questions the per-run Cluecumber
 HTML reports can't:
