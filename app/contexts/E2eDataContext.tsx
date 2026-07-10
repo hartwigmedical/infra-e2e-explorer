@@ -10,7 +10,7 @@ import {
 import type { AsyncDuckDB } from "@duckdb/duckdb-wasm";
 import { format, subDays } from "date-fns";
 import { useDuckDBContext } from "~/contexts/DuckDBContext";
-import { buildE2eViewsSql } from "~/lib/e2e-views";
+import { buildE2eViewsSql, buildTestIdsSelectSql } from "~/lib/e2e-views";
 import { queryE2e } from "~/lib/e2e-data";
 
 // ---- LOCAL mode: the existing /data/runs.json manifest shape ----
@@ -111,6 +111,13 @@ export interface E2eDataContextValue {
   /** Number of runs currently loaded into the `runs` table (i.e. runs whose
    *  date falls within the current window preset). */
   runCount: number;
+  /** Maps each currently-loaded run's `run_id` to the report URL it was
+   *  materialized from (the run's signed `cucumberUrl` in API mode, or the
+   *  same-origin `/data/.../cucumber*.json` URL in LOCAL mode). Lets a route
+   *  read a single run's report file on demand - e.g. run-detail's "Log"
+   *  button via `buildScenarioLogsSql` - without keeping every report's raw
+   *  JSON around. */
+  reportUrlByRunId: Record<string, string>;
   /** Total runs available at the source, regardless of the current window.
    *  In API mode this is the grand total across the whole bucket (see
    *  server/index.ts). In LOCAL mode this is the full synced manifest count.
@@ -186,6 +193,7 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
   const [dataSource, setDataSource] = useState<E2eDataSource | null>(null);
   const [runCount, setRunCount] = useState(0);
   const [totalRuns, setTotalRuns] = useState(0);
+  const [reportUrlByRunId, setReportUrlByRunId] = useState<Record<string, string>>({});
   const [windowIndex, setWindowIndex] = useState(DEFAULT_WINDOW_INDEX);
   const [loadingMore, setLoadingMore] = useState(false);
   // Bumped whenever the tables are rebuilt in place (soft load-more) so mounted
@@ -228,6 +236,7 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
       let nextDataSource: E2eDataSource = "local";
       let nextRunCount = 0;
       let nextTotal = 0;
+      let nextReportUrlByRunId: Record<string, string> = {};
 
       const conn = await database.connect();
       try {
@@ -246,9 +255,15 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
             JSON.stringify(apiResponse.runs),
           );
           runsJsonUrl = "e2e_runs.json";
-          reportUrls = apiResponse.runs
-            .map((r) => r.cucumberUrl)
-            .filter((u): u is string => typeof u === "string" && u.length > 0);
+          nextReportUrlByRunId = Object.fromEntries(
+            apiResponse.runs
+              .filter(
+                (r): r is ApiRun & { cucumberUrl: string } =>
+                  typeof r.cucumberUrl === "string" && r.cucumberUrl.length > 0,
+              )
+              .map((r) => [r.run_id, r.cucumberUrl]),
+          );
+          reportUrls = Object.values(nextReportUrlByRunId);
 
           nextDataSource = "api";
           nextRunCount = apiResponse.runs.length;
@@ -278,9 +293,13 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
             JSON.stringify(manifest),
           );
           runsJsonUrl = "e2e_runs_local.json";
-          reportUrls = manifest.map((entry) =>
-            new URL(entry.file, dataBase).toString(),
+          nextReportUrlByRunId = Object.fromEntries(
+            manifest.map((entry) => [
+              entry.run_id,
+              new URL(entry.file, dataBase).toString(),
+            ]),
           );
+          reportUrls = Object.values(nextReportUrlByRunId);
 
           nextDataSource = "local";
           nextRunCount = manifest.length;
@@ -300,11 +319,40 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
           setDataSource(nextDataSource);
           setRunCount(nextRunCount);
           setTotalRuns(nextTotal);
+          setReportUrlByRunId(nextReportUrlByRunId);
           setRunsReady(true);
           setStatus("runs-ready");
         }
 
-        // ---- STAGE 2: heavy, reads all report files exactly once ----
+        // ---- STAGE 2a: test_id extraction, in small file BATCHES ----
+        // buildTestIdsSelectSql reads each scenario's after-hook text/plain log
+        // embedding's `name` ("Log of test <id>") - never the embeddings'
+        // `data`. But read_json still PARSES past those multi-MB `data` blobs in
+        // the raw JSON, so reading a whole wide window at once OOMs the wasm heap
+        // (that's the bug the name-only schema alone did NOT fix). Processing a
+        // few files at a time - INSERTing only the tiny (run_id, scenario_id,
+        // test_id) rows, then freeing - bounds peak parse memory to one batch
+        // regardless of window size. Isolated: a failing batch just leaves those
+        // runs' test_id null (LEFT JOIN below), never breaking scenarios/steps.
+        await conn.query(
+          `CREATE OR REPLACE TABLE test_ids (run_id VARCHAR, scenario_id VARCHAR, test_id VARCHAR);`,
+        );
+        const TEST_ID_BATCH_SIZE = 6;
+        for (let i = 0; i < reportUrls.length; i += TEST_ID_BATCH_SIZE) {
+          const batch = reportUrls.slice(i, i + TEST_ID_BATCH_SIZE);
+          try {
+            await conn.query(
+              `INSERT INTO test_ids ${buildTestIdsSelectSql(batch)};`,
+            );
+          } catch (testIdErr) {
+            console.warn(
+              `[E2eDataProvider] test_id extraction failed for a batch of ${batch.length} (those runs' test_id left null):`,
+              testIdErr,
+            );
+          }
+        }
+
+        // ---- STAGE 2b: heavy, reads all report files exactly once ----
         try {
           await conn.query(`
           CREATE OR REPLACE TABLE scenarios_raw AS SELECT * FROM v_scenarios;
@@ -316,7 +364,10 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
               (s.result.error_message IS NOT NULL) AS has_error,
               left(s.result.error_message, 2000) AS error_message, s.match.location AS glue_location
             FROM scenarios_raw sc, UNNEST(sc.steps) AS t(s);
-          CREATE OR REPLACE TABLE scenarios AS SELECT * EXCLUDE (steps) FROM scenarios_raw;
+          CREATE OR REPLACE TABLE scenarios AS
+            SELECT sr.* EXCLUDE (steps), ti.test_id
+            FROM scenarios_raw sr
+            LEFT JOIN test_ids ti USING (run_id, scenario_id);
           DROP TABLE scenarios_raw;
         `);
         } catch (stage2Err) {
@@ -332,7 +383,10 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
             stage2Err,
           );
           await conn.query(`
-          CREATE OR REPLACE TABLE scenarios AS SELECT * EXCLUDE (steps) FROM v_scenarios;
+          CREATE OR REPLACE TABLE scenarios AS
+            SELECT sr.* EXCLUDE (steps), ti.test_id
+            FROM v_scenarios sr
+            LEFT JOIN test_ids ti USING (run_id, scenario_id);
         `);
           setStepsFallback(true);
         }
@@ -344,6 +398,7 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
           setDataSource(nextDataSource);
           setRunCount(nextRunCount);
           setTotalRuns(nextTotal);
+          setReportUrlByRunId(nextReportUrlByRunId);
           setWindowIndex(windowIndexRef.current);
           setDataVersion((v) => v + 1);
         } else {
@@ -414,6 +469,7 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
     dataSource,
     runCount,
     totalRuns,
+    reportUrlByRunId,
     windowLabel: WINDOW_STEPS[windowIndex]?.label ?? "",
     nextWindowLabel:
       windowIndex < WINDOW_STEPS.length - 1

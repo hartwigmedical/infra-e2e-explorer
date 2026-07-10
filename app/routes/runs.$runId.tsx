@@ -1,8 +1,9 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
-import { ChevronRight, ChevronsDownUp, History, MoreHorizontal } from "lucide-react";
+import { Check, ChevronRight, ChevronsDownUp, Copy, FileText, History, Search } from "lucide-react";
 import { toast } from "sonner";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
+import { buildScenarioLogsSql } from "~/lib/e2e-views";
 import StatusBadge from "~/components/StatusBadge";
 import StatusMark from "~/components/StatusMark";
 import Spinner from "~/components/Spinner";
@@ -37,6 +38,10 @@ interface ScenarioRow {
   tag_names: string[] | null;
   duration_s: number | null;
   status: string;
+  /** 8-digit id parsed from the scenario's after-hook log embedding (see
+   *  v_test_ids in e2e-views.ts). Null for backgrounds (never in this table
+   *  anyway) or when the log had no "Test ID:" line / extraction failed. */
+  test_id: string | null;
 }
 
 interface StepRow {
@@ -50,6 +55,8 @@ interface StepRow {
   duration_s: number | null;
   has_error: boolean;
   error_message: string | null;
+  /** Glue method signature, e.g. "void com.hartwig.verification.lama.LamaSteps.foo()". */
+  glue_location: string | null;
 }
 
 /** Escape a value for safe interpolation into a single-quoted SQL string literal. */
@@ -65,6 +72,14 @@ function safeDecodeURIComponent(value: string | null): string | null {
   } catch {
     return value;
   }
+}
+
+/** Reduce a feature uri (e.g. "classpath:features/Foo.feature") to just its
+ *  filename for display - strips everything up to and including the last
+ *  "/". Falls back to the original string if there's no "/" to strip. */
+function featureFileName(uri: string): string {
+  const parts = uri.split("/");
+  return parts[parts.length - 1] || uri;
 }
 
 function formatDate(runId: string): string {
@@ -198,7 +213,7 @@ function StepList({
   const items = useMemo(() => buildStepItems(steps), [steps]);
 
   if (steps.length === 0) {
-    return <p className="px-4 py-3 text-xs text-muted-foreground">No steps recorded.</p>;
+    return <p className="py-3 pr-4 pl-10 text-xs text-muted-foreground">No steps recorded.</p>;
   }
 
   const renderStep = (step: StepRow) => {
@@ -213,7 +228,9 @@ function StepList({
           else stepRefs.current.delete(step.step_ordinal);
         }}
         className={cn(
-          "px-4 py-1.5 text-sm",
+          // pl-10 aligns the step's status dot under the scenario's (which is
+          // offset by its chevron + gap); pr-4 keeps the right edge flush.
+          "py-1.5 pr-4 pl-10 text-[13px]",
           isFocused && "rounded bg-accent ring-1 ring-inset ring-ring"
         )}
       >
@@ -243,7 +260,7 @@ function StepList({
   };
 
   return (
-    <ul className="divide-y divide-border/60 border-t bg-background/40">
+    <ul className="divide-y divide-border/60 bg-background/40">
       {items.map((item) => {
         if (item.type === "step") return renderStep(item.step);
 
@@ -259,7 +276,7 @@ function StepList({
           return (
             <Fragment key={`group-${item.key}`}>
               {item.steps.map((s) => renderStep(s))}
-              <li className="px-4 py-1">
+              <li className="py-1 pr-4 pl-10">
                 <button
                   type="button"
                   onClick={() => toggleGroup(item.key)}
@@ -294,7 +311,7 @@ function StepList({
                 title={`Show ${hiddenCount} hidden ${hiddenStatusWord ? hiddenStatusWord + " " : ""}step${hiddenCount === 1 ? "" : "s"}`}
                 className="flex w-full items-center gap-2 rounded py-0.5 text-xs text-muted-foreground hover:bg-muted/40 hover:text-foreground"
               >
-                <MoreHorizontal size={12} className="shrink-0" />
+                <span aria-hidden className="inline-block size-3 shrink-0" />
                 <span className="h-px flex-1 bg-border/60" />
                 <span className="whitespace-nowrap">
                   {`${hiddenCount} more ${hiddenStatusWord ? hiddenStatusWord + " " : ""}step${hiddenCount === 1 ? "" : "s"} hidden`}
@@ -310,6 +327,134 @@ function StepList({
   );
 }
 
+function CopyTestIdButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    };
+  }, []);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      if (timeoutRef.current) clearTimeout(timeoutRef.current);
+      timeoutRef.current = setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard API unavailable/denied (e.g. insecure context, permissions) -
+      // no-op; there's nothing else useful to do here.
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={handleCopy}
+      title={copied ? "Copied" : "Copy Test ID"}
+      className="inline-flex shrink-0 items-center rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+    >
+      {copied ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
+    </button>
+  );
+}
+
+/** Header rendered above an expanded scenario's step list: a LEFT group of
+ *  labeled fields (Test ID, Duration, Tags) and a RIGHT group of actions
+ *  (History, Log). Always renders - Duration/History/Log are relevant for
+ *  every scenario, unlike the test_id/tags fields it used to gate on. */
+function ScenarioDetailHeader({
+  scenario,
+  isLogOpen,
+  logsLoading,
+  logsError,
+  log,
+  onToggleLog,
+}: {
+  scenario: ScenarioRow;
+  isLogOpen: boolean;
+  /** True while this run's scenario logs are being fetched (shared across the
+   *  run - only meaningful while `isLogOpen`, since only one scenario's panel
+   *  can be open at a time). */
+  logsLoading: boolean;
+  logsError: Error | null;
+  /** This scenario's decoded log text, once loaded; undefined if not (yet)
+   *  loaded, null if loaded but this scenario had none. */
+  log: string | null | undefined;
+  onToggleLog: () => void;
+}) {
+  const tagList = Array.from(scenario.tag_names ?? []);
+  return (
+    <div className="border-b bg-muted/20">
+      <div className="flex flex-wrap items-center justify-between gap-2 py-1.5 pr-2 pl-10 text-xs">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-muted-foreground">
+          {scenario.test_id && (
+            <span className="inline-flex items-center gap-1.5">
+              <span>Test ID:</span>
+              <span className="font-mono font-medium text-foreground">{scenario.test_id}</span>
+              <CopyTestIdButton value={scenario.test_id} />
+            </span>
+          )}
+          <span>
+            Duration: <span className="font-mono text-foreground">{formatDuration(scenario.duration_s)}</span>
+          </span>
+          {tagList.length > 0 && (
+            <span className="inline-flex flex-wrap items-center gap-1.5">
+              <span>Tags:</span>
+              <span className="flex flex-wrap gap-1">
+                {tagList.map((tag) => (
+                  <span
+                    key={tag}
+                    className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+                  >
+                    {tag}
+                  </span>
+                ))}
+              </span>
+            </span>
+          )}
+        </div>
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          <Link
+            to={scenarioHistoryPath(scenario.feature_uri, scenario.scenario_id)}
+            title="View scenario history"
+            className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <History size={13} />
+            History
+          </Link>
+          <button
+            type="button"
+            onClick={onToggleLog}
+            title="View scenario log"
+            className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            {isLogOpen && logsLoading ? <Spinner size={12} /> : <FileText size={13} />}
+            Log
+          </button>
+        </div>
+      </div>
+      {isLogOpen && (
+        <div className="pr-4 pb-2 pl-10">
+          {logsLoading ? (
+            <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
+              <Spinner size={12} /> Loading log…
+            </div>
+          ) : logsError || log == null ? (
+            <p className="py-2 text-xs text-muted-foreground">Log unavailable.</p>
+          ) : (
+            <pre className="max-h-96 overflow-auto rounded border bg-background/60 p-2 text-xs whitespace-pre-wrap">
+              {log}
+            </pre>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ScenarioRow_({
   scenario,
   isOpen,
@@ -318,6 +463,11 @@ function ScenarioRow_({
   stepsLoading,
   isFocused,
   focusStepOrdinal,
+  isLogOpen,
+  logsLoading,
+  logsError,
+  log,
+  onToggleLog,
 }: {
   scenario: ScenarioRow;
   isOpen: boolean;
@@ -328,6 +478,12 @@ function ScenarioRow_({
   isFocused?: boolean;
   /** Step ordinal targeted by the `?step=` param, only meaningful when `isFocused`. */
   focusStepOrdinal?: number | null;
+  /** Whether THIS scenario's log panel is open. */
+  isLogOpen: boolean;
+  logsLoading: boolean;
+  logsError: Error | null;
+  log: string | null | undefined;
+  onToggleLog: () => void;
 }) {
   const kind = statusKindFromScenario(scenario.status);
   const rowRef = useRef<HTMLLIElement | null>(null);
@@ -341,46 +497,30 @@ function ScenarioRow_({
 
   return (
     <li ref={rowRef} className={cn(isFocused && "rounded-md bg-accent/60 ring-2 ring-ring")}>
-      <div className="flex w-full items-center gap-1 px-4 py-2 text-sm hover:bg-muted/40">
-        <button
-          type="button"
-          onClick={onToggle}
-          className="flex min-w-0 flex-1 items-center gap-2 text-left"
-        >
-          <ChevronRight
-            size={14}
-            className={cn("shrink-0 text-muted-foreground transition-transform", isOpen && "rotate-90")}
-          />
-          <StatusMark kind={kind} shape="dot" size={10} title={statusLabel(kind)} />
-          <span className="flex-1 truncate">{scenario.scenario_name}</span>
-          {scenario.tag_names && scenario.tag_names.length > 0 && (
-            <span className="hidden shrink-0 gap-1 sm:flex">
-              {Array.from(scenario.tag_names).slice(0, 3).map((tag) => (
-                <span
-                  key={tag}
-                  className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
-                >
-                  {tag}
-                </span>
-              ))}
-            </span>
-          )}
-          <span className="shrink-0 font-mono text-xs text-muted-foreground">
-            {formatDuration(scenario.duration_s)}
-          </span>
-        </button>
-        <Link
-          to={scenarioHistoryPath(scenario.feature_uri, scenario.scenario_id)}
-          title="View scenario history"
-          className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-        >
-          <History size={14} />
-        </Link>
-      </div>
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted/40"
+      >
+        <ChevronRight
+          size={14}
+          className={cn("shrink-0 text-muted-foreground transition-transform", isOpen && "rotate-90")}
+        />
+        <StatusMark kind={kind} shape="dot" size={10} title={statusLabel(kind)} />
+        <span className="flex-1 truncate">{scenario.scenario_name}</span>
+      </button>
       {isOpen && (
-        <div>
+        <div className="border-t">
+          <ScenarioDetailHeader
+            scenario={scenario}
+            isLogOpen={isLogOpen}
+            logsLoading={logsLoading}
+            logsError={logsError}
+            log={log}
+            onToggleLog={onToggleLog}
+          />
           {stepsLoading ? (
-            <div className="flex items-center gap-2 border-t px-4 py-3 text-xs text-muted-foreground">
+            <div className="flex items-center gap-2 py-3 pr-4 pl-10 text-xs text-muted-foreground">
               <Spinner size={12} /> Loading steps…
             </div>
           ) : (
@@ -397,21 +537,99 @@ export default function RunDetail() {
   const runId = rawRunId ? decodeURIComponent(rawRunId) : "";
   const runIdLit = sqlLit(runId);
 
-  const { detailsReady, status: dataStatus, error: dataError } = useE2eData();
+  const { detailsReady, status: dataStatus, error: dataError, query, reportUrlByRunId } = useE2eData();
   const [failuresOnly, setFailuresOnly] = useState(false);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const [testIdQuery, setTestIdQuery] = useState("");
   const [openScenario, setOpenScenario] = useState<string | null>(null);
+  const testIdInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Lazy per-run scenario logs (for the header's Log button): fetched once
+  // per run on first click, cached by scenario_id. `scenarioLogsRunIdRef`
+  // tracks which run the cache (if any) belongs to, so switching runs (or a
+  // failed fetch) triggers a fresh load rather than reusing stale data.
+  const [scenarioLogs, setScenarioLogs] = useState<Map<string, string | null> | null>(null);
+  const [logsLoading, setLogsLoading] = useState(false);
+  const [logsError, setLogsError] = useState<Error | null>(null);
+  const [openLogScenarioId, setOpenLogScenarioId] = useState<string | null>(null);
+  const scenarioLogsRunIdRef = useRef<string | null>(null);
+
+  // Reset the log cache/panel whenever the run changes.
+  useEffect(() => {
+    scenarioLogsRunIdRef.current = null;
+    setScenarioLogs(null);
+    setLogsLoading(false);
+    setLogsError(null);
+    setOpenLogScenarioId(null);
+  }, [runId]);
+
+  async function loadScenarioLogsIfNeeded() {
+    if (scenarioLogsRunIdRef.current === runId) return; // already loaded/loading for this run
+    const reportUrl = reportUrlByRunId[runId];
+    if (!reportUrl) {
+      setLogsError(new Error("No report URL available for this run"));
+      return;
+    }
+    scenarioLogsRunIdRef.current = runId;
+    setLogsLoading(true);
+    setLogsError(null);
+    try {
+      const rows = await query<{ scenario_id: string; log: string | null }>(
+        buildScenarioLogsSql(reportUrl)
+      );
+      setScenarioLogs(new Map(rows.map((r) => [r.scenario_id, r.log])));
+    } catch (e) {
+      scenarioLogsRunIdRef.current = null; // allow retrying on a later click
+      setScenarioLogs(null);
+      setLogsError(e instanceof Error ? e : new Error(String(e)));
+    } finally {
+      setLogsLoading(false);
+    }
+  }
+
+  function handleToggleLog(scenarioId: string) {
+    if (openLogScenarioId === scenarioId) {
+      setOpenLogScenarioId(null);
+      return;
+    }
+    setOpenLogScenarioId(scenarioId);
+    void loadScenarioLogsIfNeeded();
+  }
 
   // Cross-navigation focus: `?scenario=<scenario_id>&step=<step_ordinal>`,
   // e.g. from the Scenarios step-history grid/history-strip. `scenario_id` is
   // a Cucumber element id ("<feature-name-slug>;<scenario-name-slug>"), which
   // already embeds the feature and is unique within a single run's report -
   // no feature_uri is needed to disambiguate it here.
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const focusScenarioId = safeDecodeURIComponent(searchParams.get("scenario"));
   const focusStepParam = searchParams.get("step");
   const focusStepOrdinal =
     focusStepParam != null && /^\d+$/.test(focusStepParam) ? Number(focusStepParam) : null;
+
+  // Escape deselects: clears the `?scenario`/`?step` focus and collapses the
+  // open scenario, returning to the plain unfocused list. Skipped when the
+  // event originates in the test-id search box, so Escape there behaves like
+  // an ordinary text input rather than being hijacked by this global handler.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== "Escape") return;
+      if (e.target === testIdInputRef.current) return;
+      if (!focusScenarioId && focusStepParam == null && !openScenario) return;
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete("scenario");
+          next.delete("step");
+          return next;
+        },
+        { replace: true }
+      );
+      setOpenScenario(null);
+    }
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [focusScenarioId, focusStepParam, openScenario, setSearchParams]);
 
   const {
     rows: runRows,
@@ -432,7 +650,7 @@ export default function RunDetail() {
     error: scenariosError,
   } = useE2eQuery<ScenarioRow>(
     detailsReady && runId
-      ? `SELECT feature_uri, feature_name, scenario_id, scenario_name, ordinal, tag_names, duration_s, status
+      ? `SELECT feature_uri, feature_name, scenario_id, scenario_name, ordinal, tag_names, duration_s, status, test_id
          FROM scenarios WHERE run_id = ${runIdLit}`
       : null,
     [detailsReady, runId]
@@ -444,7 +662,7 @@ export default function RunDetail() {
     loading: stepsLoading,
   } = useE2eQuery<StepRow>(
     detailsReady && runId
-      ? `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status, duration_s, has_error, error_message
+      ? `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status, duration_s, has_error, error_message, glue_location
          FROM steps WHERE run_id = ${runIdLit} ORDER BY scenario_id, step_ordinal`
       : null,
     [detailsReady, runId]
@@ -500,6 +718,8 @@ export default function RunDetail() {
     return Array.from(tags).sort();
   }, [scenarios]);
 
+  const trimmedTestIdQuery = testIdQuery.trim().toLowerCase();
+
   const featureGroups = useMemo(() => {
     const filtered = scenarios.filter((s) => {
       // The scenario targeted by `?scenario=` must always render, regardless
@@ -515,6 +735,11 @@ export default function RunDetail() {
         selectedTags.length > 0 &&
         !Array.from(s.tag_names ?? []).some((t) => selectedTags.includes(t))
       ) {
+        return false;
+      }
+      // Case-insensitive substring match on test_id; a scenario with no
+      // test_id (background/parse miss) never matches a non-empty query.
+      if (trimmedTestIdQuery !== "" && !s.test_id?.toLowerCase().includes(trimmedTestIdQuery)) {
         return false;
       }
       return true;
@@ -545,7 +770,7 @@ export default function RunDetail() {
       if (worstA !== worstB) return worstA - worstB;
       return a.feature_name.localeCompare(b.feature_name);
     });
-  }, [scenarios, failuresOnly, selectedTags, focusedScenarioKey]);
+  }, [scenarios, failuresOnly, selectedTags, trimmedTestIdQuery, focusedScenarioKey]);
 
   const run = runRows[0];
   const combinedError = dataError ?? runError ?? scenariosError;
@@ -664,6 +889,18 @@ export default function RunDetail() {
         <h2 className="text-sm font-semibold text-muted-foreground">Features &amp; scenarios</h2>
         <div className="flex flex-wrap items-center gap-3">
           <TagFilter allTags={availableTags} selected={selectedTags} onChange={setSelectedTags} />
+          <div className="relative">
+            <Search size={13} className="absolute top-1/2 left-2 -translate-y-1/2 text-muted-foreground" />
+            <input
+              ref={testIdInputRef}
+              type="text"
+              name="test-id-search"
+              value={testIdQuery}
+              onChange={(e) => setTestIdQuery(e.target.value)}
+              placeholder="Search test ID…"
+              className="w-40 rounded-md border bg-background py-1 pr-2 pl-7 text-sm outline-none focus:ring-1 focus:ring-ring"
+            />
+          </div>
           <label className="flex items-center gap-2 text-sm whitespace-nowrap">
             <input
               type="checkbox"
@@ -687,7 +924,7 @@ export default function RunDetail() {
         </div>
       ) : featureGroups.length === 0 ? (
         <div className="rounded-lg border bg-card p-6 text-sm text-muted-foreground">
-          {failuresOnly || selectedTags.length > 0
+          {failuresOnly || selectedTags.length > 0 || trimmedTestIdQuery !== ""
             ? "No scenarios match the current filters."
             : "No scenarios in this run."}
         </div>
@@ -697,7 +934,9 @@ export default function RunDetail() {
             <div key={group.feature_uri} className="overflow-hidden rounded-lg border bg-card">
               <div className="border-b bg-muted/30 px-4 py-2 text-sm font-medium">
                 {group.feature_name}
-                <span className="ml-2 font-mono text-xs text-muted-foreground">{group.feature_uri}</span>
+                <span className="ml-2 font-mono text-xs text-muted-foreground">
+                  {featureFileName(group.feature_uri)}
+                </span>
               </div>
               <ul className="divide-y">
                 {group.scenarios.map((scenario) => {
@@ -713,6 +952,11 @@ export default function RunDetail() {
                       stepsLoading={stepsLoading && openScenario === key}
                       isFocused={isFocused}
                       focusStepOrdinal={focusStepOrdinal}
+                      isLogOpen={openLogScenarioId === scenario.scenario_id}
+                      logsLoading={logsLoading}
+                      logsError={logsError}
+                      log={scenarioLogs?.get(scenario.scenario_id)}
+                      onToggleLog={() => handleToggleLog(scenario.scenario_id)}
                     />
                   );
                 })}
