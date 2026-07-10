@@ -191,12 +191,18 @@ function HistoryStrip({
   rows,
   scenarioId,
   hoveredRunId,
+  hoverSource,
   onHoverRun,
 }: {
   rows: HistoryRow[];
   scenarioId: string;
   hoveredRunId: string | null;
-  onHoverRun: (runId: string | null) => void;
+  /** Which view set `hoveredRunId` - lets this cell tell "I'm being hovered
+   *  directly" (no border, just the CSS grow) apart from "the matching run
+   *  is highlighted because the *other* view (the step-history grid) is
+   *  hovering it" (border-on-rect cross-highlight). */
+  hoverSource: "strip" | "grid" | null;
+  onHoverRun: (runId: string | null, source: "strip" | "grid") => void;
 }) {
   if (rows.length === 0) {
     return <p className="text-sm text-muted-foreground">No runs match the current filter.</p>;
@@ -205,19 +211,26 @@ function HistoryStrip({
     <div className="flex flex-wrap gap-1">
       {rows.map((row) => {
         const kind = statusKindFromScenario(row.status);
+        // Cross-highlight only - a direct hover on *this* cell also sets
+        // hoveredRunId to row.run_id, but with hoverSource "strip", so it's
+        // excluded here and left with just the CSS hover:scale-125 grow.
+        const isCrossHighlighted = hoveredRunId === row.run_id && hoverSource === "grid";
         return (
           <Link
             key={row.run_id}
             to={`/runs/${encodeURIComponent(row.run_id)}?scenario=${encodeURIComponent(scenarioId)}`}
-            onMouseEnter={() => onHoverRun(row.run_id)}
-            onMouseLeave={() => onHoverRun(null)}
+            onMouseEnter={() => onHoverRun(row.run_id, "strip")}
+            onMouseLeave={() => onHoverRun(null, "strip")}
             title={`${row.run_id}\n${formatRunDateTime(row.run_id)}\n${statusLabel(kind)} · ${formatDuration(row.duration_s)}${row.is_nightly ? "" : " · manual"}`}
-            className={cn(
-              "transition-transform hover:scale-125",
-              hoveredRunId === row.run_id && "ring-2 ring-ring"
-            )}
+            className="transition-transform hover:scale-125"
           >
-            <StatusMark kind={kind} shape="square" size={16} title="" />
+            <StatusMark
+              kind={kind}
+              shape="square"
+              size={16}
+              title=""
+              className={cn(isCrossHighlighted && "border-2 border-foreground/20")}
+            />
           </Link>
         );
       })}
@@ -242,7 +255,7 @@ function StepGrid({
   stepRows: StepHistoryRow[];
   scenarioId: string;
   hoveredRunId: string | null;
-  onHoverRun: (runId: string | null) => void;
+  onHoverRun: (runId: string | null, source: "strip" | "grid") => void;
 }) {
   const gridRows = useMemo<StepGridRow[]>(() => {
     const byOrdinal = new Map<number, StepGridRow>();
@@ -276,8 +289,8 @@ function StepGrid({
               <th
                 key={runId}
                 title={runId}
-                onMouseEnter={() => onHoverRun(runId)}
-                onMouseLeave={() => onHoverRun(null)}
+                onMouseEnter={() => onHoverRun(runId, "grid")}
+                onMouseLeave={() => onHoverRun(null, "grid")}
                 className={cn(
                   "sticky top-0 z-10 w-6 border-b bg-muted px-0.5 py-1.5 text-center font-normal text-muted-foreground",
                   hoveredRunId === runId && "bg-accent"
@@ -308,18 +321,21 @@ function StepGrid({
                 const isHoveredCol = hoveredRunId === runId;
                 const label = cell ? statusLabel(kind) : "no data";
                 return (
-                  <td
-                    key={runId}
-                    className={cn("border-b p-0.5 text-center", isHoveredCol && "bg-accent")}
-                  >
+                  <td key={runId} className="border-b p-0.5 text-center">
                     <Link
                       to={`/runs/${encodeURIComponent(runId)}?scenario=${encodeURIComponent(scenarioId)}&step=${row.step_ordinal}`}
-                      onMouseEnter={() => onHoverRun(runId)}
-                      onMouseLeave={() => onHoverRun(null)}
+                      onMouseEnter={() => onHoverRun(runId, "grid")}
+                      onMouseLeave={() => onHoverRun(null, "grid")}
                       title={`${row.step_label} · ${runId} · ${label} — open run detail`}
                       className="mx-auto block transition-transform hover:scale-125"
                     >
-                      <StatusMark kind={kind} shape="square" size={16} title="" />
+                      <StatusMark
+                        kind={kind}
+                        shape="square"
+                        size={16}
+                        title=""
+                        className={cn(isHoveredCol && "border-2 border-foreground/20")}
+                      />
                     </Link>
                   </td>
                 );
@@ -337,13 +353,15 @@ function ScenarioDetailPanel({
   nightlyOnly,
   tags,
   hoveredRunId,
+  hoverSource,
   onHoverRun,
 }: {
   selected: SelectedScenario;
   nightlyOnly: boolean;
   tags: string[];
   hoveredRunId: string | null;
-  onHoverRun: (runId: string | null) => void;
+  hoverSource: "strip" | "grid" | null;
+  onHoverRun: (runId: string | null, source: "strip" | "grid") => void;
 }) {
   const { detailsReady } = useE2eData();
 
@@ -400,6 +418,7 @@ function ScenarioDetailPanel({
             rows={historyRows}
             scenarioId={selected.scenario_id}
             hoveredRunId={hoveredRunId}
+            hoverSource={hoverSource}
             onHoverRun={onHoverRun}
           />
         )}
@@ -435,7 +454,16 @@ export default function Scenarios() {
   const [featureFilter, setFeatureFilter] = useState("");
   const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set());
   const [hoveredRunId, setHoveredRunId] = useState<string | null>(null);
+  // Which view (history strip vs. step-history grid) is the source of the
+  // current `hoveredRunId` - lets the strip tell apart "I'm directly hovered"
+  // (no border) from "the grid lit me up via the shared run-id" (border).
+  const [hoverSource, setHoverSource] = useState<"strip" | "grid" | null>(null);
   const selectedItemRef = useRef<HTMLButtonElement | null>(null);
+
+  const handleHoverRun = (runId: string | null, source: "strip" | "grid") => {
+    setHoveredRunId(runId);
+    setHoverSource(runId == null ? null : source);
+  };
 
   // The URL is the single source of truth for the selection: `selected` below
   // is derived (never stored in React state) from `?feature=&scenario=`, by
@@ -665,7 +693,8 @@ export default function Scenarios() {
               nightlyOnly={nightlyOnly}
               tags={selectedTagsList}
               hoveredRunId={hoveredRunId}
-              onHoverRun={setHoveredRunId}
+              hoverSource={hoverSource}
+              onHoverRun={handleHoverRun}
             />
           ) : resolvingSelection ? (
             <div className="flex h-64 items-center justify-center gap-2 rounded-lg border bg-card text-sm text-muted-foreground">

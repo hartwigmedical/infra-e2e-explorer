@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
-import { ChevronRight, History } from "lucide-react";
+import { ChevronRight, ChevronsDownUp, History, MoreHorizontal } from "lucide-react";
 import { toast } from "sonner";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
 import StatusBadge from "~/components/StatusBadge";
@@ -104,6 +104,48 @@ function TypeBadge({ isNightly }: { isNightly: boolean }) {
 // Order for surfacing failures first within a feature's scenario list.
 const STATUS_SORT_RANK: Record<string, number> = { failed: 0, skipped: 1, passed: 2 };
 
+// Minimum length of a consecutive passed/skipped run before it gets collapsed
+// into a "first … (N hidden) … last" affordance. Shorter runs (and any run
+// broken up by a failed step) render every step normally.
+const COLLAPSE_THRESHOLD = 4;
+
+type StepItem =
+  | { type: "step"; step: StepRow }
+  | { type: "group"; key: number; steps: StepRow[] };
+
+/**
+ * Walk a scenario's steps (already ordered by step_ordinal) and fold maximal
+ * runs of >= COLLAPSE_THRESHOLD consecutive passed/skipped steps into a single
+ * collapsible "group" item. A `failed` step is never part of a group - it's
+ * always its own item, and it breaks whatever passed/skipped run precedes it.
+ * Runs shorter than the threshold are left as plain per-step items so the UI
+ * never collapses 1-3 steps.
+ */
+function buildStepItems(steps: StepRow[]): StepItem[] {
+  const items: StepItem[] = [];
+  let i = 0;
+  while (i < steps.length) {
+    const step = steps[i];
+    if (step.status === "passed" || step.status === "skipped") {
+      let j = i + 1;
+      while (j < steps.length && (steps[j].status === "passed" || steps[j].status === "skipped")) {
+        j++;
+      }
+      const run = steps.slice(i, j);
+      if (run.length >= COLLAPSE_THRESHOLD) {
+        items.push({ type: "group", key: run[0].step_ordinal, steps: run });
+      } else {
+        for (const s of run) items.push({ type: "step", step: s });
+      }
+      i = j;
+    } else {
+      items.push({ type: "step", step });
+      i++;
+    }
+  }
+  return items;
+}
+
 function StepList({
   steps,
   focusStepOrdinal,
@@ -113,6 +155,12 @@ function StepList({
   focusStepOrdinal?: number | null;
 }) {
   const [openErrors, setOpenErrors] = useState<Set<number>>(new Set());
+  // Collapsed groups (>= COLLAPSE_THRESHOLD consecutive passed/skipped steps)
+  // that the user has manually expanded, keyed by the group's first step's
+  // ordinal (unique within a scenario). A group also renders expanded - even
+  // without being in this set - when it contains the currently-focused step;
+  // see `containsFocus` below.
+  const [expandedGroups, setExpandedGroups] = useState<Set<number>>(new Set());
   const stepRefs = useRef<Map<number, HTMLLIElement>>(new Map());
 
   const toggleError = (ordinal: number) => {
@@ -120,6 +168,15 @@ function StepList({
       const next = new Set(prev);
       if (next.has(ordinal)) next.delete(ordinal);
       else next.add(ordinal);
+      return next;
+    });
+  };
+
+  const toggleGroup = (key: number) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
   };
@@ -137,50 +194,108 @@ function StepList({
     stepRefs.current.get(focusStepOrdinal)?.scrollIntoView({ block: "center" });
   }, [focusStepOrdinal, steps]);
 
+  const items = useMemo(() => buildStepItems(steps), [steps]);
+
   if (steps.length === 0) {
     return <p className="px-4 py-3 text-xs text-muted-foreground">No steps recorded.</p>;
   }
 
+  const renderStep = (step: StepRow) => {
+    const kind = statusKindFromScenario(step.status);
+    const errorOpen = openErrors.has(step.step_ordinal);
+    const isFocused = focusStepOrdinal === step.step_ordinal;
+    return (
+      <li
+        key={step.step_ordinal}
+        ref={(el) => {
+          if (el) stepRefs.current.set(step.step_ordinal, el);
+          else stepRefs.current.delete(step.step_ordinal);
+        }}
+        className={cn(
+          "px-4 py-1.5 text-sm",
+          isFocused && "rounded bg-accent ring-1 ring-inset ring-ring"
+        )}
+      >
+        <div className="flex items-center gap-2">
+          <StatusMark kind={kind} shape="dot" size={9} title={statusLabel(kind)} />
+          <span className="flex-1 truncate">{step.step_label}</span>
+          <span className="shrink-0 font-mono text-xs text-muted-foreground">
+            {formatDuration(step.duration_s)}
+          </span>
+          {step.has_error && (
+            <button
+              type="button"
+              onClick={() => toggleError(step.step_ordinal)}
+              className="shrink-0 rounded px-1.5 py-0.5 text-xs text-red-600 hover:bg-red-500/10 dark:text-red-400"
+            >
+              {errorOpen ? "Hide error" : "Show error"}
+            </button>
+          )}
+        </div>
+        {step.has_error && errorOpen && (
+          <pre className="mt-1.5 max-h-64 overflow-auto rounded border border-red-500/20 bg-red-500/5 p-2 text-xs whitespace-pre-wrap text-red-700 dark:text-red-300">
+            {step.error_message ?? "(no error message)"}
+          </pre>
+        )}
+      </li>
+    );
+  };
+
   return (
     <ul className="divide-y divide-border/60 border-t bg-background/40">
-      {steps.map((step) => {
-        const kind = statusKindFromScenario(step.status);
-        const errorOpen = openErrors.has(step.step_ordinal);
-        const isFocused = focusStepOrdinal === step.step_ordinal;
-        return (
-          <li
-            key={step.step_ordinal}
-            ref={(el) => {
-              if (el) stepRefs.current.set(step.step_ordinal, el);
-              else stepRefs.current.delete(step.step_ordinal);
-            }}
-            className={cn(
-              "px-4 py-1.5 text-sm",
-              isFocused && "rounded bg-accent ring-1 ring-inset ring-ring"
-            )}
-          >
-            <div className="flex items-center gap-2">
-              <StatusMark kind={kind} shape="dot" size={9} title={statusLabel(kind)} />
-              <span className="flex-1 truncate">{step.step_label}</span>
-              <span className="shrink-0 font-mono text-xs text-muted-foreground">
-                {formatDuration(step.duration_s)}
-              </span>
-              {step.has_error && (
+      {items.map((item) => {
+        if (item.type === "step") return renderStep(item.step);
+
+        // A collapsed group must still render fully open if the deep-linked
+        // step (`?step=`) falls inside its hidden middle - otherwise the scroll
+        // + highlight effect above would have nothing to find in the DOM.
+        const containsFocus =
+          focusStepOrdinal != null && item.steps.some((s) => s.step_ordinal === focusStepOrdinal);
+        const isExpanded = containsFocus || expandedGroups.has(item.key);
+        const hiddenCount = item.steps.length - 2;
+
+        if (isExpanded) {
+          return (
+            <Fragment key={`group-${item.key}`}>
+              {item.steps.map((s) => renderStep(s))}
+              <li className="px-4 py-1">
                 <button
                   type="button"
-                  onClick={() => toggleError(step.step_ordinal)}
-                  className="shrink-0 rounded px-1.5 py-0.5 text-xs text-red-600 hover:bg-red-500/10 dark:text-red-400"
+                  onClick={() => toggleGroup(item.key)}
+                  className="flex w-full items-center gap-2 rounded py-0.5 text-xs text-muted-foreground hover:bg-muted/40 hover:text-foreground"
                 >
-                  {errorOpen ? "Hide error" : "Show error"}
+                  <ChevronsDownUp size={12} className="shrink-0" />
+                  <span className="h-px flex-1 bg-border/60" />
+                  <span>collapse {item.steps.length} steps</span>
+                  <span className="h-px flex-1 bg-border/60" />
                 </button>
-              )}
-            </div>
-            {step.has_error && errorOpen && (
-              <pre className="mt-1.5 max-h-64 overflow-auto rounded border border-red-500/20 bg-red-500/5 p-2 text-xs whitespace-pre-wrap text-red-700 dark:text-red-300">
-                {step.error_message ?? "(no error message)"}
-              </pre>
-            )}
-          </li>
+              </li>
+            </Fragment>
+          );
+        }
+
+        const first = item.steps[0];
+        const last = item.steps[item.steps.length - 1];
+        return (
+          <Fragment key={`group-${item.key}`}>
+            {renderStep(first)}
+            <li className="px-4 py-1">
+              <button
+                type="button"
+                onClick={() => toggleGroup(item.key)}
+                title={`Show ${hiddenCount} hidden step${hiddenCount === 1 ? "" : "s"}`}
+                className="flex w-full items-center gap-2 rounded py-0.5 text-xs text-muted-foreground hover:bg-muted/40 hover:text-foreground"
+              >
+                <MoreHorizontal size={12} className="shrink-0" />
+                <span className="h-px flex-1 bg-border/60" />
+                <span className="whitespace-nowrap">
+                  ··· {hiddenCount} more step{hiddenCount === 1 ? "" : "s"} hidden ···
+                </span>
+                <span className="h-px flex-1 bg-border/60" />
+              </button>
+            </li>
+            {renderStep(last)}
+          </Fragment>
         );
       })}
     </ul>

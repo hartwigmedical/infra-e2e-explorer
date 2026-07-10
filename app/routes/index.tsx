@@ -105,8 +105,8 @@ export default function Index() {
     status,
     error,
     runCount,
+    runsReady,
     detailsReady,
-    dataSource,
     windowLabel,
     loadingMore,
     hasMore,
@@ -154,8 +154,12 @@ export default function Index() {
     );
   }
 
-  // Nothing to show at all yet (stage 1 hasn't produced the `runs` table).
-  if (!runCount && (status === "loading" || runsLoading)) {
+  // Unified initial-loading state: show a single "Loading runs…" until the runs
+  // ROWS are actually on screen — not merely until runCount is known — otherwise
+  // the empty table + load-more button + per-column spinners flash first. This is
+  // distinct from load-more, where rows are already present so we never hit it.
+  const settledEmpty = runsReady && !runsLoading && runs.length === 0;
+  if (runs.length === 0 && !settledEmpty) {
     return (
       <div className="mx-auto flex max-w-5xl items-center gap-2 p-6 text-sm text-muted-foreground">
         <Spinner /> Loading runs…
@@ -170,11 +174,6 @@ export default function Index() {
           <h1 className="text-lg font-semibold">Recent Runs</h1>
           <p className="text-sm text-muted-foreground">
             {runCount} run{runCount === 1 ? "" : "s"} · {windowLabel}
-            {dataSource === "api" && (
-              <span className="ml-2 rounded-full bg-sky-500/15 px-2 py-0.5 text-xs font-medium text-sky-600 dark:text-sky-400">
-                Live
-              </span>
-            )}
           </p>
         </div>
         <div className="flex items-center gap-3 rounded-lg border bg-card px-4 py-2">
