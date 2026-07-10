@@ -47,11 +47,11 @@ interface ApiRunsResponse {
  *  default is the past week (fast to load); `loadMore` steps to the next wider
  *  window. */
 export const WINDOW_STEPS: { label: string; days: number | null }[] = [
-  { label: "past week", days: 7 },
-  { label: "past month", days: 30 },
-  { label: "past 3 months", days: 90 },
-  { label: "past year", days: 365 },
-  { label: "all time", days: null },
+  { label: "Last 7 days", days: 7 },
+  { label: "Last 30 days", days: 30 },
+  { label: "Last 3 months", days: 90 },
+  { label: "Last year", days: 365 },
+  { label: "All time", days: null },
 ];
 export const DEFAULT_WINDOW_INDEX = 0;
 
@@ -117,9 +117,14 @@ export interface E2eDataContextValue {
    *  Compare against `runCount` (via `hasMore`) to tell whether older runs
    *  exist beyond the current window. */
   totalRuns: number;
-  /** Human label for the current window preset (e.g. "past week"); widens one
+  /** Human label for the current window preset (e.g. "Last 7 days"); widens one
    *  step per `loadMore()` call. See WINDOW_STEPS. */
   windowLabel: string;
+  /** Label of the NEXT wider preset (e.g. "Last 30 days" while `windowLabel`
+   *  is "Last 7 days"), or null once the widest preset ("All time") is
+   *  already active. Lets callers (e.g. DateRangeControl) label a "Load more"
+   *  action and detect when everything is loaded. */
+  nextWindowLabel: string | null;
   /** True while a `loadMore` re-materialization is in flight. */
   loadingMore: boolean;
   /** Increments each time the tables are rebuilt in place (soft load-more), so
@@ -410,6 +415,10 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
     runCount,
     totalRuns,
     windowLabel: WINDOW_STEPS[windowIndex]?.label ?? "",
+    nextWindowLabel:
+      windowIndex < WINDOW_STEPS.length - 1
+        ? WINDOW_STEPS[windowIndex + 1].label
+        : null,
     loadingMore,
     dataVersion,
     hasMore,

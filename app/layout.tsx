@@ -2,6 +2,7 @@ import { Link, Outlet } from "react-router";
 import { DuckDBProvider } from "~/contexts/DuckDBContext";
 import { E2eDataProvider, useE2eData } from "~/contexts/E2eDataContext";
 import Spinner from "~/components/Spinner";
+import DateRangeControl from "~/components/DateRangeControl";
 
 function GlobalStatus() {
   const { status, runCount } = useE2eData();
@@ -40,7 +41,10 @@ export default function Layout() {
                 </Link>
               </nav>
             </div>
-            <GlobalStatus />
+            <div className="flex items-center gap-4">
+              <GlobalStatus />
+              <DateRangeControl />
+            </div>
           </header>
           <main className="p-4">
             <Outlet />

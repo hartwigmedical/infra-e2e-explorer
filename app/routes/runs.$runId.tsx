@@ -104,9 +104,10 @@ function TypeBadge({ isNightly }: { isNightly: boolean }) {
 // Order for surfacing failures first within a feature's scenario list.
 const STATUS_SORT_RANK: Record<string, number> = { failed: 0, skipped: 1, passed: 2 };
 
-// Minimum length of a consecutive passed/skipped run before it gets collapsed
-// into a "first … (N hidden) … last" affordance. Shorter runs (and any run
-// broken up by a failed step) render every step normally.
+// Minimum length of a consecutive SAME-status run (all passed, or all skipped)
+// before it gets collapsed into a "first … (N hidden) … last" affordance.
+// Shorter runs, and any run broken by a status change (incl. a failure), render
+// every step normally.
 const COLLAPSE_THRESHOLD = 4;
 
 type StepItem =
@@ -115,11 +116,10 @@ type StepItem =
 
 /**
  * Walk a scenario's steps (already ordered by step_ordinal) and fold maximal
- * runs of >= COLLAPSE_THRESHOLD consecutive passed/skipped steps into a single
- * collapsible "group" item. A `failed` step is never part of a group - it's
- * always its own item, and it breaks whatever passed/skipped run precedes it.
- * Runs shorter than the threshold are left as plain per-step items so the UI
- * never collapses 1-3 steps.
+ * runs of >= COLLAPSE_THRESHOLD consecutive SAME-status steps (all passed, or
+ * all skipped — never a mix) into a single collapsible "group" item. A `failed`
+ * step is never grouped, and any status change (passed↔skipped, or a failure)
+ * breaks the run. Runs shorter than the threshold are left as plain per-step items.
  */
 function buildStepItems(steps: StepRow[]): StepItem[] {
   const items: StepItem[] = [];
@@ -127,8 +127,9 @@ function buildStepItems(steps: StepRow[]): StepItem[] {
   while (i < steps.length) {
     const step = steps[i];
     if (step.status === "passed" || step.status === "skipped") {
+      const runStatus = step.status;
       let j = i + 1;
-      while (j < steps.length && (steps[j].status === "passed" || steps[j].status === "skipped")) {
+      while (j < steps.length && steps[j].status === runStatus) {
         j++;
       }
       const run = steps.slice(i, j);
@@ -276,6 +277,13 @@ function StepList({
 
         const first = item.steps[0];
         const last = item.steps[item.steps.length - 1];
+        // A run breaks at failures, so the hidden middle is normally all one
+        // status (passed or skipped) — name it; fall back to generic if mixed.
+        const hiddenStatuses = new Set(
+          item.steps.slice(1, -1).map((s) => s.status),
+        );
+        const hiddenStatusWord =
+          hiddenStatuses.size === 1 ? [...hiddenStatuses][0] : null;
         return (
           <Fragment key={`group-${item.key}`}>
             {renderStep(first)}
@@ -283,13 +291,13 @@ function StepList({
               <button
                 type="button"
                 onClick={() => toggleGroup(item.key)}
-                title={`Show ${hiddenCount} hidden step${hiddenCount === 1 ? "" : "s"}`}
+                title={`Show ${hiddenCount} hidden ${hiddenStatusWord ? hiddenStatusWord + " " : ""}step${hiddenCount === 1 ? "" : "s"}`}
                 className="flex w-full items-center gap-2 rounded py-0.5 text-xs text-muted-foreground hover:bg-muted/40 hover:text-foreground"
               >
                 <MoreHorizontal size={12} className="shrink-0" />
                 <span className="h-px flex-1 bg-border/60" />
                 <span className="whitespace-nowrap">
-                  ··· {hiddenCount} more step{hiddenCount === 1 ? "" : "s"} hidden ···
+                  {`${hiddenCount} more ${hiddenStatusWord ? hiddenStatusWord + " " : ""}step${hiddenCount === 1 ? "" : "s"} hidden`}
                 </span>
                 <span className="h-px flex-1 bg-border/60" />
               </button>

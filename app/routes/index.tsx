@@ -101,17 +101,7 @@ function ScenarioCounts({ counts }: { counts: ScenarioCountRow | undefined }) {
 }
 
 export default function Index() {
-  const {
-    status,
-    error,
-    runCount,
-    runsReady,
-    detailsReady,
-    windowLabel,
-    loadingMore,
-    hasMore,
-    loadMore,
-  } = useE2eData();
+  const { status, error, runCount, runsReady, detailsReady } = useE2eData();
   const {
     rows: runs,
     loading: runsLoading,
@@ -173,7 +163,7 @@ export default function Index() {
         <div>
           <h1 className="text-lg font-semibold">Recent Runs</h1>
           <p className="text-sm text-muted-foreground">
-            {runCount} run{runCount === 1 ? "" : "s"} · {windowLabel}
+            {runCount} run{runCount === 1 ? "" : "s"}
           </p>
         </div>
         <div className="flex items-center gap-3 rounded-lg border bg-card px-4 py-2">
@@ -285,20 +275,6 @@ export default function Index() {
           </tbody>
         </table>
       </div>
-
-      {hasMore && (
-        <div className="flex justify-center">
-          <button
-            type="button"
-            onClick={loadMore}
-            disabled={loadingMore}
-            className="inline-flex items-center gap-2 rounded-lg border bg-card px-4 py-2 text-sm font-medium hover:bg-muted/50 disabled:opacity-60"
-          >
-            {loadingMore && <Spinner size={13} />}
-            {loadingMore ? "Loading…" : "Load more (older)"}
-          </button>
-        </div>
-      )}
     </div>
   );
 }
