@@ -568,9 +568,6 @@ export default function RunDetail() {
   const runIdLit = sqlLit(runId);
 
   const { detailsReady, status: dataStatus, error: dataError, query, reportUrlByRunId } = useE2eData();
-  const [failuresOnly, setFailuresOnly] = useState(false);
-  const [selectedTags, setSelectedTags] = useState<string[]>([]);
-  const [testIdQuery, setTestIdQuery] = useState("");
   const [openScenario, setOpenScenario] = useState<string | null>(null);
   const testIdInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -636,6 +633,48 @@ export default function RunDetail() {
   const focusStepParam = searchParams.get("step");
   const focusStepOrdinal =
     focusStepParam != null && /^\d+$/.test(focusStepParam) ? Number(focusStepParam) : null;
+
+  // Filters live in the URL so they survive deep links and Back navigation.
+  // Each value is derived straight from the search params; `patchFilters` (the
+  // sole writer) uses `replace` so toggling/typing doesn't pile up history
+  // entries, and `preventScrollReset` so a filter change never jumps the page.
+  // Tags use repeated `?tag=` params (no delimiter to escape). `selectedTags`
+  // is memoized so its array identity is stable across renders that don't
+  // touch the URL - featureGroups depends on it.
+  const failuresOnly = searchParams.get("failures") === "1";
+  const testIdQuery = searchParams.get("testId") ?? "";
+  const selectedTags = useMemo(() => searchParams.getAll("tag"), [searchParams]);
+
+  const patchFilters = useCallback(
+    (mutate: (params: URLSearchParams) => void) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          mutate(next);
+          return next;
+        },
+        { replace: true, preventScrollReset: true }
+      );
+    },
+    [setSearchParams]
+  );
+
+  const setFailuresOnly = useCallback(
+    (on: boolean) => patchFilters((p) => (on ? p.set("failures", "1") : p.delete("failures"))),
+    [patchFilters]
+  );
+  const setTestIdQuery = useCallback(
+    (value: string) => patchFilters((p) => (value ? p.set("testId", value) : p.delete("testId"))),
+    [patchFilters]
+  );
+  const setSelectedTags = useCallback(
+    (tags: string[]) =>
+      patchFilters((p) => {
+        p.delete("tag");
+        for (const tag of tags) p.append("tag", tag);
+      }),
+    [patchFilters]
+  );
 
   // Clear the `?scenario`/`?step` selection, removing the highlight. Shared by
   // the Escape shortcut and the click-away handler. Leaves the row's expand
