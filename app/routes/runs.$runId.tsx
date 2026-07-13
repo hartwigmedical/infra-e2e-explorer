@@ -370,9 +370,10 @@ function ScenarioDetailHeader({
   onToggleLog,
 }: {
   scenario: ScenarioRow;
-  /** Select this scenario, writing `?scenario=` to the URL - which makes the
-   *  address bar a shareable link to it (the "Link" action). */
-  onSelect: () => void;
+  /** Select this scenario (writes `?scenario=` to the URL). Used by the "Link"
+   *  action, and - with { replace: true } - by "History" just before it
+   *  navigates away, so Back returns here with the scenario still selected. */
+  onSelect: (opts?: { replace?: boolean }) => void;
   isLogOpen: boolean;
   /** True while this run's scenario logs are being fetched (shared across the
    *  run - only meaningful while `isLogOpen`, since only one scenario's panel
@@ -418,7 +419,7 @@ function ScenarioDetailHeader({
         <div className="ml-auto flex shrink-0 items-center gap-1">
           <button
             type="button"
-            onClick={onSelect}
+            onClick={() => onSelect()}
             title="Link to this scenario (updates the address bar)"
             className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-muted-foreground hover:bg-muted hover:text-foreground"
           >
@@ -427,6 +428,9 @@ function ScenarioDetailHeader({
           </button>
           <Link
             to={scenarioHistoryPath(scenario.feature_uri, scenario.scenario_id)}
+            // Select this scenario (replacing the current history entry) before
+            // leaving, so Back from the history view lands here with it selected.
+            onClick={() => onSelect({ replace: true })}
             title="View scenario history"
             className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-muted-foreground hover:bg-muted hover:text-foreground"
           >
@@ -487,8 +491,8 @@ function ScenarioRow_({
   isFocused?: boolean;
   /** Step ordinal targeted by the `?step=` param, only meaningful when `isFocused`. */
   focusStepOrdinal?: number | null;
-  /** Select this scenario via the header's "Link" action (see ScenarioDetailHeader). */
-  onSelect: () => void;
+  /** Select this scenario, via the header's "Link"/"History" actions (see ScenarioDetailHeader). */
+  onSelect: (opts?: { replace?: boolean }) => void;
   /** Whether THIS scenario's log panel is open. */
   isLogOpen: boolean;
   logsLoading: boolean;
@@ -696,11 +700,29 @@ export default function RunDetail() {
   // Select a scenario by writing `?scenario=` (dropping any `?step=` focus,
   // which is a different, step-level deep link). This is the same URL write a
   // deep link from /scenarios produces, so selection and permalinking share
-  // one code path. A plain push (not replace) so Back steps through selections;
-  // `preventScrollReset` because the focused row scrolls itself into view (see
-  // ScenarioRow_) and the default scroll-to-top would fight that.
+  // one code path. `preventScrollReset` because the focused row scrolls itself
+  // into view (see ScenarioRow_) and the default scroll-to-top would fight it.
+  //
+  // `{ replace: true }` is used by "History" to annotate the entry it's about
+  // to leave, so Back returns here with the scenario selected. It can't go
+  // through the router: the ensuing Link navigation to /scenarios supersedes a
+  // router replace before it commits. So rewrite the current entry directly via
+  // the History API (synchronous, and reusing history.state keeps React
+  // Router's key/idx intact), preserving any other params already in the URL.
   const selectScenario = useCallback(
-    (scenarioId: string) => {
+    (scenarioId: string, opts?: { replace?: boolean }) => {
+      if (opts?.replace) {
+        const params = new URLSearchParams(window.location.search);
+        params.set("scenario", scenarioId);
+        params.delete("step");
+        const search = params.toString();
+        window.history.replaceState(
+          window.history.state,
+          "",
+          `${window.location.pathname}${search ? `?${search}` : ""}`
+        );
+        return;
+      }
       setSearchParams(
         (prev) => {
           const next = new URLSearchParams(prev);
@@ -1069,7 +1091,7 @@ export default function RunDetail() {
                       stepsLoading={stepsLoading && openScenario === key}
                       isFocused={isFocused}
                       focusStepOrdinal={focusStepOrdinal}
-                      onSelect={() => selectScenario(scenario.scenario_id)}
+                      onSelect={(opts) => selectScenario(scenario.scenario_id, opts)}
                       isLogOpen={openLogScenarioId === scenario.scenario_id}
                       logsLoading={logsLoading}
                       logsError={logsError}
