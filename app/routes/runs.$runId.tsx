@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
-import { Check, ChevronRight, ChevronsDownUp, Copy, FileText, History, Link2, Search } from "lucide-react";
+import { Check, ChevronRight, ChevronsDownUp, ChevronsUpDown, Copy, FileText, History, Link2, Search, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
 import { buildScenarioLogsSql } from "~/lib/e2e-views";
@@ -165,12 +165,18 @@ function buildStepItems(steps: StepRow[]): StepItem[] {
 function StepList({
   steps,
   focusStepOrdinal,
+  revealErrorsToken,
 }: {
   steps: StepRow[];
   /** Step ordinal to scroll to, highlight, and (if failed) auto-expand the error for. One-time per value change. */
   focusStepOrdinal?: number | null;
+  /** Monotonic counter bumped by the run detail's "reveal failures" action.
+   *  Each new value opens every error panel in this list; the user can still
+   *  close them individually afterwards. 0/undefined means "never triggered". */
+  revealErrorsToken?: number;
 }) {
   const [openErrors, setOpenErrors] = useState<Set<number>>(new Set());
+  const revealedTokenRef = useRef(0);
   // Collapsed groups (>= COLLAPSE_THRESHOLD consecutive passed/skipped steps)
   // that the user has manually expanded, keyed by the group's first step's
   // ordinal (unique within a scenario). A group also renders expanded - even
@@ -209,6 +215,19 @@ function StepList({
     }
     stepRefs.current.get(focusStepOrdinal)?.scrollIntoView({ block: "center" });
   }, [focusStepOrdinal, steps]);
+
+  // "Reveal failures" from the run header: on each new token value, open every
+  // error panel in this list. Guarded by a ref so it fires once per token (not
+  // again when `steps` re-resolves), leaving later manual closes untouched.
+  useEffect(() => {
+    if (!revealErrorsToken || revealErrorsToken === revealedTokenRef.current) return;
+    revealedTokenRef.current = revealErrorsToken;
+    setOpenErrors((prev) => {
+      const next = new Set(prev);
+      for (const s of steps) if (s.has_error) next.add(s.step_ordinal);
+      return next;
+    });
+  }, [revealErrorsToken, steps]);
 
   const items = useMemo(() => buildStepItems(steps), [steps]);
 
@@ -375,9 +394,9 @@ function ScenarioDetailHeader({
    *  navigates away, so Back returns here with the scenario still selected. */
   onSelect: (opts?: { replace?: boolean }) => void;
   isLogOpen: boolean;
-  /** True while this run's scenario logs are being fetched (shared across the
-   *  run - only meaningful while `isLogOpen`, since only one scenario's panel
-   *  can be open at a time). */
+  /** True while this run's scenario logs are being fetched. The fetch loads
+   *  every scenario's log in a single query, so this is a run-level flag
+   *  shared by all open log panels; only meaningful while `isLogOpen`. */
   logsLoading: boolean;
   logsError: Error | null;
   /** This scenario's decoded log text, once loaded; undefined if not (yet)
@@ -475,6 +494,7 @@ function ScenarioRow_({
   stepsLoading,
   isFocused,
   focusStepOrdinal,
+  revealErrorsToken,
   onSelect,
   isLogOpen,
   logsLoading,
@@ -491,6 +511,8 @@ function ScenarioRow_({
   isFocused?: boolean;
   /** Step ordinal targeted by the `?step=` param, only meaningful when `isFocused`. */
   focusStepOrdinal?: number | null;
+  /** Bumped by the run header's "reveal failures" action to open error panels. */
+  revealErrorsToken?: number;
   /** Select this scenario, via the header's "Link"/"History" actions (see ScenarioDetailHeader). */
   onSelect: (opts?: { replace?: boolean }) => void;
   /** Whether THIS scenario's log panel is open. */
@@ -558,7 +580,11 @@ function ScenarioRow_({
               <Spinner size={12} /> Loading steps…
             </div>
           ) : (
-            <StepList steps={steps} focusStepOrdinal={isFocused ? focusStepOrdinal : null} />
+            <StepList
+              steps={steps}
+              focusStepOrdinal={isFocused ? focusStepOrdinal : null}
+              revealErrorsToken={revealErrorsToken}
+            />
           )}
         </div>
       )}
@@ -572,8 +598,24 @@ export default function RunDetail() {
   const runIdLit = sqlLit(runId);
 
   const { detailsReady, status: dataStatus, error: dataError, query, reportUrlByRunId } = useE2eData();
-  const [openScenario, setOpenScenario] = useState<string | null>(null);
+  // Which scenarios are expanded, keyed by `${feature_uri}::${scenario_id}`.
+  // A Set (rather than a single key) so several can be open at once - this is
+  // purely expand/collapse state and is independent of the `?scenario=`
+  // selection (highlight / click-away / Escape), which lives in the URL.
+  const [openScenarios, setOpenScenarios] = useState<Set<string>>(new Set());
+  // Bumped by "reveal failures" to signal each open StepList to show its error
+  // panels; the failed scenarios are expanded in the same click (see below).
+  const [revealErrorsToken, setRevealErrorsToken] = useState(0);
   const testIdInputRef = useRef<HTMLInputElement | null>(null);
+
+  const toggleScenario = useCallback((key: string) => {
+    setOpenScenarios((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
 
   // Lazy per-run scenario logs (for the header's Log button): fetched once
   // per run on first click, cached by scenario_id. `scenarioLogsRunIdRef`
@@ -582,16 +624,19 @@ export default function RunDetail() {
   const [scenarioLogs, setScenarioLogs] = useState<Map<string, string | null> | null>(null);
   const [logsLoading, setLogsLoading] = useState(false);
   const [logsError, setLogsError] = useState<Error | null>(null);
-  const [openLogScenarioId, setOpenLogScenarioId] = useState<string | null>(null);
+  // Which scenarios' log panels are open, by scenario_id. A Set so any number
+  // can be open at once, independent of expand and of the `?scenario=`
+  // selection - opening a log neither collapses nor selects anything.
+  const [openLogScenarioIds, setOpenLogScenarioIds] = useState<Set<string>>(new Set());
   const scenarioLogsRunIdRef = useRef<string | null>(null);
 
-  // Reset the log cache/panel whenever the run changes.
+  // Reset the log cache/panels whenever the run changes.
   useEffect(() => {
     scenarioLogsRunIdRef.current = null;
     setScenarioLogs(null);
     setLogsLoading(false);
     setLogsError(null);
-    setOpenLogScenarioId(null);
+    setOpenLogScenarioIds(new Set());
   }, [runId]);
 
   async function loadScenarioLogsIfNeeded() {
@@ -619,12 +664,16 @@ export default function RunDetail() {
   }
 
   function handleToggleLog(scenarioId: string) {
-    if (openLogScenarioId === scenarioId) {
-      setOpenLogScenarioId(null);
-      return;
-    }
-    setOpenLogScenarioId(scenarioId);
-    void loadScenarioLogsIfNeeded();
+    const willOpen = !openLogScenarioIds.has(scenarioId);
+    setOpenLogScenarioIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(scenarioId)) next.delete(scenarioId);
+      else next.add(scenarioId);
+      return next;
+    });
+    // Logs are fetched once for the whole run (one query, all scenarios), so
+    // only kick the load when opening a panel - closing needs nothing.
+    if (willOpen) void loadScenarioLogsIfNeeded();
   }
 
   // Cross-navigation focus: `?scenario=<scenario_id>&step=<step_ordinal>`,
@@ -822,7 +871,8 @@ export default function RunDetail() {
   // `?scenario=` param changing) - not on every re-render, so a user who
   // manually collapses it afterwards isn't fought by this effect.
   useEffect(() => {
-    if (focusedScenarioKey) setOpenScenario(focusedScenarioKey);
+    if (!focusedScenarioKey) return;
+    setOpenScenarios((prev) => (prev.has(focusedScenarioKey) ? prev : new Set(prev).add(focusedScenarioKey)));
   }, [focusedScenarioKey]);
 
   const stepsByScenario = useMemo(() => {
@@ -910,6 +960,42 @@ export default function RunDetail() {
       return a.feature_name.localeCompare(b.feature_name);
     });
   }, [scenarios, failuresOnly, selectedTags, trimmedTestIdQuery, focusedScenarioKey]);
+
+  // Keys of every scenario currently visible (post-filter), for expand-all.
+  const visibleScenarioKeys = useMemo(
+    () =>
+      featureGroups.flatMap((g) =>
+        g.scenarios.map((s) => `${s.feature_uri}::${s.scenario_id}`)
+      ),
+    [featureGroups]
+  );
+  const allExpanded =
+    visibleScenarioKeys.length > 0 &&
+    visibleScenarioKeys.every((k) => openScenarios.has(k));
+  const noneExpanded = visibleScenarioKeys.every((k) => !openScenarios.has(k));
+
+  // Keys of the visible failed scenarios, for the "reveal failures" shortcut.
+  const failedScenarioKeys = useMemo(
+    () =>
+      featureGroups.flatMap((g) =>
+        g.scenarios
+          .filter((s) => s.status === "failed")
+          .map((s) => `${s.feature_uri}::${s.scenario_id}`)
+      ),
+    [featureGroups]
+  );
+
+  // Expand every failed scenario (additively - passed rows already open stay
+  // open) and bump the token so their step lists reveal all error panels.
+  const revealFailures = useCallback(() => {
+    if (failedScenarioKeys.length === 0) return;
+    setOpenScenarios((prev) => {
+      const next = new Set(prev);
+      for (const k of failedScenarioKeys) next.add(k);
+      return next;
+    });
+    setRevealErrorsToken((t) => t + 1);
+  }, [failedScenarioKeys]);
 
   const run = runRows[0];
   const combinedError = dataError ?? runError ?? scenariosError;
@@ -1025,7 +1111,39 @@ export default function RunDetail() {
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-sm font-semibold text-muted-foreground">Features &amp; scenarios</h2>
+        <div className="flex items-center gap-1.5">
+          <h2 className="text-sm font-semibold text-muted-foreground">Features &amp; scenarios</h2>
+          <div className="flex items-center">
+            <button
+              type="button"
+              onClick={() => setOpenScenarios(new Set(visibleScenarioKeys))}
+              disabled={allExpanded}
+              title="Expand all scenarios"
+              className="inline-flex items-center rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+            >
+              <ChevronsUpDown size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => setOpenScenarios(new Set())}
+              disabled={noneExpanded}
+              title="Collapse all scenarios"
+              className="inline-flex items-center rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+            >
+              <ChevronsDownUp size={14} />
+            </button>
+            <span aria-hidden className="mx-1 h-4 w-px bg-border" />
+            <button
+              type="button"
+              onClick={revealFailures}
+              disabled={failedScenarioKeys.length === 0}
+              title="Expand all failed scenarios and show their errors"
+              className="inline-flex items-center rounded p-1 text-red-600 hover:bg-red-500/10 disabled:pointer-events-none disabled:opacity-40 dark:text-red-400"
+            >
+              <TriangleAlert size={14} />
+            </button>
+          </div>
+        </div>
         <div className="flex flex-wrap items-center gap-3">
           <TagFilter allTags={availableTags} selected={selectedTags} onChange={setSelectedTags} />
           <div className="relative">
@@ -1085,14 +1203,15 @@ export default function RunDetail() {
                     <ScenarioRow_
                       key={key}
                       scenario={scenario}
-                      isOpen={openScenario === key}
-                      onToggle={() => setOpenScenario(openScenario === key ? null : key)}
+                      isOpen={openScenarios.has(key)}
+                      onToggle={() => toggleScenario(key)}
                       steps={stepsByScenario.get(key) ?? []}
-                      stepsLoading={stepsLoading && openScenario === key}
+                      stepsLoading={stepsLoading && openScenarios.has(key)}
                       isFocused={isFocused}
                       focusStepOrdinal={focusStepOrdinal}
+                      revealErrorsToken={revealErrorsToken}
                       onSelect={(opts) => selectScenario(scenario.scenario_id, opts)}
-                      isLogOpen={openLogScenarioId === scenario.scenario_id}
+                      isLogOpen={openLogScenarioIds.has(scenario.scenario_id)}
                       logsLoading={logsLoading}
                       logsError={logsError}
                       log={scenarioLogs?.get(scenario.scenario_id)}
