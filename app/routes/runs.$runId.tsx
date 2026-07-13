@@ -1,6 +1,6 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
-import { Check, ChevronRight, ChevronsDownUp, Copy, FileText, History, Search } from "lucide-react";
+import { Check, ChevronRight, ChevronsDownUp, Copy, FileText, History, Link2, Search } from "lucide-react";
 import { toast } from "sonner";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
 import { buildScenarioLogsSql } from "~/lib/e2e-views";
@@ -11,7 +11,7 @@ import CluecumberLink from "~/components/CluecumberLink";
 import TagFilter from "~/components/TagFilter";
 import { statusKindFromRunToken, statusKindFromScenario, statusLabel } from "~/lib/status";
 import { scenarioHistoryPath } from "~/lib/format";
-import { cn } from "~/lib/utils";
+import { cn, copyText } from "~/lib/utils";
 import { fireCelebration } from "~/lib/celebrate";
 
 interface RunRow {
@@ -338,15 +338,10 @@ function CopyTestIdButton({ value }: { value: string }) {
   }, []);
 
   const handleCopy = async () => {
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopied(true);
-      if (timeoutRef.current) clearTimeout(timeoutRef.current);
-      timeoutRef.current = setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard API unavailable/denied (e.g. insecure context, permissions) -
-      // no-op; there's nothing else useful to do here.
-    }
+    if (!(await copyText(value))) return;
+    setCopied(true);
+    if (timeoutRef.current) clearTimeout(timeoutRef.current);
+    timeoutRef.current = setTimeout(() => setCopied(false), 1500);
   };
 
   return (
@@ -367,6 +362,7 @@ function CopyTestIdButton({ value }: { value: string }) {
  *  every scenario, unlike the test_id/tags fields it used to gate on. */
 function ScenarioDetailHeader({
   scenario,
+  onSelect,
   isLogOpen,
   logsLoading,
   logsError,
@@ -374,6 +370,9 @@ function ScenarioDetailHeader({
   onToggleLog,
 }: {
   scenario: ScenarioRow;
+  /** Select this scenario, writing `?scenario=` to the URL - which makes the
+   *  address bar a shareable link to it (the "Link" action). */
+  onSelect: () => void;
   isLogOpen: boolean;
   /** True while this run's scenario logs are being fetched (shared across the
    *  run - only meaningful while `isLogOpen`, since only one scenario's panel
@@ -417,6 +416,15 @@ function ScenarioDetailHeader({
           )}
         </div>
         <div className="ml-auto flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            onClick={onSelect}
+            title="Link to this scenario (updates the address bar)"
+            className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <Link2 size={13} />
+            Link
+          </button>
           <Link
             to={scenarioHistoryPath(scenario.feature_uri, scenario.scenario_id)}
             title="View scenario history"
@@ -463,6 +471,7 @@ function ScenarioRow_({
   stepsLoading,
   isFocused,
   focusStepOrdinal,
+  onSelect,
   isLogOpen,
   logsLoading,
   logsError,
@@ -478,6 +487,8 @@ function ScenarioRow_({
   isFocused?: boolean;
   /** Step ordinal targeted by the `?step=` param, only meaningful when `isFocused`. */
   focusStepOrdinal?: number | null;
+  /** Select this scenario via the header's "Link" action (see ScenarioDetailHeader). */
+  onSelect: () => void;
   /** Whether THIS scenario's log panel is open. */
   isLogOpen: boolean;
   logsLoading: boolean;
@@ -488,15 +499,33 @@ function ScenarioRow_({
   const kind = statusKindFromScenario(scenario.status);
   const rowRef = useRef<HTMLLIElement | null>(null);
 
-  // Scroll the focused scenario into view once (on mount if already focused,
+  // Bring the focused scenario into view once (on mount if already focused,
   // or when it becomes focused via a param change) - guarded so plain
-  // expand/collapse interactions never trigger a re-scroll.
+  // expand/collapse interactions never trigger a re-scroll. Only scroll when
+  // the row doesn't already reach the middle 75% of the viewport: shrink the
+  // check region by 12.5% of the height top and bottom, so a row stuck in an
+  // edge band - or fully off-screen on a deep link - gets centered, while one
+  // comfortably in the middle is left alone (no jump when clicking its own
+  // "Link"). Centering reads best here; "nearest" would edge-align this big
+  // expandable card awkwardly at the fold.
   useEffect(() => {
-    if (isFocused) rowRef.current?.scrollIntoView({ block: "center" });
+    if (!isFocused) return;
+    const el = rowRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    const band = window.innerHeight * 0.125;
+    const inMiddle = rect.bottom > band && rect.top < window.innerHeight - band;
+    if (!inMiddle) el.scrollIntoView({ block: "center" });
   }, [isFocused]);
 
   return (
-    <li ref={rowRef} className={cn(isFocused && "rounded-md bg-accent/60 ring-2 ring-ring")}>
+    <li
+      ref={rowRef}
+      // Marks this row for the container's click-away deselect handler, which
+      // keeps the selection only when a click lands inside the selected row.
+      data-scenario-id={scenario.scenario_id}
+      className={cn(isFocused && "rounded-md bg-accent/60 ring-2 ring-ring")}
+    >
       <button
         type="button"
         onClick={onToggle}
@@ -513,6 +542,7 @@ function ScenarioRow_({
         <div className="border-t">
           <ScenarioDetailHeader
             scenario={scenario}
+            onSelect={onSelect}
             isLogOpen={isLogOpen}
             logsLoading={logsLoading}
             logsError={logsError}
@@ -607,29 +637,77 @@ export default function RunDetail() {
   const focusStepOrdinal =
     focusStepParam != null && /^\d+$/.test(focusStepParam) ? Number(focusStepParam) : null;
 
-  // Escape deselects: clears the `?scenario`/`?step` focus and collapses the
-  // open scenario, returning to the plain unfocused list. Skipped when the
-  // event originates in the test-id search box, so Escape there behaves like
-  // an ordinary text input rather than being hijacked by this global handler.
+  // Clear the `?scenario`/`?step` selection, removing the highlight. Shared by
+  // the Escape shortcut and the click-away handler. Leaves the row's expand
+  // state alone (deselecting isn't collapsing). `replace` so it doesn't leave
+  // an extra history entry to Back through; `preventScrollReset` so removing
+  // the param doesn't make <ScrollRestoration> jump the page to the top.
+  const clearSelection = useCallback(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("scenario");
+        next.delete("step");
+        return next;
+      },
+      { replace: true, preventScrollReset: true }
+    );
+  }, [setSearchParams]);
+
+  // Select a scenario by writing `?scenario=` (dropping any `?step=` focus,
+  // which is a different, step-level deep link). This is the same URL write a
+  // deep link from /scenarios produces, so selection and permalinking share
+  // one code path. A plain push (not replace) so Back steps through selections;
+  // `preventScrollReset` because the focused row scrolls itself into view (see
+  // ScenarioRow_) and the default scroll-to-top would fight that.
+  const selectScenario = useCallback(
+    (scenarioId: string) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.set("scenario", scenarioId);
+          next.delete("step");
+          return next;
+        },
+        { preventScrollReset: true }
+      );
+    },
+    [setSearchParams]
+  );
+
+  // Two ways to deselect: pressing Escape, or clicking anywhere that isn't
+  // inside the selected scenario's row (handleDeselectOnOutsideClick, wired to
+  // the page container below). Escape is skipped when the event originates in
+  // the test-id search box, so it behaves like an ordinary text input there.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (e.key !== "Escape") return;
       if (e.target === testIdInputRef.current) return;
-      if (!focusScenarioId && focusStepParam == null && !openScenario) return;
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev);
-          next.delete("scenario");
-          next.delete("step");
-          return next;
-        },
-        { replace: true }
-      );
-      setOpenScenario(null);
+      if (!focusScenarioId && focusStepParam == null) return;
+      clearSelection();
     }
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [focusScenarioId, focusStepParam, openScenario, setSearchParams]);
+  }, [focusScenarioId, focusStepParam, clearSelection]);
+
+  // Click-away deselect: any click that isn't inside the selected scenario's
+  // row clears the selection. A document-level listener (not one scoped to the
+  // page container) so clicks on the empty margins/background count too. Runs
+  // in the CAPTURE phase so that when a click ALSO selects a different scenario
+  // - e.g. its "Link" button - this clears the old selection first and the new
+  // one, applied on the ensuing bubble-phase onClick, wins. Attached only while
+  // something is selected. `data-scenario-id` is stamped on every scenario <li>.
+  useEffect(() => {
+    if (!focusScenarioId && focusStepParam == null) return;
+    function onClick(e: MouseEvent) {
+      const target = e.target as Element | null;
+      const clickedId = target?.closest?.("[data-scenario-id]")?.getAttribute("data-scenario-id");
+      if (clickedId === focusScenarioId) return;
+      clearSelection();
+    }
+    document.addEventListener("click", onClick, true);
+    return () => document.removeEventListener("click", onClick, true);
+  }, [focusScenarioId, focusStepParam, clearSelection]);
 
   const {
     rows: runRows,
@@ -952,6 +1030,7 @@ export default function RunDetail() {
                       stepsLoading={stepsLoading && openScenario === key}
                       isFocused={isFocused}
                       focusStepOrdinal={focusStepOrdinal}
+                      onSelect={() => selectScenario(scenario.scenario_id)}
                       isLogOpen={openLogScenarioId === scenario.scenario_id}
                       logsLoading={logsLoading}
                       logsError={logsError}
