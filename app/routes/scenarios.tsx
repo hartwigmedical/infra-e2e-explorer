@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { Search } from "lucide-react";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
@@ -449,10 +449,52 @@ function ScenarioDetailPanel({
 export default function Scenarios() {
   const { status, error, detailsReady } = useE2eData();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [search, setSearch] = useState("");
-  const [nightlyOnly, setNightlyOnly] = useState(true);
-  const [featureFilter, setFeatureFilter] = useState("");
-  const [selectedTags, setSelectedTags] = useState<Set<string>>(new Set());
+
+  // Filters live in the URL (alongside the ?feature=&scenario= selection) so
+  // they survive deep links and Back navigation. Each is derived from the
+  // params; `patchFilters` (their only writer) uses replace so typing/toggling
+  // doesn't pile up history, and preventScrollReset to avoid a jump. `nightly`
+  // defaults on, so its param records only the off state (?nightly=0). Tags use
+  // repeated ?tag= params. `selectedTags` is memoized for a stable identity.
+  const search = searchParams.get("q") ?? "";
+  const nightlyOnly = searchParams.get("nightly") !== "0";
+  const failedLastRunOnly = searchParams.get("failed") === "1";
+  const selectedTags = useMemo(() => new Set(searchParams.getAll("tag")), [searchParams]);
+
+  const patchFilters = useCallback(
+    (mutate: (params: URLSearchParams) => void) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          mutate(next);
+          return next;
+        },
+        { replace: true, preventScrollReset: true }
+      );
+    },
+    [setSearchParams]
+  );
+  const setSearch = useCallback(
+    (value: string) => patchFilters((p) => (value ? p.set("q", value) : p.delete("q"))),
+    [patchFilters]
+  );
+  const setNightlyOnly = useCallback(
+    (on: boolean) => patchFilters((p) => (on ? p.delete("nightly") : p.set("nightly", "0"))),
+    [patchFilters]
+  );
+  const setFailedLastRunOnly = useCallback(
+    (on: boolean) => patchFilters((p) => (on ? p.set("failed", "1") : p.delete("failed"))),
+    [patchFilters]
+  );
+  const setSelectedTags = useCallback(
+    (tags: string[]) =>
+      patchFilters((p) => {
+        p.delete("tag");
+        for (const tag of tags) p.append("tag", tag);
+      }),
+    [patchFilters]
+  );
+
   const [hoveredRunId, setHoveredRunId] = useState<string | null>(null);
   // Which view (history strip vs. step-history grid) is the source of the
   // current `hoveredRunId` - lets the strip tell apart "I'm directly hovered"
@@ -470,8 +512,8 @@ export default function Scenarios() {
   // exact (feature_uri, scenario_id) match. This effect-free derivation is
   // what makes it stable - there's no mount-time or stale-closure effect that
   // could resolve to, or overwrite the URL with, a different scenario. The
-  // ONLY thing that ever writes to the URL is the list item's onClick
-  // (selectScenario, below).
+  // selection params are written only by the list item's onClick
+  // (selectScenario, below); the filter params only by patchFilters (above).
   const decodedFeatureUri = safeDecodeURIComponent(searchParams.get("feature"));
   const decodedScenarioId = safeDecodeURIComponent(searchParams.get("scenario"));
   const wantsSelection = decodedFeatureUri !== null && decodedScenarioId !== null;
@@ -524,9 +566,9 @@ export default function Scenarios() {
     selectedItemRef.current?.scrollIntoView({ block: "nearest" });
   }, [selected?.feature_uri, selected?.scenario_id, masterRows]);
 
-  // The only place that writes to the URL - a plain push (default), not
-  // replace, so the browser Back button steps back through previously
-  // selected scenarios instead of skipping over them.
+  // Writes the selection params - a plain push (default), not replace, so the
+  // browser Back button steps back through previously selected scenarios
+  // instead of skipping over them. Preserves any active filter params.
   const selectScenario = (sc: MasterRow) => {
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev);
@@ -535,11 +577,6 @@ export default function Scenarios() {
       return next;
     });
   };
-
-  const featureOptions = useMemo(() => {
-    const names = new Set(masterRows.map((r) => r.feature_name));
-    return Array.from(names).sort();
-  }, [masterRows]);
 
   const tagOptions = useMemo(() => {
     const names = new Set<string>();
@@ -552,7 +589,9 @@ export default function Scenarios() {
   const filteredRows = useMemo(() => {
     const q = search.trim().toLowerCase();
     return masterRows.filter((r) => {
-      if (featureFilter && r.feature_name !== featureFilter) return false;
+      // latest_status is each scenario's status in its most recent run (within
+      // the nightly/all scope), so "failed in the last run" == latest_status.
+      if (failedLastRunOnly && r.latest_status !== "failed") return false;
       if (q && !r.scenario_name.toLowerCase().includes(q)) return false;
       if (selectedTags.size > 0) {
         const rowTags = toTagArray(r.tag_names);
@@ -560,7 +599,7 @@ export default function Scenarios() {
       }
       return true;
     });
-  }, [masterRows, search, featureFilter, selectedTags]);
+  }, [masterRows, search, failedLastRunOnly, selectedTags]);
 
   const groupedMaster = useMemo(() => {
     const groups: { feature_name: string; scenarios: MasterRow[] }[] = [];
@@ -608,19 +647,16 @@ export default function Scenarios() {
             className="w-full rounded border bg-background px-2 py-1.5 pl-7 text-sm outline-none focus:ring-1 focus:ring-ring"
           />
         </div>
-        <select
-          name="feature-filter"
-          value={featureFilter}
-          onChange={(e) => setFeatureFilter(e.target.value)}
-          className="rounded border bg-background px-2 py-1.5 text-sm outline-none focus:ring-1 focus:ring-ring"
-        >
-          <option value="">All features</option>
-          {featureOptions.map((name) => (
-            <option key={name} value={name}>
-              {name}
-            </option>
-          ))}
-        </select>
+        <label className="flex items-center gap-2 text-sm whitespace-nowrap">
+          <input
+            type="checkbox"
+            name="failed-last-run-only"
+            checked={failedLastRunOnly}
+            onChange={(e) => setFailedLastRunOnly(e.target.checked)}
+            className="size-3.5 accent-red-500"
+          />
+          Failed in last run
+        </label>
         <label className="flex items-center gap-2 text-sm whitespace-nowrap">
           <input
             type="checkbox"
@@ -634,7 +670,7 @@ export default function Scenarios() {
         <TagFilter
           allTags={tagOptions}
           selected={Array.from(selectedTags)}
-          onChange={(next) => setSelectedTags(new Set(next))}
+          onChange={setSelectedTags}
         />
       </div>
 
