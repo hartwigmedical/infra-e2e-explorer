@@ -1444,6 +1444,8 @@ export default function Scenarios() {
     [setSearchParams]
   );
 
+  // Return to the matrix as a PUSH (not replace), so the scenario detail stays
+  // on the back stack and the browser Back button returns to it.
   const clearSelection = useCallback(() => {
     setSearchParams(
       (prev) => {
@@ -1453,7 +1455,7 @@ export default function Scenarios() {
         next.delete("step");
         return next;
       },
-      { replace: true, preventScrollReset: true }
+      { preventScrollReset: true }
     );
   }, [setSearchParams]);
 
