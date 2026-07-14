@@ -1,6 +1,7 @@
 import { Link, Outlet, useLocation } from "react-router";
 import { DuckDBProvider } from "~/contexts/DuckDBContext";
 import { E2eDataProvider, useE2eData } from "~/contexts/E2eDataContext";
+import { RunScopeProvider } from "~/contexts/RunScopeContext";
 import Spinner from "~/components/Spinner";
 import DateRangeControl from "~/components/DateRangeControl";
 import { cn } from "~/lib/utils";
@@ -58,6 +59,7 @@ export default function Layout() {
   return (
     <DuckDBProvider>
       <E2eDataProvider>
+        <RunScopeProvider>
         <div className="min-h-screen bg-background text-foreground">
           <header className="flex h-(--header-height) items-center justify-between border-b px-4">
             <div className="flex items-center gap-6">
@@ -73,6 +75,7 @@ export default function Layout() {
             <Outlet />
           </main>
         </div>
+        </RunScopeProvider>
       </E2eDataProvider>
     </DuckDBProvider>
   );

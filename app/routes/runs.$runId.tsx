@@ -1071,11 +1071,7 @@ export default function RunDetail() {
           <div className="flex flex-wrap items-center gap-2">
             <TypeBadge isNightly={run.is_nightly} />
             <StatusBadge kind={statusKindFromRunToken(run.status_token)} />
-            {run.failed_count != null && run.total_count != null && (
-              <span className="rounded-full bg-muted px-2 py-0.5 font-mono text-xs text-muted-foreground">
-                {run.failed_count} / {run.total_count} failed
-              </span>
-            )}
+            <CluecumberLink runId={run.run_id} label="Report" className="text-sm" />
           </div>
         </div>
 
@@ -1138,10 +1134,6 @@ export default function RunDetail() {
             />
           </div>
         )}
-
-        <div className="mt-4 border-t pt-3">
-          <CluecumberLink runId={run.run_id} label="Cluecumber report" className="text-sm" />
-        </div>
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3">

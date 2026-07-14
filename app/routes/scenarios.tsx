@@ -1,7 +1,8 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
-import { ArrowRight, Search, X } from "lucide-react";
+import { ArrowRight, ChevronRight, Clock, Search, X } from "lucide-react";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
+import { useRunScope } from "~/contexts/RunScopeContext";
 import Spinner from "~/components/Spinner";
 import StatusMark from "~/components/StatusMark";
 import TagFilter from "~/components/TagFilter";
@@ -134,6 +135,25 @@ function sampleStdDev(xs: number[]): number | null {
   const m = mean(xs);
   const variance = xs.reduce((sum, x) => sum + (x - m) ** 2, 0) / (xs.length - 1);
   return Math.sqrt(variance);
+}
+
+/** Linear-interpolated q-quantile (0..1) of an ascending-sorted array. */
+function quantile(sortedAsc: number[], q: number): number {
+  if (sortedAsc.length === 0) return 0;
+  if (sortedAsc.length === 1) return sortedAsc[0];
+  const pos = (sortedAsc.length - 1) * q;
+  const lo = Math.floor(pos);
+  const hi = Math.min(lo + 1, sortedAsc.length - 1);
+  return sortedAsc[lo] + (sortedAsc[hi] - sortedAsc[lo]) * (pos - lo);
+}
+
+/** Compact duration for axis/caption labels: "20s" / "45m" / "2h" / "1h30m". */
+function formatDurShort(s: number): string {
+  if (s < 60) return `${Math.round(s)}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  const h = Math.floor(s / 3600);
+  const m = Math.round((s % 3600) / 60);
+  return m ? `${h}h${m}m` : `${h}h`;
 }
 
 /**
@@ -346,7 +366,7 @@ function ScenarioMatrix({
 
   return (
     <>
-      <div className="relative z-0 max-h-[72vh] overflow-auto rounded-lg border">
+      <div className="relative z-0 overflow-x-auto rounded-lg border">
       <table
         className="w-full table-fixed border-separate border-spacing-0 text-xs"
         style={{ minWidth: minTableWidth }}
@@ -686,7 +706,7 @@ function StepGrid({
   const minTableWidth = STEP_W + SUMMARY_W + runIds.length * MIN_RUN_W;
 
   return (
-    <div className="relative z-0 max-h-[60vh] overflow-auto rounded-lg border">
+    <div className="relative z-0 overflow-x-auto rounded-lg border">
       <table
         className="w-full table-fixed border-separate border-spacing-0 text-xs"
         style={{ minWidth: minTableWidth }}
@@ -804,6 +824,155 @@ function StepGrid({
   );
 }
 
+/** Fill class for a status marker in the trend chart. */
+function statusFillClass(kind: StatusKind): string {
+  switch (kind) {
+    case "passed":
+      return "fill-emerald-500";
+    case "failed":
+      return "fill-red-500";
+    case "skipped":
+      return "fill-amber-500";
+    default:
+      return "fill-zinc-400";
+  }
+}
+
+/**
+ * The scenario's total duration over runs (oldest → newest) as a line, with a
+ * shaded p10–p90 band and dashed median drawn from PASSED runs only (a failed
+ * run's duration is truncated at the failing step, so it defines no baseline).
+ * Each run is a colour-blind-safe status marker (colour + glyph, matching the
+ * status strip above), so slow/anomalous and failed runs read at a glance.
+ * Dependency-free inline SVG, theme-aware via ink/surface tokens.
+ */
+function DurationTrend({ rows }: { rows: HistoryRow[] }) {
+  const points = useMemo(
+    () => rows.filter((r): r is HistoryRow & { duration_s: number } => r.duration_s != null),
+    [rows]
+  );
+
+  if (points.length < 2) {
+    return <p className="text-sm text-muted-foreground">Not enough runs to plot a trend yet.</p>;
+  }
+
+  const W = 880;
+  const H = 190;
+  const padL = 44;
+  const padR = 14;
+  const padT = 12;
+  const padB = 22;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  const maxDur = Math.max(...points.map((p) => p.duration_s));
+  const yMax = maxDur * 1.1 || 1;
+  const x = (i: number) => padL + (i / (points.length - 1)) * plotW;
+  const y = (v: number) => padT + plotH - (v / yMax) * plotH;
+
+  const passedSorted = points
+    .filter((p) => p.status === "passed")
+    .map((p) => p.duration_s)
+    .sort((a, b) => a - b);
+  const hasBand = passedSorted.length >= 2;
+  const p10 = quantile(passedSorted, 0.1);
+  const p50 = quantile(passedSorted, 0.5);
+  const p90 = quantile(passedSorted, 0.9);
+
+  const linePath = points
+    .map((p, i) => `${i === 0 ? "M" : "L"}${x(i).toFixed(1)},${y(p.duration_s).toFixed(1)}`)
+    .join(" ");
+
+  return (
+    <div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full" role="img" aria-label="Scenario duration per run">
+        {/* y reference: baseline + max */}
+        <line x1={padL} y1={y(0)} x2={W - padR} y2={y(0)} className="stroke-border" strokeWidth={1} />
+        <text x={padL - 6} y={y(0)} textAnchor="end" dominantBaseline="middle" className="fill-muted-foreground text-[10px]">
+          0
+        </text>
+        <text x={padL - 6} y={y(maxDur)} textAnchor="end" dominantBaseline="middle" className="fill-muted-foreground text-[10px]">
+          {formatDurShort(maxDur)}
+        </text>
+
+        {/* p10–p90 band + median, from passed runs */}
+        {hasBand && (
+          <>
+            <rect
+              x={padL}
+              y={y(p90)}
+              width={plotW}
+              height={Math.max(1, y(p10) - y(p90))}
+              className="fill-foreground/[0.06]"
+            />
+            <line
+              x1={padL}
+              y1={y(p50)}
+              x2={W - padR}
+              y2={y(p50)}
+              className="stroke-muted-foreground"
+              strokeWidth={1.5}
+              strokeDasharray="4 3"
+            />
+          </>
+        )}
+
+        {/* the duration series */}
+        <path d={linePath} className="fill-none stroke-foreground/40" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+
+        {points.map((p, i) => {
+          const kind = statusKindFromScenario(p.status);
+          const cx = x(i);
+          const cy = y(p.duration_s);
+          const s = 11;
+          return (
+            <g key={p.run_id}>
+              <title>{`${formatRunDateTime(p.run_id)}\n${statusLabel(kind)} · ${formatDuration(p.duration_s)}`}</title>
+              <rect
+                x={cx - s / 2}
+                y={cy - s / 2}
+                width={s}
+                height={s}
+                rx={2}
+                className={cn(statusFillClass(kind), "stroke-background")}
+                strokeWidth={1.5}
+              />
+              {kind === "failed" && <rect x={cx - 3} y={cy - 1} width={6} height={2} rx={1} className="fill-white" />}
+              {kind === "skipped" && <circle cx={cx} cy={cy} r={2} className="fill-white" />}
+              {/* enlarged hover target for the native <title> tooltip */}
+              <rect x={cx - 9} y={cy - 9} width={18} height={18} fill="transparent" />
+            </g>
+          );
+        })}
+
+        {/* x ends */}
+        <text x={padL} y={H - 6} textAnchor="start" className="fill-muted-foreground text-[10px]">
+          {points[0].run_id.slice(5, 10)}
+        </text>
+        <text x={W - padR} y={H - 6} textAnchor="end" className="fill-muted-foreground text-[10px]">
+          {points[points.length - 1].run_id.slice(5, 10)}
+        </text>
+      </svg>
+
+      <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+        <span className="inline-flex items-center gap-1.5">
+          <StatusMark kind="passed" shape="square" size={11} /> Passed
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <StatusMark kind="failed" shape="square" size={11} /> Failed
+        </span>
+        {hasBand ? (
+          <span className="ml-auto">
+            median {formatDurShort(p50)} · band p10–p90 {formatDurShort(p10)}–{formatDurShort(p90)} (passed runs)
+          </span>
+        ) : (
+          <span className="ml-auto">no passed runs for a baseline band</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ScenarioDetailPanel({
   selected,
   nightlyOnly,
@@ -843,6 +1012,22 @@ function ScenarioDetailPanel({
     return passed / historyRows.length;
   }, [historyRows]);
 
+  // Collapsed duration-trend summary for the header toggle (median + CV over
+  // passed runs); null when there aren't enough runs with a duration to plot.
+  const trendStats = useMemo(() => {
+    const durable = historyRows.filter((r) => r.duration_s != null);
+    if (durable.length < 2) return null;
+    const passed = durable
+      .filter((r) => r.status === "passed")
+      .map((r) => r.duration_s as number)
+      .sort((a, b) => a - b);
+    if (passed.length < 2) return { median: null as number | null, cv: null as number | null };
+    const m = mean(passed);
+    const sd = sampleStdDev(passed);
+    return { median: quantile(passed, 0.5), cv: m > 0 && sd != null ? sd / m : null };
+  }, [historyRows]);
+  const [trendOpen, setTrendOpen] = useState(false);
+
   return (
     <div className="space-y-4">
       <div className="rounded-lg border bg-card p-4">
@@ -861,7 +1046,51 @@ function ScenarioDetailPanel({
               {Math.round(passRate * 100)}% pass rate
             </span>
           )}
+          {trendStats && (
+            <button
+              type="button"
+              onClick={() => setTrendOpen((o) => !o)}
+              aria-expanded={trendOpen}
+              title={trendOpen ? "Hide duration trend" : "Show duration trend"}
+              className="ml-auto inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+            >
+              <Clock size={13} className="shrink-0" />
+              {trendStats.median != null ? (
+                <>
+                  <span className="font-medium tabular-nums text-foreground">
+                    {formatDurShort(trendStats.median)}
+                  </span>
+                  <span>median</span>
+                  {trendStats.cv != null && (
+                    <>
+                      <span className="text-border">·</span>
+                      <span className="font-medium tabular-nums text-foreground">
+                        ±{Math.round(trendStats.cv * 100)}%
+                      </span>
+                    </>
+                  )}
+                </>
+              ) : (
+                <span>Duration trend</span>
+              )}
+              <ChevronRight
+                size={14}
+                className={cn("shrink-0 transition-transform", trendOpen && "rotate-90")}
+              />
+            </button>
+          )}
         </div>
+        {trendOpen && trendStats && (
+          <div className="mt-4 border-t pt-4">
+            {historyLoading && historyRows.length === 0 ? (
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Spinner size={13} /> Loading trend…
+              </div>
+            ) : (
+              <DurationTrend rows={historyRows} />
+            )}
+          </div>
+        )}
       </div>
 
       <div className="rounded-lg border bg-card p-4">
@@ -936,7 +1165,9 @@ export default function Scenarios() {
   // typing/toggling doesn't pile up history. `nightly` defaults on, so its
   // param records only the off state (?nightly=0); `metric` defaults to status.
   const search = searchParams.get("q") ?? "";
-  const nightlyOnly = searchParams.get("nightly") !== "0";
+  // Nightly/all-runs scope is a global preference shared across pages (context,
+  // not the URL), so it isn't reset when navigating here.
+  const { nightlyOnly } = useRunScope();
   // Per-run status filter: show only scenarios with `filterStatus` in run
   // `filterRunId`. Chosen from a run column header's hover popover; generalises
   // the old "failed in last run" to any run × any status.
@@ -965,10 +1196,6 @@ export default function Scenarios() {
   );
   const setSearch = useCallback(
     (value: string) => patchFilters((p) => (value ? p.set("q", value) : p.delete("q"))),
-    [patchFilters]
-  );
-  const setNightlyOnly = useCallback(
-    (on: boolean) => patchFilters((p) => (on ? p.delete("nightly") : p.set("nightly", "0"))),
     [patchFilters]
   );
   const setRunFilter = useCallback(
@@ -1295,16 +1522,6 @@ export default function Scenarios() {
                 </button>
               </span>
             )}
-            <label className="flex items-center gap-2 text-sm whitespace-nowrap">
-              <input
-                type="checkbox"
-                name="nightly-only"
-                checked={nightlyOnly}
-                onChange={(e) => setNightlyOnly(e.target.checked)}
-                className="size-3.5 accent-sky-500"
-              />
-              Nightly runs only
-            </label>
             <TagFilter allTags={tagOptions} selected={Array.from(selectedTags)} onChange={setSelectedTags} />
           </div>
 

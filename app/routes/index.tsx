@@ -1,5 +1,8 @@
+import { useState } from "react";
 import { Link } from "react-router";
+import { EyeOff, X } from "lucide-react";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
+import { useRunScope } from "~/contexts/RunScopeContext";
 import StatusBadge from "~/components/StatusBadge";
 import Spinner from "~/components/Spinner";
 import Sparkline from "~/components/Sparkline";
@@ -101,7 +104,8 @@ function ScenarioCounts({ counts }: { counts: ScenarioCountRow | undefined }) {
 }
 
 export default function Index() {
-  const { status, error, runCount, runsReady, detailsReady } = useE2eData();
+  const { status, error, runsReady, detailsReady } = useE2eData();
+  const { nightlyOnly, setNightlyOnly } = useRunScope();
   const {
     rows: runs,
     loading: runsLoading,
@@ -114,9 +118,27 @@ export default function Index() {
 
   const countsByRun = new Map(scenarioCounts.map((r) => [r.run_id, r]));
 
-  // Pass rate per nightly run, oldest -> newest, for the header sparkline.
-  const nightlyPassRates = runs
-    .filter((r) => r.is_nightly)
+  // The nightly/all-runs filter (global, from the date-range control) governs
+  // which runs the table, count, and trend reflect. When nightly-only, every
+  // shown run is a nightly, so the Type column is redundant and hidden.
+  const displayRuns = nightlyOnly ? runs.filter((r) => r.is_nightly) : runs;
+  const showType = !nightlyOnly;
+
+  // In nightly mode, warn when there are manual runs newer than the newest
+  // nightly (so the actual latest run is hidden). `runs` is newest-first, so
+  // the leading non-nightly runs are exactly those newer ones. Dismissal is
+  // in-memory only — a refresh brings the notice back.
+  const [hiddenNoticeDismissed, setHiddenNoticeDismissed] = useState(false);
+  let hiddenNewerCount = 0;
+  for (const r of runs) {
+    if (r.is_nightly) break;
+    hiddenNewerCount++;
+  }
+  const showHiddenNotice = nightlyOnly && hiddenNewerCount > 0 && !hiddenNoticeDismissed;
+  const showAllRuns = () => setNightlyOnly(false);
+
+  // Pass rate per shown run, oldest -> newest, for the header sparkline.
+  const passRates = displayRuns
     .slice()
     .sort((a, b) => (a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : 0))
     .map((r) => {
@@ -128,9 +150,7 @@ export default function Index() {
     .filter((v): v is number => v !== null);
 
   const latestPassRate =
-    nightlyPassRates.length > 0
-      ? nightlyPassRates[nightlyPassRates.length - 1]
-      : null;
+    passRates.length > 0 ? passRates[passRates.length - 1] : null;
 
   const combinedError = error ?? runsError;
   if (status === "error" || runsError) {
@@ -163,19 +183,17 @@ export default function Index() {
         <div>
           <h1 className="text-lg font-semibold">Recent Runs</h1>
           <p className="text-sm text-muted-foreground">
-            {runCount} run{runCount === 1 ? "" : "s"}
+            {displayRuns.length} run{displayRuns.length === 1 ? "" : "s"}
           </p>
         </div>
         <div className="flex items-center gap-3 rounded-lg border bg-card px-4 py-2">
-          <span className="text-xs text-muted-foreground">
-            Pass rate — nightly runs
-          </span>
+          <span className="text-xs text-muted-foreground">Pass rate</span>
           {!detailsReady ? (
             <Spinner size={13} />
-          ) : nightlyPassRates.length >= 2 ? (
+          ) : passRates.length >= 2 ? (
             <>
               <Sparkline
-                values={nightlyPassRates.map((v) => v * 100)}
+                values={passRates.map((v) => v * 100)}
                 className="text-emerald-500"
               />
               <span className="text-sm font-medium tabular-nums">
@@ -197,24 +215,57 @@ export default function Index() {
           <thead className="bg-muted/50">
             <tr className="text-left text-xs text-muted-foreground">
               <th className="px-3 py-2 font-medium">Run</th>
-              <th className="px-3 py-2 font-medium">Type</th>
+              {showType && <th className="px-3 py-2 font-medium">Type</th>}
               <th className="px-3 py-2 font-medium">Status</th>
               <th className="px-3 py-2 font-medium">Scenarios</th>
               <th className="px-3 py-2 font-medium">Report</th>
             </tr>
           </thead>
           <tbody>
-            {runs.length === 0 && !runsLoading && (
+            {showHiddenNotice && (
               <tr>
                 <td
-                  colSpan={5}
+                  colSpan={showType ? 5 : 4}
+                  className="border-b border-sky-500/20 bg-sky-500/5 px-3 py-2"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <button
+                      type="button"
+                      onClick={showAllRuns}
+                      className="inline-flex items-center gap-2 text-left text-xs text-sky-700 hover:underline dark:text-sky-400"
+                    >
+                      <EyeOff size={13} className="shrink-0" />
+                      <span>
+                        {hiddenNewerCount === 1
+                          ? "A more recent run is hidden by the Nightly filter"
+                          : `${hiddenNewerCount} more recent runs are hidden by the Nightly filter`}
+                        {" — "}
+                        <span className="font-medium">show all runs</span>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setHiddenNoticeDismissed(true)}
+                      title="Dismiss"
+                      className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            )}
+            {displayRuns.length === 0 && !runsLoading && (
+              <tr>
+                <td
+                  colSpan={showType ? 5 : 4}
                   className="px-3 py-6 text-center text-muted-foreground"
                 >
                   No runs found.
                 </td>
               </tr>
             )}
-            {runs.map((run) => {
+            {displayRuns.map((run) => {
               const instant =
                 run.updated ?? fallbackInstant(run.run_id, run.run_time);
               const primary =
@@ -236,14 +287,16 @@ export default function Index() {
                       </div>
                     </Link>
                   </td>
-                  <td className="p-0">
-                    <Link
-                      to={`/runs/${encodeURIComponent(run.run_id)}`}
-                      className="block px-3 py-2 group-hover:bg-muted/40"
-                    >
-                      <TypeBadge isNightly={run.is_nightly} />
-                    </Link>
-                  </td>
+                  {showType && (
+                    <td className="p-0">
+                      <Link
+                        to={`/runs/${encodeURIComponent(run.run_id)}`}
+                        className="block px-3 py-2 group-hover:bg-muted/40"
+                      >
+                        <TypeBadge isNightly={run.is_nightly} />
+                      </Link>
+                    </td>
+                  )}
                   <td className="p-0">
                     <Link
                       to={`/runs/${encodeURIComponent(run.run_id)}`}

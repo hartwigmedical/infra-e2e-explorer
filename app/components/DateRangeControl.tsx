@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { CalendarRange, ChevronDown } from "lucide-react";
 import { eachDayOfInterval, format } from "date-fns";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
+import { useRunScope } from "~/contexts/RunScopeContext";
 import Spinner from "~/components/Spinner";
 import Sparkline from "~/components/Sparkline";
 import { cn } from "~/lib/utils";
@@ -75,6 +76,9 @@ export default function DateRangeControl() {
   const { windowLabel, nextWindowLabel, hasMore, loadingMore, loadMore, runCount } =
     useE2eData();
 
+  // Global nightly/all-runs scope, shared across pages (see RunScopeContext).
+  const { nightlyOnly, setNightlyOnly } = useRunScope();
+
   const { rows: rangeRows } = useE2eQuery<OldestNewestRow>(RANGE_SQL, []);
   const { rows: dailyRows } = useE2eQuery<DailyCountRow>(DAILY_COUNTS_SQL, []);
 
@@ -122,10 +126,35 @@ export default function DateRangeControl() {
       >
         <CalendarRange className="size-4 opacity-70" />
         <span className="font-medium">{windowLabel}</span>
+        <span className="text-muted-foreground/40">|</span>
+        <span className="font-medium">{nightlyOnly ? "Nightly runs" : "All runs"}</span>
         <ChevronDown className="size-3.5 opacity-60" />
       </button>
       {open && (
         <div className="absolute right-0 z-30 mt-1 w-72 space-y-3 rounded-md border bg-popover p-3 text-popover-foreground shadow-md">
+          <div>
+            <div className="mb-1 text-xs text-muted-foreground">Runs</div>
+            <div className="flex rounded-md border p-0.5 text-sm">
+              {[
+                { on: true, label: "Nightly runs" },
+                { on: false, label: "All runs" },
+              ].map((opt) => (
+                <button
+                  key={opt.label}
+                  type="button"
+                  onClick={() => setNightlyOnly(opt.on)}
+                  className={cn(
+                    "flex-1 rounded px-2 py-1 transition-colors",
+                    nightlyOnly === opt.on
+                      ? "bg-accent font-medium text-accent-foreground"
+                      : "text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
           <div>
             <div className="text-xs text-muted-foreground">Loaded date range</div>
             <div className="mt-0.5 flex items-baseline justify-between gap-2">
