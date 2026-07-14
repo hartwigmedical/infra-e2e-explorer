@@ -651,12 +651,29 @@ function ScenarioRow_({
   );
 }
 
+// Module-level (not per-mount) so the celebration fires at most ONCE per page
+// load: it survives SPA navigation/remounts - opening a run detail again, or
+// hopping run→run, won't re-fire - and only resets on a full page refresh.
+let hasCelebrated = false;
+
 export default function RunDetail() {
   const { runId: rawRunId } = useParams();
   const runId = rawRunId ? decodeURIComponent(rawRunId) : "";
   const runIdLit = sqlLit(runId);
 
-  const { runsReady, detailsReady, status: dataStatus, error: dataError, query, reportUrlByRunId } = useE2eData();
+  const {
+    runsReady,
+    detailsReady,
+    status: dataStatus,
+    error: dataError,
+    query,
+    reportUrlByRunId,
+    windowLabel,
+    nextWindowLabel,
+    hasMore,
+    loadingMore,
+    loadMore,
+  } = useE2eData();
   // Which scenarios are expanded, keyed by `${feature_uri}::${scenario_id}`.
   // A Set (rather than a single key) so several can be open at once - this is
   // purely expand/collapse state and is independent of the `?scenario=`
@@ -1070,19 +1087,17 @@ export default function RunDetail() {
   const combinedError = dataError ?? runError ?? scenariosError;
 
   // Fire a celebration when this run is BOTH the newest run loaded AND a
-  // success. Not persisted anywhere - a fresh mount (e.g. a page refresh)
-  // celebrates again by design. `celebratedRef` only guards against firing
-  // twice within the same mount (React strict-mode's double-invoke, or any
-  // other double-render).
-  const celebratedRef = useRef(false);
+  // success - but only the first time per page load (see `hasCelebrated`), so
+  // reopening a run detail or navigating run→run doesn't re-fire; a full page
+  // refresh resets the flag and celebrates again.
   useEffect(() => {
-    if (!run || celebratedRef.current) return;
+    if (!run || hasCelebrated) return;
 
     const isNewest = run.newest_run_id != null && run.newest_run_id === runId;
     const isSuccess = run.status_token === "ok";
     if (!isNewest || !isSuccess) return;
 
-    celebratedRef.current = true;
+    hasCelebrated = true;
     fireCelebration();
     toast.success("🎉 All green — the latest run passed!");
   }, [run, runId]);
@@ -1109,12 +1124,35 @@ export default function RunDetail() {
   }
 
   if (!run) {
+    // A run can be absent simply because it predates the loaded window (the
+    // runs table is materialized for a rolling date range - see E2eDataContext).
+    // Offer to widen the window before concluding it doesn't exist; only once
+    // everything is loaded (`!canLoadMore`) is it truly "not found".
+    const canLoadMore = hasMore && nextWindowLabel != null;
     return (
       <div className="mx-auto max-w-4xl space-y-4 p-6">
         <div className="rounded-lg border bg-card p-6">
-          <p className="text-sm text-muted-foreground">
-            Run <span className="font-mono">{runId}</span> not found.
-          </p>
+          {canLoadMore ? (
+            <>
+              <p className="text-sm text-muted-foreground">
+                Run <span className="font-mono">{runId}</span> isn't in the loaded data. It may be
+                older than the current <span className="font-medium">{windowLabel}</span> window.
+              </p>
+              <button
+                type="button"
+                onClick={loadMore}
+                disabled={loadingMore}
+                className="mt-3 inline-flex items-center justify-center gap-2 rounded-md border bg-card px-3 py-1.5 text-sm font-medium hover:bg-muted/50 disabled:opacity-60"
+              >
+                {loadingMore && <Spinner size={13} />}
+                {loadingMore ? "Loading…" : `Load ${nextWindowLabel}`}
+              </button>
+            </>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              Run <span className="font-mono">{runId}</span> not found.
+            </p>
+          )}
         </div>
       </div>
     );
