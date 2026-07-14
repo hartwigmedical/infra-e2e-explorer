@@ -52,7 +52,8 @@ export function statusDotClass(kind: StatusKind): string {
       return "bg-amber-500";
     case "unknown":
     default:
-      return "bg-zinc-500";
+      // "No data" — deliberately faint so present-but-empty cells recede.
+      return "bg-zinc-200 dark:bg-zinc-700";
   }
 }
 
