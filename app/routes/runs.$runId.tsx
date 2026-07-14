@@ -1,11 +1,12 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
-import { Check, ChevronRight, ChevronsDownUp, ChevronsUpDown, Copy, FileText, History, Link2, Search, TriangleAlert } from "lucide-react";
+import { Check, ChevronRight, ChevronsDownUp, ChevronsUpDown, Clock, Copy, FileText, History, Link2, Search, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
 import { buildScenarioLogsSql } from "~/lib/e2e-views";
 import StatusBadge from "~/components/StatusBadge";
 import StatusMark from "~/components/StatusMark";
+import RunGantt, { computeRunTiming, formatElapsed } from "~/components/RunGantt";
 import Spinner from "~/components/Spinner";
 import CluecumberLink from "~/components/CluecumberLink";
 import TagFilter from "~/components/TagFilter";
@@ -37,6 +38,10 @@ interface ScenarioRow {
   ordinal: number;
   tag_names: string[] | null;
   duration_s: number | null;
+  /** Scenario start as epoch ms (from `started_at`); cast to DOUBLE in SQL so
+   *  it arrives as a plain number, not an Arrow int64. Null when the report
+   *  had no parseable start_timestamp. Feeds the execution-timeline Gantt. */
+  started_ms: number | null;
   status: string;
   /** 8-digit id parsed from the scenario's after-hook log embedding (see
    *  v_test_ids in e2e-views.ts). Null for backgrounds (never in this table
@@ -601,6 +606,10 @@ export default function RunDetail() {
   // Bumped by "reveal failures" to signal each open StepList to show its error
   // panels; the failed scenarios are expanded in the same click (see below).
   const [revealErrorsToken, setRevealErrorsToken] = useState(0);
+  // The execution-timeline Gantt is collapsed by default (the page's job is
+  // browsing scenarios/steps); a compact wall-clock + parallelism toggle in
+  // the run header expands it on demand. Persists across run navigation.
+  const [timelineOpen, setTimelineOpen] = useState(false);
   const testIdInputRef = useRef<HTMLInputElement | null>(null);
 
   const toggleScenario = useCallback((key: string) => {
@@ -833,7 +842,8 @@ export default function RunDetail() {
     error: scenariosError,
   } = useE2eQuery<ScenarioRow>(
     detailsReady && runId
-      ? `SELECT feature_uri, feature_name, scenario_id, scenario_name, ordinal, tag_names, duration_s, status, test_id
+      ? `SELECT feature_uri, feature_name, scenario_id, scenario_name, ordinal, tag_names, duration_s,
+                epoch_ms(started_at)::DOUBLE AS started_ms, status, test_id
          FROM scenarios WHERE run_id = ${runIdLit}`
       : null,
     [detailsReady, runId]
@@ -892,6 +902,11 @@ export default function RunDetail() {
   }, [scenarios]);
 
   const totalStepCount = allSteps.length;
+
+  // Wall-clock + avg-parallelism summary for the collapsed header toggle; null
+  // (toggle hidden) when there aren't enough placeable scenarios to draw the
+  // timeline at all - matches RunGantt's own render guard.
+  const runTiming = useMemo(() => computeRunTiming(scenarios), [scenarios]);
 
   // Union of tag_names across every scenario in this run, for the tag filter dropdown.
   const availableTags = useMemo(() => {
@@ -1096,9 +1111,43 @@ export default function RunDetail() {
               <span className="text-muted-foreground">
                 {scenarios.length} scenario(s) · {totalStepCount} step(s)
               </span>
+              {runTiming && (
+                <button
+                  type="button"
+                  onClick={() => setTimelineOpen((open) => !open)}
+                  aria-expanded={timelineOpen}
+                  title={timelineOpen ? "Hide execution timeline" : "Show execution timeline"}
+                  className="ml-auto inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                >
+                  <Clock size={13} className="shrink-0" />
+                  <span className="font-medium tabular-nums text-foreground">
+                    {formatElapsed(runTiming.makespanMs)}
+                  </span>
+                  <span>wall-clock</span>
+                  <span className="text-border">·</span>
+                  <span className="font-medium tabular-nums text-foreground">
+                    {runTiming.avgParallelism.toFixed(1)}×
+                  </span>
+                  <span>parallel</span>
+                  <ChevronRight
+                    size={14}
+                    className={cn("shrink-0 transition-transform", timelineOpen && "rotate-90")}
+                  />
+                </button>
+              )}
             </>
           )}
         </div>
+
+        {detailsReady && timelineOpen && scenarios.length > 1 && (
+          <div className="mt-4 border-t pt-4">
+            <RunGantt
+              scenarios={scenarios}
+              focusedScenarioId={focusScenarioId}
+              onSelectScenario={(id) => selectScenario(id)}
+            />
+          </div>
+        )}
 
         <div className="mt-4 border-t pt-3">
           <CluecumberLink runId={run.run_id} label="Cluecumber report" className="text-sm" />
