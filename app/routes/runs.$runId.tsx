@@ -597,7 +597,7 @@ export default function RunDetail() {
   const runId = rawRunId ? decodeURIComponent(rawRunId) : "";
   const runIdLit = sqlLit(runId);
 
-  const { detailsReady, status: dataStatus, error: dataError, query, reportUrlByRunId } = useE2eData();
+  const { runsReady, detailsReady, status: dataStatus, error: dataError, query, reportUrlByRunId } = useE2eData();
   // Which scenarios are expanded, keyed by `${feature_uri}::${scenario_id}`.
   // A Set (rather than a single key) so several can be open at once - this is
   // purely expand/collapse state and is independent of the `?scenario=`
@@ -1038,7 +1038,10 @@ export default function RunDetail() {
     );
   }
 
-  if (runLoading && !run) {
+  // Show "Loading" (not "not found") whenever the run row can't be known yet:
+  // the runs table isn't ready, or the lookup is still in flight. Guarding on
+  // `!run` too means an already-loaded run isn't blanked during a soft reload.
+  if ((!runsReady || runLoading) && !run) {
     return (
       <div className="mx-auto flex max-w-4xl items-center gap-2 p-6 text-sm text-muted-foreground">
         <Spinner /> Loading run…

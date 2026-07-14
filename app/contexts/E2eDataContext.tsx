@@ -516,35 +516,50 @@ export function useE2eQuery<T = any>(
 ): UseE2eQueryResult<T> {
   const { query, runsReady, dataVersion } = useE2eData();
   const [rows, setRows] = useState<T[]>([]);
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  // Key of the query we've most recently *settled* (resolved or errored).
+  // `loading` is DERIVED from it rather than kept as its own state set inside
+  // the effect. That matters: an active query whose result isn't in yet reads
+  // as loading on the very first render — and on the render right after any
+  // input change — *before* the effect fires. A separate `useState(false)`
+  // would be false for that first frame, so a consumer keying off
+  // `!loading && rows.length === 0` (e.g. run detail's "not found", the
+  // dashboard's empty state) would flash briefly on mount / navigation.
+  const [settledKey, setSettledKey] = useState<string | null>(null);
   const requestIdRef = useRef(0);
 
+  // Identity of the query that should currently be running (null when there's
+  // nothing to run). Encodes everything that changes the result: the SQL
+  // (params are baked into the string), the soft-reload counter, and deps.
+  const activeKey = sql && runsReady ? JSON.stringify([dataVersion, sql, deps]) : null;
+  const loading = activeKey !== null && settledKey !== activeKey;
+
   useEffect(() => {
-    if (!sql || !runsReady) {
+    if (!activeKey) {
+      requestIdRef.current++; // cancel any in-flight response
       setRows([]);
-      setLoading(false);
       setError(null);
+      setSettledKey(null);
       return;
     }
 
     const requestId = ++requestIdRef.current;
-    setLoading(true);
     setError(null);
 
-    query<T>(sql)
+    query<T>(sql as string)
       .then((result) => {
         if (requestIdRef.current !== requestId) return; // stale
         setRows(result);
-        setLoading(false);
+        setError(null);
+        setSettledKey(activeKey);
       })
       .catch((e) => {
         if (requestIdRef.current !== requestId) return; // stale
         setError(e instanceof Error ? e : new Error(String(e)));
-        setLoading(false);
+        setSettledKey(activeKey);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sql, runsReady, dataVersion, query, ...deps]);
+  }, [activeKey, query]);
 
   return { rows, loading, error };
 }
