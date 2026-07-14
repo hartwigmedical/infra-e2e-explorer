@@ -279,7 +279,7 @@ function StepList({
   };
 
   return (
-    <ul className="divide-y divide-border/60 bg-background/40">
+    <ul className="divide-y divide-border/60">
       {items.map((item) => {
         if (item.type === "step") return renderStep(item.step);
 
@@ -375,24 +375,45 @@ function CopyTestIdButton({ value }: { value: string }) {
   );
 }
 
-/** Header rendered above an expanded scenario's step list: a LEFT group of
- *  labeled fields (Test ID, Duration, Tags) and a RIGHT group of actions
- *  (History, Log). Always renders - Duration/History/Log are relevant for
- *  every scenario, unlike the test_id/tags fields it used to gate on. */
-function ScenarioDetailHeader({
-  scenario,
-  onSelect,
+/** The Test ID + Tags line shown directly under an expanded scenario's title,
+ *  as part of the row header (above the steps' shaded content area). Renders
+ *  nothing when the scenario has neither a test_id nor tags. */
+function ScenarioMeta({ scenario }: { scenario: ScenarioRow }) {
+  const tagList = Array.from(scenario.tag_names ?? []);
+  if (!scenario.test_id && tagList.length === 0) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 pb-2 pl-10 text-xs text-muted-foreground">
+      {scenario.test_id && (
+        <span className="inline-flex items-center gap-1.5">
+          <span>Test ID:</span>
+          <span className="font-mono font-medium text-foreground">{scenario.test_id}</span>
+          <CopyTestIdButton value={scenario.test_id} />
+        </span>
+      )}
+      {tagList.length > 0 && (
+        <span className="flex flex-wrap gap-1">
+          {tagList.map((tag) => (
+            <span
+              key={tag}
+              className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+            >
+              {tag}
+            </span>
+          ))}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** The scenario log panel, shown at the top of the shaded content area when
+ *  its Log action is toggled on. Renders nothing while closed. */
+function ScenarioLog({
   isLogOpen,
   logsLoading,
   logsError,
   log,
-  onToggleLog,
 }: {
-  scenario: ScenarioRow;
-  /** Select this scenario (writes `?scenario=` to the URL). Used by the "Link"
-   *  action, and - with { replace: true } - by "History" just before it
-   *  navigates away, so Back returns here with the scenario still selected. */
-  onSelect: (opts?: { replace?: boolean }) => void;
   isLogOpen: boolean;
   /** True while this run's scenario logs are being fetched. The fetch loads
    *  every scenario's log in a single query, so this is a run-level flag
@@ -402,85 +423,20 @@ function ScenarioDetailHeader({
   /** This scenario's decoded log text, once loaded; undefined if not (yet)
    *  loaded, null if loaded but this scenario had none. */
   log: string | null | undefined;
-  onToggleLog: () => void;
 }) {
-  const tagList = Array.from(scenario.tag_names ?? []);
+  if (!isLogOpen) return null;
   return (
-    <div className="border-b bg-muted/20">
-      <div className="flex flex-wrap items-center justify-between gap-2 py-1.5 pr-2 pl-10 text-xs">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-muted-foreground">
-          {scenario.test_id && (
-            <span className="inline-flex items-center gap-1.5">
-              <span>Test ID:</span>
-              <span className="font-mono font-medium text-foreground">{scenario.test_id}</span>
-              <CopyTestIdButton value={scenario.test_id} />
-            </span>
-          )}
-          <span>
-            Duration: <span className="font-mono text-foreground">{formatDuration(scenario.duration_s)}</span>
-          </span>
-          {tagList.length > 0 && (
-            <span className="inline-flex flex-wrap items-center gap-1.5">
-              <span>Tags:</span>
-              <span className="flex flex-wrap gap-1">
-                {tagList.map((tag) => (
-                  <span
-                    key={tag}
-                    className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
-                  >
-                    {tag}
-                  </span>
-                ))}
-              </span>
-            </span>
-          )}
+    <div className="pr-4 pt-2 pb-2 pl-10">
+      {logsLoading ? (
+        <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
+          <Spinner size={12} /> Loading log…
         </div>
-        <div className="ml-auto flex shrink-0 items-center gap-1">
-          <button
-            type="button"
-            onClick={() => onSelect()}
-            title="Link to this scenario (updates the address bar)"
-            className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-          >
-            <Link2 size={13} />
-            Link
-          </button>
-          <Link
-            to={scenarioHistoryPath(scenario.feature_uri, scenario.scenario_id)}
-            // Select this scenario (replacing the current history entry) before
-            // leaving, so Back from the history view lands here with it selected.
-            onClick={() => onSelect({ replace: true })}
-            title="View scenario history"
-            className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-          >
-            <History size={13} />
-            History
-          </Link>
-          <button
-            type="button"
-            onClick={onToggleLog}
-            title="View scenario log"
-            className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-          >
-            {isLogOpen && logsLoading ? <Spinner size={12} /> : <FileText size={13} />}
-            Log
-          </button>
-        </div>
-      </div>
-      {isLogOpen && (
-        <div className="pr-4 pb-2 pl-10">
-          {logsLoading ? (
-            <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
-              <Spinner size={12} /> Loading log…
-            </div>
-          ) : logsError || log == null ? (
-            <p className="py-2 text-xs text-muted-foreground">Log unavailable.</p>
-          ) : (
-            <pre className="max-h-96 overflow-auto rounded border bg-background/60 p-2 text-xs whitespace-pre-wrap">
-              {log}
-            </pre>
-          )}
-        </div>
+      ) : logsError || log == null ? (
+        <p className="py-2 text-xs text-muted-foreground">Log unavailable.</p>
+      ) : (
+        <pre className="max-h-96 overflow-auto rounded border bg-background/60 p-2 text-xs whitespace-pre-wrap">
+          {log}
+        </pre>
       )}
     </div>
   );
@@ -513,7 +469,7 @@ function ScenarioRow_({
   focusStepOrdinal?: number | null;
   /** Bumped by the run header's "reveal failures" action to open error panels. */
   revealErrorsToken?: number;
-  /** Select this scenario, via the header's "Link"/"History" actions (see ScenarioDetailHeader). */
+  /** Select this scenario, via the row's "Link"/"History" title-line actions. */
   onSelect: (opts?: { replace?: boolean }) => void;
   /** Whether THIS scenario's log panel is open. */
   isLogOpen: boolean;
@@ -552,28 +508,67 @@ function ScenarioRow_({
       data-scenario-id={scenario.scenario_id}
       className={cn(isFocused && "rounded-md bg-accent/60 ring-2 ring-ring")}
     >
-      <button
-        type="button"
-        onClick={onToggle}
-        className="flex w-full items-center gap-2 px-4 py-2 text-left text-sm hover:bg-muted/40"
-      >
-        <ChevronRight
-          size={14}
-          className={cn("shrink-0 text-muted-foreground transition-transform", isOpen && "rotate-90")}
-        />
-        <StatusMark kind={kind} shape="dot" size={10} title={statusLabel(kind)} />
-        <span className="flex-1 truncate">{scenario.scenario_name}</span>
-      </button>
+      <div className="flex items-center gap-2 px-4 py-2 text-sm hover:bg-muted/40">
+        <button
+          type="button"
+          onClick={onToggle}
+          className="flex min-w-0 flex-1 items-center gap-2 text-left"
+        >
+          <ChevronRight
+            size={14}
+            className={cn("shrink-0 text-muted-foreground transition-transform", isOpen && "rotate-90")}
+          />
+          <StatusMark kind={kind} shape="dot" size={10} title={statusLabel(kind)} />
+          <span className="min-w-0 flex-1 truncate">{scenario.scenario_name}</span>
+          <span className="shrink-0 font-mono text-xs text-muted-foreground">
+            {formatDuration(scenario.duration_s)}
+          </span>
+        </button>
+        {/* Row actions live on the title line (only while expanded) instead of
+            a separate header band. Test ID + tags render just below the title
+            (still part of the header); the steps sit in a shaded content area. */}
+        {isOpen && (
+          <div className="flex shrink-0 items-center gap-0.5 text-muted-foreground">
+            <button
+              type="button"
+              onClick={() => onSelect()}
+              title="Link to this scenario (updates the address bar)"
+              className="inline-flex items-center rounded p-1 hover:bg-muted hover:text-foreground"
+            >
+              <Link2 size={14} />
+            </button>
+            <Link
+              to={scenarioHistoryPath(scenario.feature_uri, scenario.scenario_id)}
+              // Select this scenario (replacing the current history entry) before
+              // leaving, so Back from the history view lands here with it selected.
+              onClick={() => onSelect({ replace: true })}
+              title="View scenario history"
+              className="inline-flex items-center rounded p-1 hover:bg-muted hover:text-foreground"
+            >
+              <History size={14} />
+            </Link>
+            <button
+              type="button"
+              onClick={onToggleLog}
+              title="View scenario log"
+              className={cn(
+                "inline-flex items-center rounded p-1 hover:bg-muted hover:text-foreground",
+                isLogOpen && "bg-muted text-foreground"
+              )}
+            >
+              {isLogOpen && logsLoading ? <Spinner size={14} /> : <FileText size={14} />}
+            </button>
+          </div>
+        )}
+      </div>
+      {isOpen && <ScenarioMeta scenario={scenario} />}
       {isOpen && (
-        <div className="border-t">
-          <ScenarioDetailHeader
-            scenario={scenario}
-            onSelect={onSelect}
+        <div className="border-t bg-muted/50">
+          <ScenarioLog
             isLogOpen={isLogOpen}
             logsLoading={logsLoading}
             logsError={logsError}
             log={log}
-            onToggleLog={onToggleLog}
           />
           {stepsLoading ? (
             <div className="flex items-center gap-2 py-3 pr-4 pl-10 text-xs text-muted-foreground">
