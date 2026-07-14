@@ -360,6 +360,7 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
             SELECT sc.run_id, sc.feature_uri, sc.scenario_id, sc.scenario_name,
               trim(s.keyword)||' '||s.name AS step_label, s.name AS step_name, trim(s.keyword) AS step_keyword,
               row_number() OVER (PARTITION BY sc.run_id, sc.scenario_id ORDER BY s.line) AS step_ordinal,
+              s.is_background AS is_background,
               s.result.status AS status, s.result.duration/1e9 AS duration_s,
               (s.result.error_message IS NOT NULL) AS has_error,
               left(s.result.error_message, 2000) AS error_message, s.match.location AS glue_location

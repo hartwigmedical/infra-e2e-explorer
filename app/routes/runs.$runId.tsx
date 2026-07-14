@@ -60,6 +60,8 @@ interface StepRow {
   duration_s: number | null;
   has_error: boolean;
   error_message: string | null;
+  /** True for steps folded in from the feature's Background (see v_scenarios). */
+  is_background: boolean;
   /** Glue method signature, e.g. "void com.hartwig.verification.lama.LamaSteps.foo()". */
   glue_location: string | null;
 }
@@ -188,6 +190,13 @@ function StepList({
   // without being in this set - when it contains the currently-focused step;
   // see `containsFocus` below.
   const [expandedGroups, setExpandedGroups] = useState<Set<number>>(new Set());
+  // Background steps (folded in from the feature's Background — see
+  // v_scenarios) are hidden behind a "N background steps" affordance by
+  // default; this tracks whether the user has opened it.
+  const [showBackground, setShowBackground] = useState(false);
+  // Step ordinals a hovered "collapse …" control is about to fold away, so we
+  // can preview which rows will disappear. null when nothing is hovered.
+  const [collapseHoverOrdinals, setCollapseHoverOrdinals] = useState<Set<number> | null>(null);
   const stepRefs = useRef<Map<number, HTMLLIElement>>(new Map());
 
   const toggleError = (ordinal: number) => {
@@ -218,8 +227,12 @@ function StepList({
     if (step.has_error) {
       setOpenErrors((prev) => (prev.has(focusStepOrdinal) ? prev : new Set(prev).add(focusStepOrdinal)));
     }
+    // A focused background step lives in the collapsed section — open it so the
+    // scroll/highlight has something to land on (showBackground is in the deps
+    // so this re-runs and scrolls once it's rendered).
+    if (step.is_background) setShowBackground(true);
     stepRefs.current.get(focusStepOrdinal)?.scrollIntoView({ block: "center" });
-  }, [focusStepOrdinal, steps]);
+  }, [focusStepOrdinal, steps, showBackground]);
 
   // "Reveal failures" from the run header: on each new token value, open every
   // error panel in this list. Guarded by a ref so it fires once per token (not
@@ -232,9 +245,14 @@ function StepList({
       for (const s of steps) if (s.has_error) next.add(s.step_ordinal);
       return next;
     });
+    // If a failure is in the (hidden) background, reveal that section too.
+    if (steps.some((s) => s.is_background && s.has_error)) setShowBackground(true);
   }, [revealErrorsToken, steps]);
 
-  const items = useMemo(() => buildStepItems(steps), [steps]);
+  const bgSteps = useMemo(() => steps.filter((s) => s.is_background), [steps]);
+  const bodySteps = useMemo(() => steps.filter((s) => !s.is_background), [steps]);
+  const items = useMemo(() => buildStepItems(bodySteps), [bodySteps]);
+  const bgHasFailure = bgSteps.some((s) => s.status === "failed");
 
   if (steps.length === 0) {
     return <p className="py-3 pr-4 pl-10 text-xs text-muted-foreground">No steps recorded.</p>;
@@ -244,6 +262,7 @@ function StepList({
     const kind = statusKindFromScenario(step.status);
     const errorOpen = openErrors.has(step.step_ordinal);
     const isFocused = focusStepOrdinal === step.step_ordinal;
+    const willCollapse = collapseHoverOrdinals?.has(step.step_ordinal) ?? false;
     return (
       <li
         key={step.step_ordinal}
@@ -255,12 +274,15 @@ function StepList({
           // pl-10 aligns the step's status dot under the scenario's (which is
           // offset by its chevron + gap); pr-4 keeps the right edge flush.
           "py-1.5 pr-4 pl-10 text-[13px]",
+          !isFocused && willCollapse && "bg-muted/70",
           isFocused && "rounded bg-accent ring-1 ring-inset ring-ring"
         )}
       >
         <div className="flex items-center gap-2">
           <StatusMark kind={kind} shape="dot" size={9} title={statusLabel(kind)} />
-          <span className="flex-1 truncate">{step.step_label}</span>
+          <span className={cn("flex-1 truncate", step.is_background && "text-muted-foreground")}>
+            {step.step_label}
+          </span>
           <span className="shrink-0 font-mono text-xs text-muted-foreground">
             {formatDuration(step.duration_s)}
           </span>
@@ -285,6 +307,41 @@ function StepList({
 
   return (
     <ul className="divide-y divide-border/60">
+      {bgSteps.length > 0 && (
+        <Fragment>
+          <li className="py-1 pr-4 pl-10">
+            <button
+              type="button"
+              onClick={() => setShowBackground((v) => !v)}
+              onMouseEnter={() => {
+                if (showBackground) setCollapseHoverOrdinals(new Set(bgSteps.map((s) => s.step_ordinal)));
+              }}
+              onMouseLeave={() => setCollapseHoverOrdinals(null)}
+              title={showBackground ? "Collapse background steps" : "Show background steps"}
+              className={cn(
+                "flex w-full items-center gap-2 rounded py-0.5 text-xs hover:bg-muted/40",
+                !showBackground && bgHasFailure
+                  ? "text-red-600 hover:text-red-700 dark:text-red-400"
+                  : "text-muted-foreground hover:text-foreground"
+              )}
+            >
+              {showBackground ? (
+                <ChevronsDownUp size={12} className="shrink-0" />
+              ) : (
+                <ChevronsUpDown size={12} className="shrink-0" />
+              )}
+              <span className="h-px flex-1 bg-border/60" />
+              <span className="whitespace-nowrap">
+                {showBackground
+                  ? `collapse ${bgSteps.length} background step${bgSteps.length === 1 ? "" : "s"}`
+                  : `${bgSteps.length} background step${bgSteps.length === 1 ? "" : "s"} hidden${bgHasFailure ? " · contains a failure" : ""}`}
+              </span>
+              <span className="h-px flex-1 bg-border/60" />
+            </button>
+          </li>
+          {showBackground && bgSteps.map((s) => renderStep(s))}
+        </Fragment>
+      )}
       {items.map((item) => {
         if (item.type === "step") return renderStep(item.step);
 
@@ -304,6 +361,8 @@ function StepList({
                 <button
                   type="button"
                   onClick={() => toggleGroup(item.key)}
+                  onMouseEnter={() => setCollapseHoverOrdinals(new Set(item.steps.map((s) => s.step_ordinal)))}
+                  onMouseLeave={() => setCollapseHoverOrdinals(null)}
                   className="flex w-full items-center gap-2 rounded py-0.5 text-xs text-muted-foreground hover:bg-muted/40 hover:text-foreground"
                 >
                   <ChevronsDownUp size={12} className="shrink-0" />
@@ -328,14 +387,14 @@ function StepList({
         return (
           <Fragment key={`group-${item.key}`}>
             {renderStep(first)}
-            <li className="px-4 py-1">
+            <li className="py-1 pr-4 pl-10">
               <button
                 type="button"
                 onClick={() => toggleGroup(item.key)}
                 title={`Show ${hiddenCount} hidden ${hiddenStatusWord ? hiddenStatusWord + " " : ""}step${hiddenCount === 1 ? "" : "s"}`}
                 className="flex w-full items-center gap-2 rounded py-0.5 text-xs text-muted-foreground hover:bg-muted/40 hover:text-foreground"
               >
-                <span aria-hidden className="inline-block size-3 shrink-0" />
+                <ChevronsUpDown size={12} className="shrink-0" />
                 <span className="h-px flex-1 bg-border/60" />
                 <span className="whitespace-nowrap">
                   {`${hiddenCount} more ${hiddenStatusWord ? hiddenStatusWord + " " : ""}step${hiddenCount === 1 ? "" : "s"} hidden`}
@@ -855,7 +914,7 @@ export default function RunDetail() {
     loading: stepsLoading,
   } = useE2eQuery<StepRow>(
     detailsReady && runId
-      ? `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status, duration_s, has_error, error_message, glue_location
+      ? `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status, duration_s, has_error, error_message, is_background, glue_location
          FROM steps WHERE run_id = ${runIdLit} ORDER BY scenario_id, step_ordinal`
       : null,
     [detailsReady, runId]

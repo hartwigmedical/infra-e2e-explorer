@@ -249,16 +249,62 @@ SELECT regexp_extract(filename, '([^/?]+)/cucumber[a-z-]*\\.json', 1) AS run_id,
 FROM read_json(${reportUrlArray}, filename = true, format = 'array',
                columns = ${FEATURES_COLUMNS}, maximum_object_size = 67108864);
 
--- one row per (run, scenario). Background elements (type = 'background') are excluded.
+-- one row per (run, scenario). A feature's Background runs as a SEPARATE
+-- 'background' element emitted immediately before each scenario; we fold its
+-- steps into that scenario - tagged is_background = true and (via their lower
+-- line numbers, which sort first in v_steps) ordered ahead of the scenario's
+-- own steps - so duration_s, status, and the step list all account for setup.
+-- Crucially a failed background step therefore correctly makes the scenario
+-- 'failed' (its own steps report as 'skipped' when the background fails).
+--
+-- Pairing is by ARRAY ADJACENCY, not line: every emitted background element
+-- carries the SAME line (the Background's single definition line) and a NULL
+-- id, so a line/lead-based match collapses them into one tie and folds the
+-- background into only one scenario per feature. Instead we zip each element
+-- with its 1-based position in the elements array (elem_idx) and join each
+-- scenario to the element at elem_idx - 1 when that is a background.
 CREATE OR REPLACE VIEW v_scenarios AS
-WITH scen AS (
-  SELECT f.run_id, f.feature_uri, f.feature_name,
-         e.id AS scenario_id, e.name AS scenario_name, e.tags AS tags,
-         try_cast(e.start_timestamp AS TIMESTAMP) AS started_at,
-         e.steps AS steps, e.before AS before_hooks, e.after AS after_hooks,
-         row_number() OVER (PARTITION BY f.run_id, f.feature_uri ORDER BY e.line) AS ordinal
-  FROM v_features f, UNNEST(f.elements) AS t(e)
-  WHERE e.type = 'scenario'
+WITH elems AS (
+  SELECT run_id, feature_uri, feature_name, elem_idx,
+         e.type AS elem_type, e.id AS elem_id, e.name AS elem_name, e.line AS elem_line,
+         e.tags AS tags, e.start_timestamp AS start_timestamp,
+         e.steps AS steps, e.before AS before_hooks, e.after AS after_hooks
+  FROM (
+    SELECT f.run_id, f.feature_uri, f.feature_name,
+           unnest(f.elements) AS e,
+           unnest(range(1, len(f.elements) + 1)) AS elem_idx
+    FROM v_features f
+  )
+),
+bg AS (
+  SELECT b.run_id, b.feature_uri, s.elem_id AS scenario_id,
+         list_transform(b.steps, x -> struct_pack(
+           keyword := x.keyword, name := x.name, line := x.line,
+           match := x.match, result := x.result, is_background := true)) AS bg_steps
+  FROM elems b
+  JOIN elems s
+    ON s.run_id = b.run_id AND s.feature_uri = b.feature_uri AND s.elem_idx = b.elem_idx + 1
+  WHERE b.elem_type = 'background' AND s.elem_type = 'scenario'
+),
+scen AS (
+  SELECT run_id, feature_uri, feature_name,
+         elem_id AS scenario_id, elem_name AS scenario_name, tags,
+         try_cast(start_timestamp AS TIMESTAMP) AS started_at,
+         before_hooks, after_hooks,
+         row_number() OVER (PARTITION BY run_id, feature_uri ORDER BY elem_idx) AS ordinal,
+         list_transform(steps, x -> struct_pack(
+           keyword := x.keyword, name := x.name, line := x.line,
+           match := x.match, result := x.result, is_background := false)) AS own_steps
+  FROM elems
+  WHERE elem_type = 'scenario'
+),
+combined AS (
+  SELECT sc.run_id, sc.feature_uri, sc.feature_name, sc.scenario_id, sc.scenario_name,
+         sc.ordinal, sc.started_at, sc.tags, sc.before_hooks, sc.after_hooks,
+         CASE WHEN bg.scenario_id IS NULL THEN sc.own_steps
+              ELSE list_concat(bg.bg_steps, sc.own_steps) END AS steps
+  FROM scen sc
+  LEFT JOIN bg USING (run_id, feature_uri, scenario_id)
 )
 SELECT run_id, feature_uri, feature_name, scenario_id, scenario_name, ordinal, started_at,
   list_transform(tags, x -> x.name) AS tag_names,
@@ -276,7 +322,7 @@ SELECT run_id, feature_uri, feature_name, scenario_id, scenario_name, ordinal, s
     ELSE 'passed'
   END AS status,
   steps
-FROM scen;
+FROM combined;
 
 -- (test_id extraction is NOT a view here - read_json parses past the multi-MB
 -- embedding data blobs, so E2eDataContext runs buildTestIdsSelectSql() in small
@@ -287,6 +333,7 @@ CREATE OR REPLACE VIEW v_steps AS
 SELECT sc.run_id, sc.feature_uri, sc.scenario_id, sc.scenario_name,
   trim(s.keyword) || ' ' || s.name AS step_label, s.name AS step_name, trim(s.keyword) AS step_keyword,
   row_number() OVER (PARTITION BY sc.run_id, sc.scenario_id ORDER BY s.line) AS step_ordinal,
+  s.is_background AS is_background,
   s.result.status AS status,
   s.result.duration / 1e9 AS duration_s,
   (s.result.error_message IS NOT NULL) AS has_error,

@@ -34,6 +34,8 @@ interface StepHistoryRow {
   duration_s: number | null;
   has_error: boolean;
   error_message: string | null;
+  /** True for steps folded in from the feature's Background (see v_scenarios). */
+  is_background: boolean;
 }
 
 interface SelectedScenario {
@@ -186,7 +188,7 @@ function buildHistorySql(featureUri: string, scenarioId: string, nightlyOnly: bo
 
 function buildStepHistorySql(featureUri: string, scenarioId: string, nightlyOnly: boolean): string {
   return `
-    SELECT st.run_id, st.step_ordinal, st.step_label, st.status, st.duration_s, st.has_error, st.error_message
+    SELECT st.run_id, st.step_ordinal, st.step_label, st.status, st.duration_s, st.has_error, st.error_message, st.is_background
     FROM steps st
     JOIN runs r USING (run_id)
     WHERE st.feature_uri = ${sqlLit(featureUri)} AND st.scenario_id = ${sqlLit(scenarioId)}
@@ -632,6 +634,7 @@ function HistoryStrip({
 interface StepGridRow {
   step_ordinal: number;
   step_label: string;
+  is_background: boolean;
   cells: Map<string, StepHistoryRow>;
   passed: number;
   total: number;
@@ -664,6 +667,7 @@ function StepGrid({
         entry = {
           step_ordinal: row.step_ordinal,
           step_label: row.step_label,
+          is_background: row.is_background,
           cells: new Map(),
           passed: 0,
           total: 0,
@@ -676,6 +680,7 @@ function StepGrid({
       // stepRows is ordered by run_id ascending, so the last write wins -
       // i.e. the label reflects the most recent run that had this step.
       entry.step_label = row.step_label;
+      entry.is_background = row.is_background;
       entry.cells.set(row.run_id, row);
     }
     for (const entry of byOrdinal.values()) {
@@ -695,6 +700,11 @@ function StepGrid({
     return Array.from(byOrdinal.values()).sort((a, b) => a.step_ordinal - b.step_ordinal);
   }, [stepRows]);
 
+  const bgRows = useMemo(() => gridRows.filter((r) => r.is_background), [gridRows]);
+  const bodyRows = useMemo(() => gridRows.filter((r) => !r.is_background), [gridRows]);
+  const bgHasFailure = bgRows.some((r) => r.passed < r.total);
+  const [showBackground, setShowBackground] = useState(false);
+
   if (gridRows.length === 0) {
     return <p className="text-sm text-muted-foreground">No step data for this scenario.</p>;
   }
@@ -704,6 +714,87 @@ function StepGrid({
   const SUMMARY_W = 132;
   const MIN_RUN_W = metric === "status" ? 30 : 58;
   const minTableWidth = STEP_W + SUMMARY_W + runIds.length * MIN_RUN_W;
+  const colCount = runIds.length + 2;
+
+  const renderRow = (row: StepGridRow) => (
+    <tr key={row.step_ordinal}>
+      <td
+        className={cn(
+          "sticky left-0 z-10 truncate border-b border-r bg-card px-2 py-1",
+          row.is_background && "text-muted-foreground"
+        )}
+        title={row.step_label}
+      >
+        {row.step_label}
+      </td>
+      {runIds.map((runId) => {
+        const cell = row.cells.get(runId);
+        const isHoveredCol = hoveredRunId === runId;
+        const hoverProps = {
+          onMouseEnter: () => onHoverRun(runId, "grid"),
+          onMouseLeave: () => onHoverRun(null, "grid"),
+        };
+        const href = `/runs/${encodeURIComponent(runId)}?scenario=${encodeURIComponent(scenarioId)}&step=${row.step_ordinal}`;
+        if (!cell) {
+          return metric === "status" ? (
+            <td key={runId} {...hoverProps} className={cn("border-b p-0.5 text-center", isHoveredCol && "bg-accent")}>
+              <StatusMark kind="unknown" shape="square" size={16} title="No data" className="mx-auto" />
+            </td>
+          ) : (
+            <td
+              key={runId}
+              {...hoverProps}
+              title="No data"
+              className={cn("border-b px-2 py-1 text-center text-muted-foreground", isHoveredCol && "bg-accent")}
+            >
+              —
+            </td>
+          );
+        }
+        const kind = statusKindFromScenario(cell.status);
+        const tip = `${row.step_label}\n${runId}\n${statusLabel(kind)} · ${formatDuration(cell.duration_s)} — open run detail`;
+        if (metric === "status") {
+          return (
+            <td key={runId} {...hoverProps} className={cn("border-b p-0.5 text-center", isHoveredCol && "bg-accent")}>
+              <Link to={href} title={tip} className="mx-auto block w-fit transition-transform hover:scale-125">
+                <StatusMark kind={kind} shape="square" size={16} title="" />
+              </Link>
+            </td>
+          );
+        }
+        return (
+          <td key={runId} {...hoverProps} className={cn("border-b px-2 py-1 text-center", isHoveredCol && "bg-accent")}>
+            <Link
+              to={href}
+              title={tip}
+              className={cn("block whitespace-nowrap font-mono tabular-nums hover:underline", durationClass(cell.status))}
+            >
+              {formatDuration(cell.duration_s)}
+            </Link>
+          </td>
+        );
+      })}
+      <td className="sticky right-0 z-10 border-b border-l bg-card px-2 py-1 text-right">
+        {metric === "status" ? (
+          <span className="whitespace-nowrap">
+            <span className="font-medium tabular-nums">{Math.round(row.passRate * 100)}%</span>
+            <span className="ml-1 text-[10px] text-muted-foreground">
+              {row.passed}/{row.total}
+            </span>
+          </span>
+        ) : (
+          <span className="whitespace-nowrap">
+            <span className="font-medium tabular-nums">
+              {row.durAvg != null ? formatDuration(row.durAvg) : "—"}
+            </span>
+            <span className="ml-1 text-[10px] text-muted-foreground">
+              {row.durCv != null ? `±${Math.round(row.durCv * 100)}%` : "—"}
+            </span>
+          </span>
+        )}
+      </td>
+    </tr>
+  );
 
   return (
     <div className="relative z-0 overflow-x-auto rounded-lg border">
@@ -742,82 +833,29 @@ function StepGrid({
           </tr>
         </thead>
         <tbody>
-          {gridRows.map((row) => (
-            <tr key={row.step_ordinal}>
-              <td
-                className="sticky left-0 z-10 truncate border-b border-r bg-card px-2 py-1"
-                title={row.step_label}
-              >
-                {row.step_label}
-              </td>
-              {runIds.map((runId) => {
-                const cell = row.cells.get(runId);
-                const isHoveredCol = hoveredRunId === runId;
-                const hoverProps = {
-                  onMouseEnter: () => onHoverRun(runId, "grid"),
-                  onMouseLeave: () => onHoverRun(null, "grid"),
-                };
-                const href = `/runs/${encodeURIComponent(runId)}?scenario=${encodeURIComponent(scenarioId)}&step=${row.step_ordinal}`;
-                if (!cell) {
-                  return metric === "status" ? (
-                    <td key={runId} {...hoverProps} className={cn("border-b p-0.5 text-center", isHoveredCol && "bg-accent")}>
-                      <StatusMark kind="unknown" shape="square" size={16} title="No data" className="mx-auto" />
-                    </td>
-                  ) : (
-                    <td
-                      key={runId}
-                      {...hoverProps}
-                      title="No data"
-                      className={cn("border-b px-2 py-1 text-center text-muted-foreground", isHoveredCol && "bg-accent")}
-                    >
-                      —
-                    </td>
-                  );
-                }
-                const kind = statusKindFromScenario(cell.status);
-                const tip = `${row.step_label}\n${runId}\n${statusLabel(kind)} · ${formatDuration(cell.duration_s)} — open run detail`;
-                if (metric === "status") {
-                  return (
-                    <td key={runId} {...hoverProps} className={cn("border-b p-0.5 text-center", isHoveredCol && "bg-accent")}>
-                      <Link to={href} title={tip} className="mx-auto block w-fit transition-transform hover:scale-125">
-                        <StatusMark kind={kind} shape="square" size={16} title="" />
-                      </Link>
-                    </td>
-                  );
-                }
-                return (
-                  <td key={runId} {...hoverProps} className={cn("border-b px-2 py-1 text-center", isHoveredCol && "bg-accent")}>
-                    <Link
-                      to={href}
-                      title={tip}
-                      className={cn("block whitespace-nowrap font-mono tabular-nums hover:underline", durationClass(cell.status))}
-                    >
-                      {formatDuration(cell.duration_s)}
-                    </Link>
-                  </td>
-                );
-              })}
-              <td className="sticky right-0 z-10 border-b border-l bg-card px-2 py-1 text-right">
-                {metric === "status" ? (
-                  <span className="whitespace-nowrap">
-                    <span className="font-medium tabular-nums">{Math.round(row.passRate * 100)}%</span>
-                    <span className="ml-1 text-[10px] text-muted-foreground">
-                      {row.passed}/{row.total}
-                    </span>
+          {bgRows.length > 0 && (
+            <tr>
+              <td colSpan={colCount} className="border-b bg-card p-0">
+                <button
+                  type="button"
+                  onClick={() => setShowBackground((v) => !v)}
+                  title={showBackground ? "Hide background steps" : "Show background steps"}
+                  className={cn(
+                    "flex w-full items-center gap-2 px-2 py-1 text-left text-[11px] hover:bg-muted/40",
+                    bgHasFailure ? "text-red-600 dark:text-red-400" : "text-muted-foreground hover:text-foreground"
+                  )}
+                >
+                  <ChevronRight size={12} className={cn("shrink-0 transition-transform", showBackground && "rotate-90")} />
+                  <span>
+                    {showBackground ? "Hide" : "Show"} {bgRows.length} background step{bgRows.length === 1 ? "" : "s"}
+                    {bgHasFailure ? " · contains a failure" : ""}
                   </span>
-                ) : (
-                  <span className="whitespace-nowrap">
-                    <span className="font-medium tabular-nums">
-                      {row.durAvg != null ? formatDuration(row.durAvg) : "—"}
-                    </span>
-                    <span className="ml-1 text-[10px] text-muted-foreground">
-                      {row.durCv != null ? `±${Math.round(row.durCv * 100)}%` : "—"}
-                    </span>
-                  </span>
-                )}
+                </button>
               </td>
             </tr>
-          ))}
+          )}
+          {showBackground && bgRows.map(renderRow)}
+          {bodyRows.map(renderRow)}
         </tbody>
       </table>
     </div>
