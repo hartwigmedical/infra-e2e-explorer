@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
-import { Search, X } from "lucide-react";
+import { ArrowRight, Search, X } from "lucide-react";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
 import Spinner from "~/components/Spinner";
 import StatusMark from "~/components/StatusMark";
@@ -30,6 +30,7 @@ interface StepHistoryRow {
   step_ordinal: number;
   step_label: string;
   status: string;
+  duration_s: number | null;
   has_error: boolean;
   error_message: string | null;
 }
@@ -165,7 +166,7 @@ function buildHistorySql(featureUri: string, scenarioId: string, nightlyOnly: bo
 
 function buildStepHistorySql(featureUri: string, scenarioId: string, nightlyOnly: boolean): string {
   return `
-    SELECT st.run_id, st.step_ordinal, st.step_label, st.status, st.has_error, st.error_message
+    SELECT st.run_id, st.step_ordinal, st.step_label, st.status, st.duration_s, st.has_error, st.error_message
     FROM steps st
     JOIN runs r USING (run_id)
     WHERE st.feature_uri = ${sqlLit(featureUri)} AND st.scenario_id = ${sqlLit(scenarioId)}
@@ -541,6 +542,15 @@ function ScenarioMatrix({
                   </button>
                 );
               })}
+              <div className="mt-1 border-t pt-1">
+                <Link
+                  to={`/runs/${encodeURIComponent(menu.runId)}`}
+                  className="flex items-center justify-between gap-2 rounded-md px-2 py-1.5 text-sm text-muted-foreground hover:bg-muted hover:text-foreground"
+                >
+                  Open run detail
+                  <ArrowRight size={13} />
+                </Link>
+              </div>
             </div>
           );
         })()}
@@ -603,18 +613,26 @@ interface StepGridRow {
   step_ordinal: number;
   step_label: string;
   cells: Map<string, StepHistoryRow>;
+  passed: number;
+  total: number;
+  passRate: number;
+  /** Mean duration over PASSED runs (failed/skipped step durations are truncated). */
+  durAvg: number | null;
+  durCv: number | null;
 }
 
 function StepGrid({
   runIds,
   stepRows,
   scenarioId,
+  metric,
   hoveredRunId,
   onHoverRun,
 }: {
   runIds: string[];
   stepRows: StepHistoryRow[];
   scenarioId: string;
+  metric: Metric;
   hoveredRunId: string | null;
   onHoverRun: (runId: string | null, source: "strip" | "grid") => void;
 }) {
@@ -623,13 +641,36 @@ function StepGrid({
     for (const row of stepRows) {
       let entry = byOrdinal.get(row.step_ordinal);
       if (!entry) {
-        entry = { step_ordinal: row.step_ordinal, step_label: row.step_label, cells: new Map() };
+        entry = {
+          step_ordinal: row.step_ordinal,
+          step_label: row.step_label,
+          cells: new Map(),
+          passed: 0,
+          total: 0,
+          passRate: 0,
+          durAvg: null,
+          durCv: null,
+        };
         byOrdinal.set(row.step_ordinal, entry);
       }
       // stepRows is ordered by run_id ascending, so the last write wins -
       // i.e. the label reflects the most recent run that had this step.
       entry.step_label = row.step_label;
       entry.cells.set(row.run_id, row);
+    }
+    for (const entry of byOrdinal.values()) {
+      const passedDurations: number[] = [];
+      for (const cell of entry.cells.values()) {
+        entry.total++;
+        if (cell.status === "passed") {
+          entry.passed++;
+          if (cell.duration_s != null) passedDurations.push(cell.duration_s);
+        }
+      }
+      entry.passRate = entry.total > 0 ? entry.passed / entry.total : 0;
+      entry.durAvg = passedDurations.length > 0 ? mean(passedDurations) : null;
+      const sd = sampleStdDev(passedDurations);
+      entry.durCv = entry.durAvg != null && entry.durAvg > 0 && sd != null ? sd / entry.durAvg : null;
     }
     return Array.from(byOrdinal.values()).sort((a, b) => a.step_ordinal - b.step_ordinal);
   }, [stepRows]);
@@ -638,12 +679,21 @@ function StepGrid({
     return <p className="text-sm text-muted-foreground">No step data for this scenario.</p>;
   }
 
+  const summaryHeader = metric === "status" ? "Pass rate" : "Avg · CV";
+  const STEP_W = 320;
+  const SUMMARY_W = 132;
+  const MIN_RUN_W = metric === "status" ? 30 : 58;
+  const minTableWidth = STEP_W + SUMMARY_W + runIds.length * MIN_RUN_W;
+
   return (
-    <div className="relative z-0 max-h-[60vh] overflow-x-auto overflow-y-auto rounded-lg border">
-      <table className="w-full border-separate border-spacing-0 text-xs">
+    <div className="relative z-0 max-h-[60vh] overflow-auto rounded-lg border">
+      <table
+        className="w-full table-fixed border-separate border-spacing-0 text-xs"
+        style={{ minWidth: minTableWidth }}
+      >
         <thead>
           <tr>
-            <th className="sticky top-0 left-0 z-30 min-w-[240px] max-w-[320px] border-b bg-muted px-2 py-1.5 text-left font-medium text-muted-foreground">
+            <th className="sticky left-0 top-0 z-30 w-[320px] border-b border-r bg-muted px-2 py-1.5 text-left font-medium text-muted-foreground">
               Step
             </th>
             {runIds.map((runId) => (
@@ -653,7 +703,8 @@ function StepGrid({
                 onMouseEnter={() => onHoverRun(runId, "grid")}
                 onMouseLeave={() => onHoverRun(null, "grid")}
                 className={cn(
-                  "sticky top-0 z-10 w-6 border-b bg-muted px-0.5 py-1.5 text-center font-normal text-muted-foreground",
+                  "sticky top-0 z-20 border-b bg-muted py-1.5 text-center font-normal text-muted-foreground",
+                  metric === "status" ? "px-1" : "px-2",
                   hoveredRunId === runId && "bg-accent"
                 )}
               >
@@ -665,42 +716,86 @@ function StepGrid({
                 </span>
               </th>
             ))}
+            <th className="sticky right-0 top-0 z-30 w-[132px] border-b border-l bg-muted px-2 py-1.5 text-right font-medium text-muted-foreground">
+              {summaryHeader}
+            </th>
           </tr>
         </thead>
         <tbody>
           {gridRows.map((row) => (
             <tr key={row.step_ordinal}>
               <td
-                className="sticky left-0 z-20 max-w-[320px] truncate border-b bg-card px-2 py-1"
+                className="sticky left-0 z-10 truncate border-b border-r bg-card px-2 py-1"
                 title={row.step_label}
               >
                 {row.step_label}
               </td>
               {runIds.map((runId) => {
                 const cell = row.cells.get(runId);
-                const kind = cell ? statusKindFromScenario(cell.status) : "unknown";
                 const isHoveredCol = hoveredRunId === runId;
-                const label = cell ? statusLabel(kind) : "no data";
-                return (
-                  <td key={runId} className="border-b p-0.5 text-center">
-                    <Link
-                      to={`/runs/${encodeURIComponent(runId)}?scenario=${encodeURIComponent(scenarioId)}&step=${row.step_ordinal}`}
-                      onMouseEnter={() => onHoverRun(runId, "grid")}
-                      onMouseLeave={() => onHoverRun(null, "grid")}
-                      title={`${row.step_label} · ${runId} · ${label} — open run detail`}
-                      className="mx-auto block transition-transform hover:scale-125"
+                const hoverProps = {
+                  onMouseEnter: () => onHoverRun(runId, "grid"),
+                  onMouseLeave: () => onHoverRun(null, "grid"),
+                };
+                const href = `/runs/${encodeURIComponent(runId)}?scenario=${encodeURIComponent(scenarioId)}&step=${row.step_ordinal}`;
+                if (!cell) {
+                  return metric === "status" ? (
+                    <td key={runId} {...hoverProps} className={cn("border-b p-0.5 text-center", isHoveredCol && "bg-accent")}>
+                      <StatusMark kind="unknown" shape="square" size={16} title="No data" className="mx-auto" />
+                    </td>
+                  ) : (
+                    <td
+                      key={runId}
+                      {...hoverProps}
+                      title="No data"
+                      className={cn("border-b px-2 py-1 text-center text-muted-foreground", isHoveredCol && "bg-accent")}
                     >
-                      <StatusMark
-                        kind={kind}
-                        shape="square"
-                        size={16}
-                        title=""
-                        className={cn(isHoveredCol && "border-2 border-foreground/20")}
-                      />
+                      —
+                    </td>
+                  );
+                }
+                const kind = statusKindFromScenario(cell.status);
+                const tip = `${row.step_label}\n${runId}\n${statusLabel(kind)} · ${formatDuration(cell.duration_s)} — open run detail`;
+                if (metric === "status") {
+                  return (
+                    <td key={runId} {...hoverProps} className={cn("border-b p-0.5 text-center", isHoveredCol && "bg-accent")}>
+                      <Link to={href} title={tip} className="mx-auto block w-fit transition-transform hover:scale-125">
+                        <StatusMark kind={kind} shape="square" size={16} title="" />
+                      </Link>
+                    </td>
+                  );
+                }
+                return (
+                  <td key={runId} {...hoverProps} className={cn("border-b px-2 py-1 text-center", isHoveredCol && "bg-accent")}>
+                    <Link
+                      to={href}
+                      title={tip}
+                      className={cn("block whitespace-nowrap font-mono tabular-nums hover:underline", durationClass(cell.status))}
+                    >
+                      {formatDuration(cell.duration_s)}
                     </Link>
                   </td>
                 );
               })}
+              <td className="sticky right-0 z-10 border-b border-l bg-card px-2 py-1 text-right">
+                {metric === "status" ? (
+                  <span className="whitespace-nowrap">
+                    <span className="font-medium tabular-nums">{Math.round(row.passRate * 100)}%</span>
+                    <span className="ml-1 text-[10px] text-muted-foreground">
+                      {row.passed}/{row.total}
+                    </span>
+                  </span>
+                ) : (
+                  <span className="whitespace-nowrap">
+                    <span className="font-medium tabular-nums">
+                      {row.durAvg != null ? formatDuration(row.durAvg) : "—"}
+                    </span>
+                    <span className="ml-1 text-[10px] text-muted-foreground">
+                      {row.durCv != null ? `±${Math.round(row.durCv * 100)}%` : "—"}
+                    </span>
+                  </span>
+                )}
+              </td>
             </tr>
           ))}
         </tbody>
@@ -713,6 +808,8 @@ function ScenarioDetailPanel({
   selected,
   nightlyOnly,
   tags,
+  metric,
+  setMetric,
   hoveredRunId,
   hoverSource,
   onHoverRun,
@@ -720,6 +817,8 @@ function ScenarioDetailPanel({
   selected: SelectedScenario;
   nightlyOnly: boolean;
   tags: string[];
+  metric: Metric;
+  setMetric: (m: Metric) => void;
   hoveredRunId: string | null;
   hoverSource: "strip" | "grid" | null;
   onHoverRun: (runId: string | null, source: "strip" | "grid") => void;
@@ -786,9 +885,28 @@ function ScenarioDetailPanel({
       </div>
 
       <div className="rounded-lg border bg-card p-4">
-        <h3 className="mb-2 text-sm font-semibold text-muted-foreground">
-          Step history ({runIds.length} run{runIds.length === 1 ? "" : "s"})
-        </h3>
+        <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
+          <h3 className="text-sm font-semibold text-muted-foreground">
+            Step history ({runIds.length} run{runIds.length === 1 ? "" : "s"})
+          </h3>
+          <div className="inline-flex rounded-md border p-0.5 text-sm">
+            {(["status", "duration"] as Metric[]).map((m) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => setMetric(m)}
+                className={cn(
+                  "rounded px-3 py-1 capitalize transition-colors",
+                  metric === m
+                    ? "bg-accent font-medium text-accent-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                )}
+              >
+                {m}
+              </button>
+            ))}
+          </div>
+        </div>
         {stepsLoading && stepRows.length === 0 ? (
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Spinner size={13} /> Loading step history…
@@ -798,6 +916,7 @@ function ScenarioDetailPanel({
             runIds={runIds}
             stepRows={stepRows}
             scenarioId={selected.scenario_id}
+            metric={metric}
             hoveredRunId={hoveredRunId}
             onHoverRun={onHoverRun}
           />
@@ -1108,6 +1227,8 @@ export default function Scenarios() {
             selected={selected}
             nightlyOnly={nightlyOnly}
             tags={selectedTagsList}
+            metric={metric}
+            setMetric={setMetric}
             hoveredRunId={hoveredRunId}
             hoverSource={hoverSource}
             onHoverRun={handleHoverRun}

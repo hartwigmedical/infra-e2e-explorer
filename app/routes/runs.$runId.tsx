@@ -1031,9 +1031,6 @@ export default function RunDetail() {
   if (dataStatus === "error" || runError || scenariosError) {
     return (
       <div className="mx-auto max-w-4xl space-y-4 p-6">
-        <Link to="/" className="text-sm text-muted-foreground hover:text-foreground">
-          ← Back to Recent Runs
-        </Link>
         <p className="text-sm text-destructive">
           Failed to load run{combinedError ? `: ${combinedError.message}` : "."}
         </p>
@@ -1052,9 +1049,6 @@ export default function RunDetail() {
   if (!run) {
     return (
       <div className="mx-auto max-w-4xl space-y-4 p-6">
-        <Link to="/" className="text-sm text-muted-foreground hover:text-foreground">
-          ← Back to Recent Runs
-        </Link>
         <div className="rounded-lg border bg-card p-6">
           <p className="text-sm text-muted-foreground">
             Run <span className="font-mono">{runId}</span> not found.
@@ -1066,10 +1060,6 @@ export default function RunDetail() {
 
   return (
     <div className="mx-auto max-w-4xl space-y-4 p-6">
-      <Link to="/" className="text-sm text-muted-foreground hover:text-foreground">
-        ← Back to Recent Runs
-      </Link>
-
       <div className="rounded-lg border bg-card p-6">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
