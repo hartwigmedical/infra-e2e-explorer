@@ -11,6 +11,12 @@ const BUCKET_NAME = process.env.E2E_BUCKET || "infra-e2e-test-reports";
 const SIGNED_URL_TTL_SECONDS =
   Number(process.env.SIGNED_URL_TTL_SECONDS) || 900;
 
+// Host serving the Cluecumber HTML reports. Differs per environment, so it's a
+// runtime var (not build-time) — one built client bundle is shared across
+// deployments, so the value must be injected at serve time via /config.js.
+const CLUECUMBER_BASE_URL =
+  process.env.CLUECUMBER_BASE_URL || "http://e2e-test-reports.pilot-1";
+
 // Reports are named differently across report "eras" — try current era first.
 const CANDIDATE_SOURCES = ["cucumber-parallel.json", "cucumber.json"];
 
@@ -247,6 +253,17 @@ app.get("/api/runs", async (req, res) => {
   });
 });
 
+// Runtime config for the SPA. Served as a classic (render-blocking) script so
+// window.__APP_CONFIG__ is set before the deferred app bundle runs — see
+// app/lib/format.ts. In dev this is reached via Vite's proxy (see vite.config.ts).
+app.get("/config.js", (_req, res) => {
+  res.type("application/javascript").send(
+    `window.__APP_CONFIG__=${JSON.stringify({
+      cluecumberBaseUrl: CLUECUMBER_BASE_URL,
+    })};`,
+  );
+});
+
 // Serve the built client in production (single deployable). In dev, Vite serves
 // the client and proxies /api to this server instead, so this is a no-op then.
 const clientDir = path.resolve(import.meta.dirname, "../build/client");
@@ -260,4 +277,5 @@ if (existsSync(clientDir)) {
 app.listen(PORT, () => {
   console.log(`e2e-explorer server listening on http://localhost:${PORT}`);
   console.log(`Bucket: gs://${BUCKET_NAME}`);
+  console.log(`Cluecumber reports: ${CLUECUMBER_BASE_URL}`);
 });

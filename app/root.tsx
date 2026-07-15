@@ -16,6 +16,9 @@ export function Layout({ children }: { children: React.ReactNode }) {
       <head>
         <meta charSet="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
+        {/* Runtime config from the server; classic (non-module) script so
+            window.__APP_CONFIG__ is set before the app bundle runs. */}
+        <script src="/config.js" />
         <Meta />
         <Links />
       </head>

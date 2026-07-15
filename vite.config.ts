@@ -14,6 +14,7 @@ export default defineConfig({
   server: {
     proxy: {
       "/api": "http://127.0.0.1:3001",
+      "/config.js": "http://127.0.0.1:3001",
     },
   },
   optimizeDeps: { exclude: ["@duckdb/duckdb-wasm"] },
