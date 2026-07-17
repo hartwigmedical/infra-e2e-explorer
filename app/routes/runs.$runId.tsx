@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 import { Check, ChevronRight, ChevronsDownUp, ChevronsUpDown, Clock, Copy, FileText, History, Link2, Search, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
@@ -11,7 +11,7 @@ import Spinner from "~/components/Spinner";
 import CluecumberLink from "~/components/CluecumberLink";
 import TagFilter from "~/components/TagFilter";
 import { statusKindFromRunToken, statusKindFromScenario, statusLabel } from "~/lib/status";
-import { scenarioHistoryPath } from "~/lib/format";
+import { scenarioHistoryPath, utcRunRange, utcRunRangeIso } from "~/lib/format";
 import { cn, copyText } from "~/lib/utils";
 import { fireCelebration } from "~/lib/celebrate";
 
@@ -410,7 +410,9 @@ function StepList({
   );
 }
 
-function CopyTestIdButton({ value }: { value: string }) {
+/** A small clipboard-copy icon button that briefly flips to a check on success.
+ *  `title` labels what gets copied (shown until the 1.5s "Copied" confirmation). */
+function CopyButton({ value, title = "Copy" }: { value: string; title?: string }) {
   const [copied, setCopied] = useState(false);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -431,11 +433,113 @@ function CopyTestIdButton({ value }: { value: string }) {
     <button
       type="button"
       onClick={handleCopy}
-      title={copied ? "Copied" : "Copy Test ID"}
+      title={copied ? "Copied" : title}
       className="inline-flex shrink-0 items-center rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
     >
       {copied ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
     </button>
+  );
+}
+
+/** One "Start"/"End" row inside the run-range popover: the label, the ISO 8601
+ *  instant in monospace, and a copy button for that single value. */
+function IsoCopyRow({ label, iso }: { label: string; iso: string }) {
+  return (
+    <div className="flex items-center gap-2 text-xs whitespace-nowrap">
+      <span className="w-8 shrink-0 text-muted-foreground">{label}</span>
+      <span className="font-mono text-foreground">{iso}</span>
+      <CopyButton value={iso} title={`Copy ${label.toLowerCase()} (ISO 8601)`} />
+    </div>
+  );
+}
+
+/**
+ * The run-range text in the scenario header, wrapped in a hover popover that
+ * exposes the start/end as copyable ISO 8601 instants (handy for pasting into a
+ * log query). Opens after a short hover delay so it doesn't flicker while the
+ * pointer merely passes over, and closes on a brief delay so moving from the
+ * text down into the popover (across the small gap) doesn't dismiss it. Also
+ * opens on keyboard focus (immediately — no delay needed) for non-mouse users.
+ */
+function RunRangePopover({
+  display,
+  startIso,
+  endIso,
+}: {
+  display: string;
+  startIso: string;
+  endIso: string | null;
+}) {
+  const [open, setOpen] = useState(false);
+  const openTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearOpenTimer = () => {
+    if (openTimer.current) {
+      clearTimeout(openTimer.current);
+      openTimer.current = null;
+    }
+  };
+  const clearCloseTimer = () => {
+    if (closeTimer.current) {
+      clearTimeout(closeTimer.current);
+      closeTimer.current = null;
+    }
+  };
+  useEffect(() => () => {
+    clearOpenTimer();
+    clearCloseTimer();
+  }, []);
+
+  // Enter (text or popover): cancel any pending close; arm the open delay.
+  const handleEnter = () => {
+    clearCloseTimer();
+    if (open || openTimer.current) return;
+    openTimer.current = setTimeout(() => {
+      openTimer.current = null;
+      setOpen(true);
+    }, 450);
+  };
+  // Leave: cancel a pending open; close after a short grace period (re-entering
+  // the popover fires handleEnter again and cancels it — see the gap note above).
+  const handleLeave = () => {
+    clearOpenTimer();
+    if (!open) return;
+    closeTimer.current = setTimeout(() => {
+      closeTimer.current = null;
+      setOpen(false);
+    }, 120);
+  };
+
+  return (
+    <span className="relative inline-flex" onMouseEnter={handleEnter} onMouseLeave={handleLeave}>
+      <span
+        tabIndex={0}
+        onFocus={() => {
+          clearOpenTimer();
+          clearCloseTimer();
+          setOpen(true);
+        }}
+        onBlur={() => setOpen(false)}
+        className="inline-flex items-center gap-1.5 rounded outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      >
+        <Clock size={12} className="shrink-0" />
+        <span className="font-mono text-foreground underline decoration-dotted decoration-muted-foreground/40 underline-offset-2 hover:decoration-muted-foreground">
+          {display}
+        </span>
+      </span>
+      {open && (
+        <div
+          role="dialog"
+          className="absolute top-full left-0 z-30 mt-1 w-max rounded-md border bg-popover p-2 text-popover-foreground shadow-md"
+        >
+          <div className="flex flex-col gap-1.5">
+            <IsoCopyRow label="Start" iso={startIso} />
+            {endIso && <IsoCopyRow label="End" iso={endIso} />}
+          </div>
+        </div>
+      )}
+    </span>
   );
 }
 
@@ -444,28 +548,59 @@ function CopyTestIdButton({ value }: { value: string }) {
  *  nothing when the scenario has neither a test_id nor tags. */
 function ScenarioMeta({ scenario }: { scenario: ScenarioRow }) {
   const tagList = Array.from(scenario.tag_names ?? []);
-  if (!scenario.test_id && tagList.length === 0) return null;
+  // The UTC window this scenario was running in (start → start + busy time),
+  // for correlating a scenario against logs. duration_s is busy time, but a
+  // scenario's steps run sequentially, so it's a good proxy for its wall-clock.
+  const runRange = utcRunRange(scenario.started_ms, scenario.duration_s);
+  const runRangeIso = utcRunRangeIso(scenario.started_ms, scenario.duration_s);
+
+  // Collect only the present items, then interleave a subtle dot between them
+  // (below) so there's never a leading/trailing/doubled separator regardless of
+  // which pieces this scenario has.
+  const items: ReactNode[] = [];
+  if (scenario.test_id) {
+    items.push(
+      <span key="test-id" className="inline-flex items-center gap-1.5">
+        <span>Test ID:</span>
+        <span className="font-mono font-medium text-foreground">{scenario.test_id}</span>
+        <CopyButton value={scenario.test_id} title="Copy Test ID" />
+      </span>
+    );
+  }
+  if (runRange && runRangeIso) {
+    items.push(
+      <RunRangePopover
+        key="run-range"
+        display={runRange}
+        startIso={runRangeIso.start}
+        endIso={runRangeIso.end}
+      />
+    );
+  }
+  if (tagList.length > 0) {
+    items.push(
+      <span key="tags" className="flex flex-wrap gap-1">
+        {tagList.map((tag) => (
+          <span
+            key={tag}
+            className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+          >
+            {tag}
+          </span>
+        ))}
+      </span>
+    );
+  }
+
+  if (items.length === 0) return null;
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 pb-2 pl-10 text-xs text-muted-foreground">
-      {scenario.test_id && (
-        <span className="inline-flex items-center gap-1.5">
-          <span>Test ID:</span>
-          <span className="font-mono font-medium text-foreground">{scenario.test_id}</span>
-          <CopyTestIdButton value={scenario.test_id} />
-        </span>
-      )}
-      {tagList.length > 0 && (
-        <span className="flex flex-wrap gap-1">
-          {tagList.map((tag) => (
-            <span
-              key={tag}
-              className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
-            >
-              {tag}
-            </span>
-          ))}
-        </span>
-      )}
+    <div className="flex flex-wrap items-center gap-x-1 gap-y-1 px-4 pb-2 pl-10 text-xs text-muted-foreground">
+      {items.map((item, i) => (
+        <Fragment key={i}>
+          {i > 0 && <span aria-hidden>·</span>}
+          {item}
+        </Fragment>
+      ))}
     </div>
   );
 }
