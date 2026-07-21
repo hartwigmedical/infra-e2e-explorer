@@ -1,54 +1,44 @@
 /**
- * SQL for the four non-stored DuckDB views that expose the nested Cucumber
- * JSON e2e reports as clean, flat, queryable tables. Two data sources feed
- * these views (see app/contexts/E2eDataContext.tsx for how the active one is
- * chosen):
+ * SQL for exposing the nested Cucumber JSON e2e reports as clean, flat,
+ * queryable tables/views in DuckDB.
  *
- *   - LOCAL mode: runs.json + report files served same-origin from /data.
- *   - API  mode: the live `/api/runs` run list (registered into DuckDB-Wasm's
- *     virtual filesystem via `registerFileText`, see E2eDataContext) plus
- *     each run's signed `cucumberUrl` pointing at storage.googleapis.com.
+ * Loading strategy (see app/contexts/E2eDataContext.tsx for the orchestration):
  *
- * The views themselves don't care which mode produced their inputs - they
- * just take a runs-JSON location and a list of report URLs:
+ *   1. v_runs is built straight from the run list (runs.json / the /api/runs
+ *      response) - no report parsing.
+ *   2. Each run's raw cucumber.json is parsed EXACTLY ONCE into a compact
+ *      "slim" Parquet (buildSlimSelectSql): the feature/scenario/step structure
+ *      with the embeddings' multi-MB base64 `data` blobs stripped (they're 90%+
+ *      of a report's bytes and nothing here needs them; only the tiny embedding
+ *      `name`/`mime_type` are kept, for test_id extraction). That slim Parquet
+ *      is cached in IndexedDB keyed by run_id (see app/lib/report-cache.ts), so
+ *      a repeat session / loadMore skips the fetch+parse entirely.
+ *   3. v_features reads the slim Parquet files (buildFeaturesViewSql), and
+ *      v_scenarios / v_steps / the test_ids extraction all run over v_features -
+ *      i.e. over the cheap slim data, never the raw JSON again. E2eDataContext
+ *      materialises those into the `scenarios` / `steps` / `test_ids` tables the
+ *      app actually queries.
  *
- *   v_runs       - one row per run, derived straight from the run list (no report parsing)
- *   v_features   - one row per (run, feature)
- *   v_scenarios  - one row per (run, scenario) - background elements excluded
- *   v_steps      - one row per (run, scenario, step)
- *   (test_ids)   - one row per (run, scenario) test_id, parsed out of the
- *                  scenario's after-hook text/plain log embedding's `name`
- *                  field (e.g. "Log of test 12345678"). NOT a view: built by
- *                  buildTestIdsSelectSql() (see TEST_ID_ELEMENTS_TYPE) and run
- *                  by E2eDataContext in small file BATCHES into a `test_ids`
- *                  table. Even though the schema reads only the tiny `name`
- *                  (never the embeddings' `data`, which can be a multi-MB base64
- *                  zip blob alongside the log), read_json still PARSES past
- *                  those `data` values in the raw JSON, so a single pass over a
- *                  whole wide window OOMs the wasm heap - batching bounds peak
- *                  parse memory to one batch regardless of window size.
+ * Why slim Parquet as the cache layer (rather than the final scenarios/steps
+ * tables): the expensive step is parsing the huge raw JSON; the analysis SQL
+ * over the slim structure is cheap. Caching the slim structure means changing
+ * status/background/test_id logic (or adding a column derived from fields we
+ * already capture) needs NO cache invalidation - only changing the *set of raw
+ * fields we extract* does, which auto-bumps SCHEMA_VERSION below.
  *
- * These are views, not materialized tables: every query against them re-reads
- * the underlying JSON via DuckDB's `read_json`, so there is nothing to keep in
- * sync when new runs land in the manifest - re-running buildE2eViewsSql() (or
- * just querying again after CREATE VIEW) always reflects the current input.
+ * v_features uses an EXPLICIT `columns` schema for read_json rather than
+ * auto-detection: auto-detection OOMs the wasm heap across dozens of files, and
+ * explicit typing also sidesteps schema drift between report eras. Extracting
+ * one file at a time (see E2eDataContext) further bounds peak parse memory,
+ * since read_json still parses PAST the base64 `data` even when the schema
+ * omits it.
  *
- * app/contexts/E2eDataContext.tsx creates these views once per session and
- * then materializes `runs`/`scenarios`/`steps`/`test_ids` TABLEs on top of
- * them, so the app never re-reads the underlying JSON on every query (see
- * that file's doc comment for the two-stage materialization strategy).
+ * Separately, buildScenarioLogsSql() builds a one-off query (NOT part of the
+ * slim pipeline) for reading a SINGLE run's full scenario logs on demand - the
+ * one place that still base64-decodes an embedding's `data`. See its doc comment.
  *
  * Validated against 60 real report files (public/data, ~277MB total) via the
  * DuckDB CLI before being wired into the browser.
- *
- * v_features uses an EXPLICIT `columns` schema for read_json instead of
- * auto-detection (deviation from the original draft - see buildE2eViewsSql
- * doc comment below for why).
- *
- * Separately, `buildScenarioLogsSql()` below builds a one-off query (NOT a
- * view baked into buildE2eViewsSql) for reading a SINGLE run's full scenario
- * logs on demand - see its own doc comment for why that one does need to
- * decode `data` and is deliberately scoped to one report URL at a time.
  */
 
 function sqlStringLiteral(value: string): string {
@@ -60,12 +50,14 @@ function sqlArrayLiteral(values: string[]): string {
 }
 
 // Explicit schema for the `elements` field of a Cucumber feature, passed to
-// read_json's `columns` option (see buildE2eViewsSql for why). Only the
-// fields actually consumed by v_scenarios/v_steps are declared; anything
-// else present in the source JSON (e.g. attachment/embedding blobs on hooks,
-// which can carry large base64 log dumps and are not needed by any view
-// here) is simply never extracted.
-const ELEMENTS_TYPE = `STRUCT(
+// read_json's `columns` option. Only the fields consumed by v_scenarios /
+// v_steps / test_id extraction are declared; everything else in the source JSON
+// is never extracted. Crucially the embeddings' `data` field is NOT declared -
+// only the tiny `name`/`mime_type` are - so the huge base64 screenshot/video/
+// log blobs (90%+ of a report's bytes) are dropped from the slim Parquet. The
+// per-scenario test id is embedded in the after-hook text/plain log embedding's
+// NAME ("Log of test <8 digits>"), which is why `name` is kept here.
+const SLIM_ELEMENTS_TYPE = `STRUCT(
     id VARCHAR,
     name VARCHAR,
     line BIGINT,
@@ -73,7 +65,11 @@ const ELEMENTS_TYPE = `STRUCT(
     tags STRUCT(name VARCHAR)[],
     start_timestamp VARCHAR,
     before STRUCT(result STRUCT(status VARCHAR, duration BIGINT), match STRUCT(location VARCHAR))[],
-    after STRUCT(result STRUCT(status VARCHAR, duration BIGINT), match STRUCT(location VARCHAR))[],
+    after STRUCT(
+      result STRUCT(status VARCHAR, duration BIGINT),
+      match STRUCT(location VARCHAR),
+      embeddings STRUCT(mime_type VARCHAR, name VARCHAR)[]
+    )[],
     steps STRUCT(
       keyword VARCHAR,
       name VARCHAR,
@@ -85,147 +81,49 @@ const ELEMENTS_TYPE = `STRUCT(
   .replace(/\s+/g, " ")
   .trim();
 
-const FEATURES_COLUMNS = `{'uri': 'VARCHAR', 'name': 'VARCHAR', 'keyword': 'VARCHAR', 'tags': 'STRUCT(name VARCHAR)[]', 'elements': '${ELEMENTS_TYPE}'}`;
+const SLIM_FEATURES_COLUMNS = `{'uri': 'VARCHAR', 'name': 'VARCHAR', 'keyword': 'VARCHAR', 'tags': 'STRUCT(name VARCHAR)[]', 'elements': '${SLIM_ELEMENTS_TYPE}'}`;
 
-// Minimal schema for the test_id extraction pass (see v_test_ids below). The
-// per-scenario 8-digit test id is embedded right in the NAME of the
-// scenario's after-hook text/plain log embedding ("Log of test <8 digits>") -
-// step args/data-tables/names all keep the literal "$testId" placeholder, so
-// there's no way to get it without embeddings. Rather than adding embeddings
-// to ELEMENTS_TYPE above (which would carry them into every row of the
-// scenarios/steps tables materialized in E2eDataContext), this schema
-// declares ONLY `id`/`type`/`after.embeddings.{mime_type,name}` - deliberately
-// omitting `data` entirely, so this never reads (let alone decodes) any
-// embedding's base64 payload, including the multi-MB screenshot/video zip
-// some scenarios carry alongside the log in the same list. Reading only tiny
-// `name` strings for every file is cheap, so - unlike the old data-decoding
-// version of this extraction - v_test_ids can be a single view over ALL
-// report URLs, no batching required.
-const TEST_ID_ELEMENTS_TYPE = `STRUCT(
-    id VARCHAR,
-    "type" VARCHAR,
-    after STRUCT(
-      embeddings STRUCT(mime_type VARCHAR, name VARCHAR)[]
-    )[]
-  )[]`
-  .replace(/\s+/g, " ")
-  .trim();
-
-const TEST_ID_FEATURES_COLUMNS = `{'elements': '${TEST_ID_ELEMENTS_TYPE}'}`;
-
-// Schema for the on-demand single-run scenario log fetch (see
-// buildScenarioLogsSql). Unlike TEST_ID_ELEMENTS_TYPE above, this DOES declare
-// `data` because the whole point is to decode the log text - but it's only
-// ever queried for one report URL at a time (see that function's doc comment
-// for why that keeps it safe).
-const SCENARIO_LOG_ELEMENTS_TYPE = `STRUCT(
-    id VARCHAR,
-    "type" VARCHAR,
-    after STRUCT(
-      embeddings STRUCT(mime_type VARCHAR, "data" VARCHAR)[]
-    )[]
-  )[]`
-  .replace(/\s+/g, " ")
-  .trim();
-
-const SCENARIO_LOG_FEATURES_COLUMNS = `{'elements': '${SCENARIO_LOG_ELEMENTS_TYPE}'}`;
+// Column list (in slim-Parquet order) shared by the real extract and the empty
+// placeholder, so both always produce an identically-typed relation.
+const SLIM_SELECT_COLUMNS = `uri AS feature_uri, name AS feature_name, keyword AS feature_keyword, tags AS feature_tags, elements`;
 
 /**
- * Build a SELECT of (scenario_id, log) for a SINGLE run's report file: the
- * fully decoded text/plain after-hook log embedding for every scenario in
- * that one file. Used on demand by the run-detail "Log" button
- * (E2eDataContext.reportUrlByRunId supplies the URL for the run currently
- * being viewed) rather than folded into the startup materialization.
- *
- * This is the one place that still base64-decodes an embedding's `data` -
- * intentionally scoped to ONE report URL per call, so the multi-MB
- * screenshot/video zip embedding some scenarios carry alongside the log is
- * only ever read transiently for a single file, never across a whole window
- * (that was what OOMed the old batched test_id extraction - see
- * TEST_ID_ELEMENTS_TYPE above for why that extraction now avoids `data`
- * entirely instead).
- *
- * list_filter narrows to the text/plain embedding BEFORE from_base64/decode,
- * so the zip is never base64-decoded. NULL-safe: a missing/empty `after` or no
- * text/plain embedding both fall through to a NULL log.
+ * FNV-1a 32-bit hash -> 8 hex chars. Small, stable, dependency-free; used only
+ * to fingerprint the extraction schema for cache versioning, not for security.
  */
-export function buildScenarioLogsSql(reportUrl: string): string {
-  const reportUrlArray = sqlArrayLiteral([reportUrl]);
-  return `
-SELECT e.id AS scenario_id,
-       decode(from_base64(
-         list_extract(
-           list_filter(
-             flatten(list_transform(coalesce(e.after, []), h -> coalesce(h.embeddings, []))),
-             emb -> emb.mime_type = 'text/plain'
-           ),
-           1
-         )."data"
-       )) AS log
-FROM read_json(${reportUrlArray}, format = 'array',
-               columns = ${SCENARIO_LOG_FEATURES_COLUMNS}, maximum_object_size = 67108864),
-     UNNEST(elements) AS t(e)
-WHERE e.type = 'scenario'`;
+function fnv1a(input: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
 }
 
-/**
- * Build the name-based test_id extraction SELECT for a SUBSET of report URLs -
- * one row per (run, scenario), with the "Log of test <id>" id pulled from the
- * after-hook text/plain embedding's `name`. Reads only tiny `name` strings,
- * never any `data` blob.
- *
- * Callable per-batch (NOT a single view over all URLs) because read_json still
- * PARSES past each file's multi-MB embedding `data` values even when the schema
- * omits them, so reading a whole wide window at once OOMs the wasm heap.
- * E2eDataContext invokes this over small file batches and INSERTs the tiny
- * results into a `test_ids` table, bounding peak parse memory to one batch.
- *
- * nullif('') because regexp_extract returns '' (not NULL) when the embedding
- * name doesn't match, so a scenario whose log name didn't parse becomes NULL
- * (no Test ID shown) rather than an empty-valued row.
- */
-export function buildTestIdsSelectSql(reportUrls: string[]): string {
-  const reportUrlArray = sqlArrayLiteral(reportUrls);
-  return `
-SELECT regexp_extract(filename, '([^/?]+)/cucumber[a-z-]*\\.json', 1) AS run_id,
-       e.id AS scenario_id,
-       nullif(
-         regexp_extract(
-           list_extract(
-             list_filter(
-               flatten(list_transform(coalesce(e.after, []), h -> coalesce(h.embeddings, []))),
-               emb -> emb.mime_type = 'text/plain'
-             ),
-             1
-           ).name,
-           'Log of test ([0-9]+)', 1
-         ), ''
-       ) AS test_id
-FROM read_json(${reportUrlArray}, filename = true, format = 'array',
-               columns = ${TEST_ID_FEATURES_COLUMNS}, maximum_object_size = 67108864),
-     UNNEST(elements) AS t(e)
-WHERE e.type = 'scenario'`;
-}
+// Bump to force-invalidate every cached slim report regardless of schema (e.g.
+// after a change to the slim SELECT/analysis that the schema hash below can't
+// see). Normally you never touch this: editing SLIM_FEATURES_COLUMNS already
+// changes the hash and clears the cache automatically.
+const CACHE_SALT = "1";
 
 /**
- * Build the full CREATE OR REPLACE VIEW script for the four views.
- *
- * @param runsJsonUrl - location of the run list, readable via DuckDB's
- *   `read_json`. Either an absolute URL to runs.json (LOCAL mode) or the name
- *   of a file registered into duckdb-wasm's virtual filesystem via
- *   `registerFileText` (API mode) - `read_json` doesn't care which.
- * @param reportUrls - absolute URLs to each run's cucumber.json report -
- *   same-origin /data paths in LOCAL mode, signed storage.googleapis.com URLs
- *   in API mode. Order doesn't matter for correctness: run_id is recovered
- *   per-row from the source filename via `filename = true`, not from array
- *   position.
+ * Identifies the shape of the cached slim Parquet. The report cache clears
+ * itself whenever this changes (see report-cache.ts), so any edit to the set of
+ * raw fields we extract auto-invalidates stale caches - clients self-heal on
+ * their next load (one slow load, then fast again). Derived from the extraction
+ * schema so it can't be forgotten; CACHE_SALT is the manual escape hatch.
  */
-export function buildE2eViewsSql(runsJsonUrl: string, reportUrls: string[]): string {
+export const SCHEMA_VERSION = `v${CACHE_SALT}-${fnv1a(SLIM_FEATURES_COLUMNS)}`;
+
+/**
+ * Build the CREATE OR REPLACE VIEW for v_runs from the run list. `runsJsonUrl`
+ * is either an absolute URL to runs.json (LOCAL mode) or the name of a file
+ * registered into duckdb-wasm's virtual filesystem via registerFileText (API
+ * mode) - read_json doesn't care which. No report parsing happens here.
+ */
+export function buildRunsViewSql(runsJsonUrl: string): string {
   const runsJsonLiteral = sqlStringLiteral(runsJsonUrl);
-  const reportUrlArray = sqlArrayLiteral(reportUrls);
-
   return `
--- runs overview straight from the manifest (no report parsing)
 CREATE OR REPLACE VIEW v_runs AS
 SELECT
   run_id, source, updated, size_bytes,
@@ -236,33 +134,82 @@ SELECT
   try_cast(regexp_extract(run_id, 'failed-(\\d+)-of-\\d+', 1) AS INTEGER)          AS failed_count,
   try_cast(regexp_extract(run_id, '-of-(\\d+)', 1) AS INTEGER)                    AS total_count,
   (regexp_extract(run_id, '^\\d{4}-\\d{2}-\\d{2}-(\\d{4})', 1) IN ('0000','0100','0200')) AS is_nightly
-FROM read_json(${runsJsonLiteral});
+FROM read_json(${runsJsonLiteral});`;
+}
 
--- one row per (run, feature). run_id is recovered from the source filename -
--- a single regex covers both LOCAL paths (".../runs/<id>/cucumber.json") and
--- API-mode signed URLs (".../<id>/cucumber-parallel.json?X-Goog-..."): in
--- both, the run_id is the path segment immediately before "/cucumber*.json".
+/**
+ * Build the SELECT that extracts ONE run's slim feature structure from its raw
+ * cucumber.json, tagging every row with the known run_id. E2eDataContext wraps
+ * this in `COPY (...) TO '<run>.parquet' (FORMAT parquet)` - one file at a time,
+ * so read_json's parse memory is bounded to a single report even though it must
+ * parse past that file's base64 `data` blobs (which the schema drops).
+ *
+ * @param reportUrl - absolute URL to the run's raw report: a same-origin
+ *   /data/.../cucumber.json path (LOCAL) or a signed storage.googleapis.com URL
+ *   (API mode).
+ * @param runId - the run this report belongs to; injected as a literal column
+ *   so the slim Parquet is self-describing regardless of the source URL.
+ */
+export function buildSlimSelectSql(reportUrl: string, runId: string): string {
+  const reportUrlArray = sqlArrayLiteral([reportUrl]);
+  return `
+SELECT ${sqlStringLiteral(runId)} AS run_id, ${SLIM_SELECT_COLUMNS}
+FROM read_json(${reportUrlArray}, format = 'array',
+               columns = ${SLIM_FEATURES_COLUMNS}, maximum_object_size = 67108864)`;
+}
+
+/**
+ * A zero-row SELECT with the exact slim-Parquet schema. E2eDataContext writes
+ * this to a placeholder Parquet when a window has no runs at all, so v_features
+ * (and the tables built over it) still exist with the right columns instead of
+ * read_parquet erroring on an empty file list.
+ */
+export function buildEmptySlimSelectSql(): string {
+  return `
+SELECT
+  CAST(NULL AS VARCHAR) AS run_id,
+  CAST(NULL AS VARCHAR) AS feature_uri,
+  CAST(NULL AS VARCHAR) AS feature_name,
+  CAST(NULL AS VARCHAR) AS feature_keyword,
+  CAST(NULL AS STRUCT(name VARCHAR)[]) AS feature_tags,
+  CAST(NULL AS ${SLIM_ELEMENTS_TYPE}) AS elements
+WHERE false`;
+}
+
+/**
+ * Build CREATE OR REPLACE VIEW v_features over the given slim-Parquet files
+ * (names registered in duckdb-wasm's virtual filesystem). One row per
+ * (run, feature); run_id is stored in the Parquet by buildSlimSelectSql.
+ */
+export function buildFeaturesViewSql(parquetNames: string[]): string {
+  const parquetArray = sqlArrayLiteral(parquetNames);
+  return `
 CREATE OR REPLACE VIEW v_features AS
-SELECT regexp_extract(filename, '([^/?]+)/cucumber[a-z-]*\\.json', 1) AS run_id,
-       uri AS feature_uri, name AS feature_name, keyword AS feature_keyword,
-       tags AS feature_tags, elements
-FROM read_json(${reportUrlArray}, filename = true, format = 'array',
-               columns = ${FEATURES_COLUMNS}, maximum_object_size = 67108864);
+SELECT run_id, feature_uri, feature_name, feature_keyword, feature_tags, elements
+FROM read_parquet(${parquetArray});`;
+}
 
--- one row per (run, scenario). A feature's Background runs as a SEPARATE
--- 'background' element emitted immediately before each scenario; we fold its
--- steps into that scenario - tagged is_background = true and (via their lower
--- line numbers, which sort first in v_steps) ordered ahead of the scenario's
--- own steps - so duration_s, status, and the step list all account for setup.
--- Crucially a failed background step therefore correctly makes the scenario
--- 'failed' (its own steps report as 'skipped' when the background fails).
---
--- Pairing is by ARRAY ADJACENCY, not line: every emitted background element
--- carries the SAME line (the Background's single definition line) and a NULL
--- id, so a line/lead-based match collapses them into one tie and folds the
--- background into only one scenario per feature. Instead we zip each element
--- with its 1-based position in the elements array (elem_idx) and join each
--- scenario to the element at elem_idx - 1 when that is a background.
+/**
+ * Build the CREATE OR REPLACE VIEW statements for v_scenarios and v_steps. Both
+ * read from v_features (the slim Parquet), so they never touch the raw JSON.
+ *
+ * v_scenarios: one row per (run, scenario). A feature's Background runs as a
+ * SEPARATE 'background' element emitted immediately before each scenario; we
+ * fold its steps into that scenario - tagged is_background = true and (via their
+ * lower line numbers, which sort first in v_steps) ordered ahead of the
+ * scenario's own steps - so duration_s, status, and the step list all account
+ * for setup. Crucially a failed background step therefore correctly makes the
+ * scenario 'failed' (its own steps report as 'skipped' when the background fails).
+ *
+ * Pairing is by ARRAY ADJACENCY, not line: every emitted background element
+ * carries the SAME line (the Background's single definition line) and a NULL id,
+ * so a line/lead-based match collapses them into one tie and folds the
+ * background into only one scenario per feature. Instead we zip each element
+ * with its 1-based position in the elements array (elem_idx) and join each
+ * scenario to the element at elem_idx - 1 when that is a background.
+ */
+export function buildScenariosStepsViewsSql(): string {
+  return `
 CREATE OR REPLACE VIEW v_scenarios AS
 WITH elems AS (
   SELECT run_id, feature_uri, feature_name, elem_idx,
@@ -324,11 +271,6 @@ SELECT run_id, feature_uri, feature_name, scenario_id, scenario_name, ordinal, s
   steps
 FROM combined;
 
--- (test_id extraction is NOT a view here - read_json parses past the multi-MB
--- embedding data blobs, so E2eDataContext runs buildTestIdsSelectSql() in small
--- file batches into a test_ids table to bound peak memory. See that function.)
-
--- one row per (run, scenario, step)
 CREATE OR REPLACE VIEW v_steps AS
 SELECT sc.run_id, sc.feature_uri, sc.scenario_id, sc.scenario_name,
   trim(s.keyword) || ' ' || s.name AS step_label, s.name AS step_name, trim(s.keyword) AS step_keyword,
@@ -339,6 +281,86 @@ SELECT sc.run_id, sc.feature_uri, sc.scenario_id, sc.scenario_name,
   (s.result.error_message IS NOT NULL) AS has_error,
   left(s.result.error_message, 2000) AS error_message,
   s.match.location AS glue_location
-FROM v_scenarios sc, UNNEST(sc.steps) AS t(s);
-`;
+FROM v_scenarios sc, UNNEST(sc.steps) AS t(s);`;
+}
+
+/**
+ * Build the (run_id, scenario_id, test_id) SELECT, pulling the "Log of test
+ * <id>" id out of each scenario's after-hook text/plain log embedding NAME.
+ * Reads from v_features (the slim Parquet) - which already dropped the base64
+ * `data` - so this is a single cheap pass over all runs, no batching needed
+ * (unlike the old raw-JSON extraction, which had to batch to bound parse memory).
+ *
+ * nullif('') because regexp_extract returns '' (not NULL) when the embedding
+ * name doesn't match, so a scenario whose log name didn't parse becomes NULL
+ * (no Test ID shown) rather than an empty-valued row.
+ */
+export function buildTestIdsSelectSql(): string {
+  return `
+SELECT f.run_id,
+       e.id AS scenario_id,
+       nullif(
+         regexp_extract(
+           list_extract(
+             list_filter(
+               flatten(list_transform(coalesce(e.after, []), h -> coalesce(h.embeddings, []))),
+               emb -> emb.mime_type = 'text/plain'
+             ),
+             1
+           ).name,
+           'Log of test ([0-9]+)', 1
+         ), ''
+       ) AS test_id
+FROM v_features f,
+     UNNEST(f.elements) AS t(e)
+WHERE e.type = 'scenario'`;
+}
+
+// Schema for the on-demand single-run scenario log fetch (see
+// buildScenarioLogsSql). Unlike SLIM_ELEMENTS_TYPE above, this DOES declare
+// `data` because the whole point is to decode the log text - but it's only ever
+// queried for one report URL at a time (see that function's doc comment).
+const SCENARIO_LOG_ELEMENTS_TYPE = `STRUCT(
+    id VARCHAR,
+    "type" VARCHAR,
+    after STRUCT(
+      embeddings STRUCT(mime_type VARCHAR, "data" VARCHAR)[]
+    )[]
+  )[]`
+  .replace(/\s+/g, " ")
+  .trim();
+
+const SCENARIO_LOG_FEATURES_COLUMNS = `{'elements': '${SCENARIO_LOG_ELEMENTS_TYPE}'}`;
+
+/**
+ * Build a SELECT of (scenario_id, log) for a SINGLE run's report file: the fully
+ * decoded text/plain after-hook log embedding for every scenario in that one
+ * file. Used on demand by the run-detail "Log" button (E2eDataContext.
+ * reportUrlByRunId supplies the URL for the run being viewed) rather than folded
+ * into startup - this is the one place that still base64-decodes an embedding's
+ * `data`, intentionally scoped to ONE report URL per call so the multi-MB
+ * screenshot/video zip embedding some scenarios carry alongside the log is only
+ * ever read transiently for a single file, never across a whole window.
+ *
+ * list_filter narrows to the text/plain embedding BEFORE from_base64/decode, so
+ * the zip is never base64-decoded. NULL-safe: a missing/empty `after` or no
+ * text/plain embedding both fall through to a NULL log.
+ */
+export function buildScenarioLogsSql(reportUrl: string): string {
+  const reportUrlArray = sqlArrayLiteral([reportUrl]);
+  return `
+SELECT e.id AS scenario_id,
+       decode(from_base64(
+         list_extract(
+           list_filter(
+             flatten(list_transform(coalesce(e.after, []), h -> coalesce(h.embeddings, []))),
+             emb -> emb.mime_type = 'text/plain'
+           ),
+           1
+         )."data"
+       )) AS log
+FROM read_json(${reportUrlArray}, format = 'array',
+               columns = ${SCENARIO_LOG_FEATURES_COLUMNS}, maximum_object_size = 67108864),
+     UNNEST(elements) AS t(e)
+WHERE e.type = 'scenario'`;
 }

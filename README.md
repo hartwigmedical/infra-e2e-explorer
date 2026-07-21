@@ -15,22 +15,36 @@ HTML reports can't:
 
 ## How it works
 
-Client-side SPA — no build pipeline, no Parquet. It loads the raw `cucumber.json` reports at
-runtime with **DuckDB-Wasm** and exposes the deeply-nested Cucumber JSON as clean SQL over
-`read_json` + `UNNEST` (see `app/lib/e2e-views.ts`):
+Client-side SPA — no build pipeline. It reads the `cucumber.json` reports at runtime with
+**DuckDB-Wasm** and exposes the deeply-nested Cucumber JSON as clean SQL over `read_json` +
+`UNNEST` (see `app/lib/e2e-views.ts`):
 
 - `v_runs` — one row per run, derived from the run-folder name (`runs.json`); no report parsing.
 - `v_features` / `v_scenarios` / `v_steps` — features → scenarios → steps, unnested.
 
-On load the views are **materialized once into in-memory DuckDB tables** (`runs`, `scenarios`,
-`steps`) so every navigation is instant instead of re-reading ~270 MB of JSON per query. The
-runs table is ready almost immediately (folder names only); scenario/step details finish a
-moment later. Reports are read same-origin from `public/data/` (dev server), so there's no CORS
-or auth to deal with locally.
+On load these are **materialized once into in-memory DuckDB tables** (`runs`, `scenarios`,
+`steps`) so every navigation is instant instead of re-querying. The runs table is ready almost
+immediately (folder names only); scenario/step details finish a moment later. Reports are read
+same-origin from `public/data/` (dev server), so there's no CORS or auth to deal with locally.
 
-> Note: `v_features` uses an explicit `columns=` schema rather than `read_json` auto-detection —
-> auto-detection OOMs the wasm heap across dozens of files. Explicit typing also sidesteps
-> schema drift between report eras.
+**Per-run slim cache (fast repeat loads).** A raw report is ~90% base64 embedding blobs the app
+never uses. So each run's report is parsed exactly once into a compact "slim" Parquet — the
+feature/scenario/step structure with those blobs stripped (a ~9 MB report → tens of KB) — which
+is cached in **IndexedDB** keyed by the immutable `run_id` (see `app/lib/report-cache.ts`). A
+repeat session or `loadMore` registers the cached Parquet straight into DuckDB (no fetch, no
+parse) and only pays for genuinely new runs; a warm window does zero report I/O. All analysis
+(`v_scenarios`/`v_steps`/`test_ids`) runs over the slim Parquet, so it's a single pass, never the
+raw JSON twice.
+
+> Why IndexedDB and not OPFS: the app is deployed over plain HTTP on an internal host, which is
+> not a secure context — OPFS, the Cache API and `navigator.storage` are all unavailable there,
+> but IndexedDB works. Cache staleness is handled by `SCHEMA_VERSION` (a hash of the extraction
+> schema): change the *set of raw fields extracted* and every client's cache self-clears on next
+> load; changing only *analysis* logic needs no invalidation, since that re-runs over the cache.
+
+> Note: the slim extraction uses an explicit `columns=` schema rather than `read_json`
+> auto-detection — auto-detection OOMs the wasm heap across dozens of files. Explicit typing also
+> sidesteps schema drift between report eras, and is what drops the embedding `data` blobs.
 
 ## Quick start
 
@@ -179,10 +193,12 @@ service account for this repo before relying on it; it hasn't been run.
 
 - **Dedicated reader service account**: see the "Signing locally" note above — today bucket read
   rides on the broad project-Viewer grant instead of a purpose-built SA.
-- **Persistent cache**: if the window grows large enough that runtime parsing is slow, persist
-  the materialized tables (DuckDB OPFS file) instead of re-parsing each session.
 - **More filters**: date-range and tag filters (nightly-only, feature, search, and failures-only
   are implemented).
+- **Server-side slim derivation**: the per-run slim Parquet is computed client-side and cached in
+  IndexedDB (see "Per-run slim cache" above), so a *cold* load still downloads full raw reports.
+  Precomputing the slim Parquet server-side (derive-once into GCS, sign those URLs) would cut the
+  cold-load download too — the client cache already covers warm loads and `loadMore`.
 
 Built on the DuckDB-Wasm patterns from the [`middle-layer`](../middle-layer) project (React 19 +
 React Router 7/8 SPA + Vite + Tailwind/shadcn).

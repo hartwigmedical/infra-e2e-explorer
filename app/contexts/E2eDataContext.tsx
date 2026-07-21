@@ -10,7 +10,16 @@ import {
 import type { AsyncDuckDB } from "@duckdb/duckdb-wasm";
 import { format, subDays } from "date-fns";
 import { useDuckDBContext } from "~/contexts/DuckDBContext";
-import { buildE2eViewsSql, buildTestIdsSelectSql } from "~/lib/e2e-views";
+import {
+  SCHEMA_VERSION,
+  buildRunsViewSql,
+  buildSlimSelectSql,
+  buildEmptySlimSelectSql,
+  buildFeaturesViewSql,
+  buildScenariosStepsViewsSql,
+  buildTestIdsSelectSql,
+} from "~/lib/e2e-views";
+import { openReportCache, type CachedSlimReport } from "~/lib/report-cache";
 import { queryE2e } from "~/lib/e2e-data";
 
 // ---- LOCAL mode: the existing /data/runs.json manifest shape ----
@@ -41,6 +50,18 @@ interface ApiRunsResponse {
   runs: ApiRun[];
   /** Present when signed-URL generation failed for at least one run. */
   warning?: string;
+}
+
+/** Per-run facts needed by STAGE 2: where to fetch the raw report on a cache
+ *  miss (`url`) and the manifest facts a cached slim Parquet is validated
+ *  against (`size_bytes`/`source` - a run folder is effectively immutable, but
+ *  if its report were ever re-uploaded these would change and force a
+ *  re-extract). Unified across API and LOCAL mode so STAGE 2 is identical. */
+interface RunInfo {
+  run_id: string;
+  url: string;
+  size_bytes: number | null;
+  source: string | null;
 }
 
 /** Rolling-window presets (widest last), for both API and LOCAL mode. The
@@ -98,7 +119,8 @@ export interface E2eDataContextValue {
   /** True once the `runs` table exists (fast - runs.json only, no report parsing). */
   runsReady: boolean;
   /** True once `scenarios` (and, unless the wasm-OOM fallback kicked in, `steps`)
-   *  exist - i.e. every report file has been read exactly once. */
+   *  exist - i.e. every report has been turned into its slim Parquet (freshly
+   *  parsed, or served from the IndexedDB cache) and materialized. */
   detailsReady: boolean;
   /** True if stage 2 hit a wasm OOM and fell back to scenario-only materialization
    *  (no global `steps` table). See the STAGE 2 comment in E2eDataProvider. */
@@ -165,24 +187,26 @@ const E2eDataContext = createContext<E2eDataContextValue | null>(null);
  * `cucumberUrl`. Otherwise (unreachable, empty, or every cucumberUrl is null
  * - e.g. V4 signing isn't configured, the expected local dev situation today)
  * fall back to LOCAL mode: the original /data/runs.json + same-origin report
- * files, unchanged. Either way, downstream (buildE2eViewsSql, the two-stage
- * materialization below, every route) is identical - see e2e-views.ts's doc
- * comment for how the two sources are unified into the same `v_runs`/
- * `v_features` inputs.
+ * files, unchanged. Either way, downstream (the slim-Parquet extraction, the
+ * two-stage materialization below, every route) is identical - see
+ * e2e-views.ts's doc comment for how the two sources are unified.
  *
  * Why materialize instead of just querying the v_* views directly: the views
- * in e2e-views.ts re-read the underlying JSON (274MB across 60 files) via
- * read_json on *every* query. That's fine for a single debug query, but the
- * dashboard fires several queries per render - re-reading all that JSON each
- * time is far too slow. So we read every file exactly once, at startup, into
- * real tables (`runs`, `scenarios`, `steps`), and every subsequent query in
- * the app hits those tables instead of the views.
+ * in e2e-views.ts re-read their underlying data on *every* query. That's fine
+ * for a single debug query, but the dashboard fires several queries per render,
+ * so we read each report once, at startup, into real tables (`runs`,
+ * `scenarios`, `steps`) and every subsequent query hits those tables instead.
  *
  * Two stages so the UI isn't blocked on the slow part:
  *  - STAGE 1 resolves the data source and reads only the (tiny) run list ->
  *    `runs` table. Fast, so the runs list can paint almost immediately.
- *  - STAGE 2 reads every report file once -> `scenarios` + `steps` tables.
- *    This is the heavy part (hundreds of MB of JSON parsed in wasm).
+ *  - STAGE 2 turns each run's raw report into a compact slim Parquet, cached in
+ *    IndexedDB keyed by the immutable run_id (see app/lib/report-cache.ts), then
+ *    materializes `scenarios` + `steps` from it. The expensive raw-JSON parse
+ *    happens once per run, ever: a warm window (all runs cached) does zero
+ *    report fetches/parses, and loadMore only pays for the newly-added runs.
+ *    A cold run is a single pass (the old code scanned every report twice - once
+ *    for test_ids, once for scenarios/steps).
  */
 export function E2eDataProvider({ children }: { children: ReactNode }) {
   const { db } = useDuckDBContext();
@@ -193,7 +217,9 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
   const [dataSource, setDataSource] = useState<E2eDataSource | null>(null);
   const [runCount, setRunCount] = useState(0);
   const [totalRuns, setTotalRuns] = useState(0);
-  const [reportUrlByRunId, setReportUrlByRunId] = useState<Record<string, string>>({});
+  const [reportUrlByRunId, setReportUrlByRunId] = useState<
+    Record<string, string>
+  >({});
   const [windowIndex, setWindowIndex] = useState(DEFAULT_WINDOW_INDEX);
   const [loadingMore, setLoadingMore] = useState(false);
   // Bumped whenever the tables are rebuilt in place (soft load-more) so mounted
@@ -237,41 +263,43 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
       let nextRunCount = 0;
       let nextTotal = 0;
       let nextReportUrlByRunId: Record<string, string> = {};
+      let runInfos: RunInfo[] = [];
 
       const conn = await database.connect();
       try {
         // ---- STAGE 1: fast, resolve the data source + run list ----
         let runsJsonUrl: string;
-        let reportUrls: string[];
 
         const apiResponse = await tryFetchApiRuns(since);
         if (apiResponse) {
-          // API mode: register the run list as a virtual file so it can be
-          // read via read_json exactly like runs.json is in LOCAL mode below -
-          // buildE2eViewsSql doesn't need to know the difference. The server
-          // already applied `since`, so apiResponse.runs IS the current window.
+          // API mode: register the run list as a virtual file so v_runs can be
+          // read via read_json exactly like runs.json is in LOCAL mode below.
+          // The server already applied `since`, so apiResponse.runs IS the
+          // current window.
           await database.registerFileText(
             "e2e_runs.json",
             JSON.stringify(apiResponse.runs),
           );
           runsJsonUrl = "e2e_runs.json";
-          nextReportUrlByRunId = Object.fromEntries(
-            apiResponse.runs
-              .filter(
-                (r): r is ApiRun & { cucumberUrl: string } =>
-                  typeof r.cucumberUrl === "string" && r.cucumberUrl.length > 0,
-              )
-              .map((r) => [r.run_id, r.cucumberUrl]),
-          );
-          reportUrls = Object.values(nextReportUrlByRunId);
+          runInfos = apiResponse.runs
+            .filter(
+              (r): r is ApiRun & { cucumberUrl: string } =>
+                typeof r.cucumberUrl === "string" && r.cucumberUrl.length > 0,
+            )
+            .map((r) => ({
+              run_id: r.run_id,
+              url: r.cucumberUrl,
+              size_bytes: r.size_bytes,
+              source: r.source,
+            }));
 
           nextDataSource = "api";
           nextRunCount = apiResponse.runs.length;
           nextTotal = apiResponse.total;
         } else {
           // LOCAL mode: fetch the full synced manifest (unchanged), then filter
-          // client-side to the current rolling window so the same month-window
-          // + load-more UX applies as in API mode.
+          // client-side to the current rolling window so the same window +
+          // load-more UX applies as in API mode.
           const dataBase = window.location.origin + "/data/";
           const manifestRes = await fetch("/data/runs.json");
           if (!manifestRes.ok) {
@@ -286,31 +314,30 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
           );
 
           // Register the filtered manifest as a virtual file (same pattern as
-          // API mode above) instead of pointing read_json at runs.json directly,
-          // so v_runs only sees runs inside the current window.
+          // API mode above) so v_runs only sees runs inside the current window.
           await database.registerFileText(
             "e2e_runs_local.json",
             JSON.stringify(manifest),
           );
           runsJsonUrl = "e2e_runs_local.json";
-          nextReportUrlByRunId = Object.fromEntries(
-            manifest.map((entry) => [
-              entry.run_id,
-              new URL(entry.file, dataBase).toString(),
-            ]),
-          );
-          reportUrls = Object.values(nextReportUrlByRunId);
+          runInfos = manifest.map((entry) => ({
+            run_id: entry.run_id,
+            url: new URL(entry.file, dataBase).toString(),
+            size_bytes: entry.size_bytes,
+            source: entry.source,
+          }));
 
           nextDataSource = "local";
           nextRunCount = manifest.length;
           nextTotal = fullManifest.length;
         }
 
-        // Creating the views is cheap/lazy - no file reads happen until something
-        // selects from them.
-        const viewsSql = buildE2eViewsSql(runsJsonUrl, reportUrls);
-        await conn.query(viewsSql);
+        nextReportUrlByRunId = Object.fromEntries(
+          runInfos.map((r) => [r.run_id, r.url]),
+        );
 
+        // v_runs is cheap/lazy - reads only the (tiny) run list, no reports.
+        await conn.query(buildRunsViewSql(runsJsonUrl));
         await conn.query(
           `CREATE OR REPLACE TABLE runs AS SELECT * FROM v_runs;`,
         );
@@ -324,35 +351,96 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
           setStatus("runs-ready");
         }
 
-        // ---- STAGE 2a: test_id extraction, in small file BATCHES ----
-        // buildTestIdsSelectSql reads each scenario's after-hook text/plain log
-        // embedding's `name` ("Log of test <id>") - never the embeddings'
-        // `data`. But read_json still PARSES past those multi-MB `data` blobs in
-        // the raw JSON, so reading a whole wide window at once OOMs the wasm heap
-        // (that's the bug the name-only schema alone did NOT fix). Processing a
-        // few files at a time - INSERTing only the tiny (run_id, scenario_id,
-        // test_id) rows, then freeing - bounds peak parse memory to one batch
-        // regardless of window size. Isolated: a failing batch just leaves those
-        // runs' test_id null (LEFT JOIN below), never breaking scenarios/steps.
-        await conn.query(
-          `CREATE OR REPLACE TABLE test_ids (run_id VARCHAR, scenario_id VARCHAR, test_id VARCHAR);`,
+        // ---- STAGE 2: slim per-run Parquet, cached in IndexedDB ----
+        // Each run's raw cucumber.json is parsed to a compact slim Parquet
+        // exactly once, ever (see e2e-views.ts): 90%+ of a report is base64
+        // embedding blobs nothing here needs, so the slim form is tiny and lives
+        // in IndexedDB keyed by the immutable run_id. A HIT registers the cached
+        // buffer straight into DuckDB's virtual FS (no fetch, no parse); a MISS
+        // extracts it from the raw report (one file at a time, so read_json's
+        // parse memory is bounded to a single report even though it parses past
+        // that file's base64) and caches it. Then v_features reads the slim
+        // Parquet and the analysis (test_ids / scenarios / steps) runs over THAT,
+        // never the raw JSON again - so repeat sessions and loadMore only pay for
+        // genuinely new runs, and a warm window does zero report fetches/parses.
+        const cache = await openReportCache(SCHEMA_VERSION);
+        const cachedByRunId = await cache.getMany(
+          runInfos.map((r) => r.run_id),
         );
-        const TEST_ID_BATCH_SIZE = 6;
-        for (let i = 0; i < reportUrls.length; i += TEST_ID_BATCH_SIZE) {
-          const batch = reportUrls.slice(i, i + TEST_ID_BATCH_SIZE);
+
+        const slimNames: string[] = [];
+        for (const info of runInfos) {
+          const name = `slim_${info.run_id}.parquet`;
+          const hit = cachedByRunId.get(info.run_id);
+
+          // A run folder is effectively immutable, so a hit whose size_bytes +
+          // source still match is trusted as-is.
+          if (
+            hit != null &&
+            hit.size_bytes === info.size_bytes &&
+            hit.source === info.source
+          ) {
+            try {
+              await database.dropFile(name).catch(() => {});
+              await database.registerFileBuffer(name, hit.bytes);
+              slimNames.push(name);
+              continue;
+            } catch (registerErr) {
+              console.warn(
+                `[E2eDataProvider] failed to register cached slim report for ${info.run_id}; re-extracting:`,
+                registerErr,
+              );
+            }
+          }
+
+          // Miss (or a failed register): extract the slim Parquet from the raw
+          // report and cache it. Isolated per run - a single failure just omits
+          // that run from the detail tables, never breaks the others.
           try {
+            await database.dropFile(name).catch(() => {});
             await conn.query(
-              `INSERT INTO test_ids ${buildTestIdsSelectSql(batch)};`,
+              `COPY (${buildSlimSelectSql(info.url, info.run_id)}) TO '${name}' (FORMAT parquet);`,
             );
-          } catch (testIdErr) {
+            const bytes = await database.copyFileToBuffer(name);
+            slimNames.push(name);
+            const record: CachedSlimReport = {
+              run_id: info.run_id,
+              size_bytes: info.size_bytes,
+              source: info.source,
+              bytes,
+              cachedAt: Date.now(),
+            };
+            await cache.put(record);
+          } catch (extractErr) {
             console.warn(
-              `[E2eDataProvider] test_id extraction failed for a batch of ${batch.length} (those runs' test_id left null):`,
-              testIdErr,
+              `[E2eDataProvider] slim extraction failed for ${info.run_id} (run omitted from scenario/step detail):`,
+              extractErr,
             );
           }
         }
 
-        // ---- STAGE 2b: heavy, reads all report files exactly once ----
+        // With no usable slim files, write a zero-row placeholder so v_features
+        // (and the tables built over it) still exist with the right schema
+        // instead of read_parquet erroring on an empty file list.
+        if (slimNames.length === 0) {
+          const placeholder = "slim_empty.parquet";
+          await database.dropFile(placeholder).catch(() => {});
+          await conn.query(
+            `COPY (${buildEmptySlimSelectSql()}) TO '${placeholder}' (FORMAT parquet);`,
+          );
+          slimNames.push(placeholder);
+        }
+
+        await conn.query(buildFeaturesViewSql(slimNames));
+        await conn.query(buildScenariosStepsViewsSql());
+
+        // test_ids: a single cheap pass over the slim Parquet (no base64 to
+        // parse past, so no batching needed - unlike the old raw-JSON version).
+        await conn.query(
+          `CREATE OR REPLACE TABLE test_ids AS ${buildTestIdsSelectSql()};`,
+        );
+
+        // Materialize scenarios + steps from the slim data.
         try {
           await conn.query(`
           CREATE OR REPLACE TABLE scenarios_raw AS SELECT * FROM v_scenarios;
@@ -532,7 +620,8 @@ export function useE2eQuery<T = any>(
   // Identity of the query that should currently be running (null when there's
   // nothing to run). Encodes everything that changes the result: the SQL
   // (params are baked into the string), the soft-reload counter, and deps.
-  const activeKey = sql && runsReady ? JSON.stringify([dataVersion, sql, deps]) : null;
+  const activeKey =
+    sql && runsReady ? JSON.stringify([dataVersion, sql, deps]) : null;
   const loading = activeKey !== null && settledKey !== activeKey;
 
   useEffect(() => {
