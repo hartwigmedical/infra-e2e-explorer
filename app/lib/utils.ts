@@ -6,37 +6,50 @@ export function cn(...inputs: ClassValue[]) {
 }
 
 /**
- * Copy text to the clipboard, resolving to whether it succeeded. Prefers the
- * async Clipboard API but falls back to a hidden <textarea> +
- * document.execCommand("copy"). The async API only exists in a secure context,
- * and this tool is served over plain HTTP (http://e2e-explorer.gateway.pilot-1),
- * so the fallback is the normal path in production - not an edge case.
+ * Whether the browser can programmatically write to the clipboard. The async
+ * Clipboard API (and `navigator.clipboard` itself) only exists in a secure
+ * context — HTTPS or localhost — which `window.isSecureContext` reports. This
+ * tool is often served over plain HTTP (http://e2e-explorer.gateway.pilot-1),
+ * where this is false and callers should fall back to a manual select-to-copy
+ * affordance instead of a one-click copy that can't work.
+ */
+export function canCopyToClipboard(): boolean {
+  return typeof navigator !== "undefined" && !!navigator.clipboard?.writeText;
+}
+
+/**
+ * Copy text to the clipboard, resolving to whether it succeeded. Requires a
+ * secure context (see canCopyToClipboard); resolves false when unavailable or
+ * rejected, so callers can fall back to letting the user copy manually.
  */
 export async function copyText(text: string): Promise<boolean> {
-  if (navigator.clipboard?.writeText) {
-    try {
-      await navigator.clipboard.writeText(text);
-      return true;
-    } catch {
-      // Secure-context API present but rejected (permissions, not focused, …) -
-      // fall through to the execCommand path, which works without it.
-    }
-  }
+  if (!canCopyToClipboard()) return false;
   try {
-    const textarea = document.createElement("textarea");
-    textarea.value = text;
-    textarea.setAttribute("readonly", "");
-    textarea.style.position = "fixed";
-    textarea.style.top = "0";
-    textarea.style.left = "0";
-    textarea.style.opacity = "0";
-    textarea.style.pointerEvents = "none";
-    document.body.appendChild(textarea);
-    textarea.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(textarea);
-    return ok;
+    await navigator.clipboard.writeText(text);
+    return true;
   } catch {
+    // Secure-context API present but rejected (permissions, not focused, …).
     return false;
   }
+}
+
+/**
+ * Select an element's text contents on-screen so the user can copy it manually
+ * (⌘C / Ctrl+C). Used on insecure origins where copyText can't write. Returns
+ * whether a selection was made.
+ */
+export function selectElementText(el: HTMLElement): boolean {
+  const selection = window.getSelection();
+  if (!selection) return false;
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  return true;
+}
+
+/** The manual-copy keyboard hint for the current platform, e.g. "⌘C" or "Ctrl+C". */
+export function copyShortcutLabel(): string {
+  if (typeof navigator === "undefined") return "Ctrl+C";
+  return /Mac|iPhone|iPad|iPod/.test(navigator.userAgent) ? "⌘C" : "Ctrl+C";
 }

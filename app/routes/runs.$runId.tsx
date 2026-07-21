@@ -12,7 +12,7 @@ import CluecumberLink from "~/components/CluecumberLink";
 import TagFilter from "~/components/TagFilter";
 import { statusKindFromRunToken, statusKindFromScenario, statusLabel } from "~/lib/status";
 import { scenarioHistoryPath, utcRunRange, utcRunRangeIso } from "~/lib/format";
-import { cn, copyText } from "~/lib/utils";
+import { cn, copyShortcutLabel, copyText, selectElementText } from "~/lib/utils";
 import { fireCelebration } from "~/lib/celebrate";
 
 interface RunRow {
@@ -411,9 +411,20 @@ function StepList({
 }
 
 /** A small clipboard-copy icon button that briefly flips to a check on success.
- *  `title` labels what gets copied (shown until the 1.5s "Copied" confirmation). */
-function CopyButton({ value, title = "Copy" }: { value: string; title?: string }) {
-  const [copied, setCopied] = useState(false);
+ *  On a secure origin it writes to the clipboard; on an insecure one (this tool
+ *  is often served over plain HTTP, where the Clipboard API doesn't exist) it
+ *  falls back to selecting `valueRef`'s on-screen text and prompting the user to
+ *  copy it manually. `title` labels what gets copied. */
+function CopyButton({
+  value,
+  title = "Copy",
+  valueRef,
+}: {
+  value: string;
+  title?: string;
+  valueRef?: React.RefObject<HTMLElement | null>;
+}) {
+  const [status, setStatus] = useState<"idle" | "copied" | "selected">("idle");
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -422,22 +433,69 @@ function CopyButton({ value, title = "Copy" }: { value: string; title?: string }
     };
   }, []);
 
-  const handleCopy = async () => {
-    if (!(await copyText(value))) return;
-    setCopied(true);
+  const flash = (next: "copied" | "selected", ms: number) => {
+    setStatus(next);
     if (timeoutRef.current) clearTimeout(timeoutRef.current);
-    timeoutRef.current = setTimeout(() => setCopied(false), 1500);
+    timeoutRef.current = setTimeout(() => setStatus("idle"), ms);
   };
 
+  const handleCopy = async () => {
+    if (await copyText(value)) {
+      flash("copied", 1500);
+      return;
+    }
+    // No clipboard access (insecure origin) — highlight the value so the user
+    // can copy it manually, and leave the hint up a little longer.
+    if (valueRef?.current && selectElementText(valueRef.current)) flash("selected", 3000);
+  };
+
+  const label =
+    status === "copied" ? "Copied" : status === "selected" ? `Press ${copyShortcutLabel()} to copy` : title;
+
   return (
-    <button
-      type="button"
-      onClick={handleCopy}
-      title={copied ? "Copied" : title}
-      className="inline-flex shrink-0 items-center rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-    >
-      {copied ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
-    </button>
+    <span className="relative inline-flex">
+      <button
+        type="button"
+        onClick={handleCopy}
+        title={label}
+        aria-label={label}
+        className="inline-flex shrink-0 items-center rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+      >
+        {status === "copied" ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
+      </button>
+      {status === "selected" && (
+        // Floating hint — absolutely positioned so it never shifts the row.
+        <span
+          aria-hidden
+          className="pointer-events-none absolute bottom-full left-1/2 z-30 mb-1 -translate-x-1/2 rounded-md border bg-popover px-1.5 py-0.5 text-[11px] leading-none font-medium whitespace-nowrap text-popover-foreground shadow-md"
+        >
+          Press {copyShortcutLabel()} to copy
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** A monospace value followed by a {@link CopyButton} wired to select it in place
+ *  when the clipboard isn't available. Owns the ref so the button can highlight
+ *  the exact on-screen text. `valueClassName` styles the value span. */
+function CopyableValue({
+  value,
+  title,
+  valueClassName,
+}: {
+  value: string;
+  title?: string;
+  valueClassName?: string;
+}) {
+  const valueRef = useRef<HTMLSpanElement>(null);
+  return (
+    <>
+      <span ref={valueRef} className={cn("font-mono", valueClassName)}>
+        {value}
+      </span>
+      <CopyButton value={value} title={title} valueRef={valueRef} />
+    </>
   );
 }
 
@@ -447,8 +505,7 @@ function IsoCopyRow({ label, iso }: { label: string; iso: string }) {
   return (
     <div className="flex items-center gap-2 text-xs whitespace-nowrap">
       <span className="w-8 shrink-0 text-muted-foreground">{label}</span>
-      <span className="font-mono text-foreground">{iso}</span>
-      <CopyButton value={iso} title={`Copy ${label.toLowerCase()} (ISO 8601)`} />
+      <CopyableValue value={iso} valueClassName="text-foreground" title={`Copy ${label.toLowerCase()} (ISO 8601)`} />
     </div>
   );
 }
@@ -562,8 +619,7 @@ function ScenarioMeta({ scenario }: { scenario: ScenarioRow }) {
     items.push(
       <span key="test-id" className="inline-flex items-center gap-1.5">
         <span>Test ID:</span>
-        <span className="font-mono font-medium text-foreground">{scenario.test_id}</span>
-        <CopyButton value={scenario.test_id} title="Copy Test ID" />
+        <CopyableValue value={scenario.test_id} valueClassName="font-medium text-foreground" title="Copy Test ID" />
       </span>
     );
   }
