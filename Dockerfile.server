@@ -1,3 +1,8 @@
+# Multi-stage: build the SPA client + bundle the Express server, then run a slim
+# non-root runtime that carries only the server bundle, its one external dep
+# (@google-cloud/storage), and the static client. See README "Docker".
+
+# ---------- Builder ----------
 FROM node:24-alpine AS builder
 
 WORKDIR /app
@@ -7,21 +12,38 @@ RUN npm ci
 
 COPY . .
 
-RUN npm run build
+# Client SPA -> build/client, then bundle the server -> build/index.mjs
+# (esbuild inlines express/cors; @google-cloud/storage stays external).
+RUN npm run build && npm run build:server
 
-# ------- Production -------
+# Minimal production install for the runtime: only the deps kept external to the
+# server bundle (@google-cloud/storage + its transitive deps), pinned to the
+# version this build resolved. Everything else the app depends on is either
+# compiled into build/client or inlined into build/index.mjs, so it never
+# reaches the runtime image (that's the ~250 MB the old single-install runtime
+# carried needlessly - almost all of it client-only libs like duckdb-wasm).
+RUN mkdir /runtime-deps && cd /runtime-deps \
+ && node -e "const v=require('/app/node_modules/@google-cloud/storage/package.json').version; require('fs').writeFileSync('package.json', JSON.stringify({name:'e2e-explorer-runtime',private:true,dependencies:{'@google-cloud/storage':v}}))" \
+ && npm install --omit=dev --no-audit --no-fund --no-package-lock
+
+# ---------- Runtime ----------
 FROM node:24-alpine
 
 WORKDIR /app
+ENV NODE_ENV=production
 
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
-
+# Only the external runtime deps, the server bundle, and the static client.
+COPY --from=builder /runtime-deps/node_modules ./node_modules
+COPY --from=builder /app/build/index.mjs ./build/index.mjs
 COPY --from=builder /app/build/client ./build/client
-COPY server ./server
+
+# Drop root: the node:alpine image ships an unprivileged `node` user (uid 1000).
+# The app never writes into the image, so root-owned (world-readable) files are
+# fine to run as this user.
+USER node
 
 # Signed URLs are produced via Application Default Credentials (workload
 # identity in Cloud Run / GKE) — no key file or hardcoded service account.
 EXPOSE 3001
 
-CMD ["node", "--import", "tsx/esm", "server/index.ts"]
+CMD ["node", "build/index.mjs"]

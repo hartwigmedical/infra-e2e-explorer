@@ -172,9 +172,13 @@ origin once the app is deployed.
 
 ### Docker
 
-`Dockerfile.server` is a multi-stage build: it builds the client (`npm run build`) then runs the
-Express server (serving the static client build **and** `/api`) in a slim `node:24-alpine` image
-— a single deployable, mirroring `middle-layer/Dockerfile.server`.
+`Dockerfile.server` is a multi-stage build producing a single deployable that serves the static
+client build **and** `/api`. The builder compiles the client (`npm run build`) and bundles the
+Express server into one self-contained file (`npm run build:server` → esbuild → `build/index.mjs`,
+with `express`/`cors` inlined and `@google-cloud/storage` kept external). The runtime stage then
+carries only that bundle, the static client, and a minimal install of the one external dep — so
+it doesn't ship the ~250 MB of client-only libraries (duckdb-wasm, react, lucide, …) that the
+server never uses. It runs on `node:24-alpine` **as the non-root `node` user** (~240 MB image).
 
 ```bash
 docker build -f Dockerfile.server -t e2e-explorer .
