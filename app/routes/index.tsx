@@ -86,19 +86,69 @@ function TypeBadge({ isNightly }: { isNightly: boolean }) {
   );
 }
 
-function ScenarioCounts({ counts }: { counts: ScenarioCountRow | undefined }) {
+// One scenario-count value. A non-zero count links to the Scenarios matrix
+// pre-filtered to that run × status (e.g. the failed count opens
+// /scenarios?frun=<run>&fstatus=failed - a one-click path to that view). A zero
+// count isn't linked (it would open an empty filtered view) and is dimmed to
+// read as non-interactive, matching the Scenarios page's own 0-count handling.
+function CountLink({
+  runId,
+  status,
+  count,
+  colorClass,
+}: {
+  runId: string;
+  status: "passed" | "failed" | "skipped";
+  count: number;
+  colorClass: string;
+}) {
+  if (count === 0) {
+    return <span className={cn(colorClass, "opacity-40")}>{count}</span>;
+  }
+  return (
+    <Link
+      to={`/scenarios?frun=${encodeURIComponent(runId)}&fstatus=${status}`}
+      title={`View ${status} scenarios in this run`}
+      className={cn(
+        colorClass,
+        "rounded-sm hover:underline focus-visible:underline focus-visible:outline-none",
+      )}
+    >
+      {count}
+    </Link>
+  );
+}
+
+function ScenarioCounts({
+  counts,
+  runId,
+}: {
+  counts: ScenarioCountRow | undefined;
+  runId: string;
+}) {
   if (!counts) return <span className="text-muted-foreground">—</span>;
   return (
     <span className="inline-flex items-center gap-1.5 font-mono text-xs">
-      <span className="text-emerald-600 dark:text-emerald-400">
-        {counts.passed}
-      </span>
+      <CountLink
+        runId={runId}
+        status="passed"
+        count={counts.passed}
+        colorClass="text-emerald-600 dark:text-emerald-400"
+      />
       <span className="text-muted-foreground">/</span>
-      <span className="text-red-600 dark:text-red-400">{counts.failed}</span>
+      <CountLink
+        runId={runId}
+        status="failed"
+        count={counts.failed}
+        colorClass="text-red-600 dark:text-red-400"
+      />
       <span className="text-muted-foreground">/</span>
-      <span className="text-amber-600 dark:text-amber-400">
-        {counts.skipped}
-      </span>
+      <CountLink
+        runId={runId}
+        status="skipped"
+        count={counts.skipped}
+        colorClass="text-amber-600 dark:text-amber-400"
+      />
     </span>
   );
 }
@@ -307,17 +357,18 @@ export default function Index() {
                       />
                     </Link>
                   </td>
-                  <td className="p-0">
-                    <Link
-                      to={`/runs/${encodeURIComponent(run.run_id)}`}
-                      className="block px-3 py-2 group-hover:bg-muted/40"
-                    >
-                      {detailsReady ? (
-                        <ScenarioCounts counts={countsByRun.get(run.run_id)} />
-                      ) : (
-                        <Spinner size={13} />
-                      )}
-                    </Link>
+                  {/* Not a run-detail link: each count drills into the
+                      Scenarios view for this run × status (run detail is still
+                      reachable via the Run/Type/Status cells). */}
+                  <td className="px-3 py-2 group-hover:bg-muted/40">
+                    {detailsReady ? (
+                      <ScenarioCounts
+                        counts={countsByRun.get(run.run_id)}
+                        runId={run.run_id}
+                      />
+                    ) : (
+                      <Spinner size={13} />
+                    )}
                   </td>
                   <td className="px-3 py-2">
                     <CluecumberLink runId={run.run_id} />
