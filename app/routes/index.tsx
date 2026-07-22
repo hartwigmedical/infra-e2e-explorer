@@ -111,7 +111,12 @@ function CountLink({
       title={`View ${status} scenarios in this run`}
       className={cn(
         colorClass,
-        "rounded-sm hover:underline focus-visible:underline focus-visible:outline-none",
+        "relative rounded-sm hover:underline focus-visible:underline focus-visible:outline-none",
+        // Enlarge the tap target (a single digit is a tiny hit area) WITHOUT
+        // shifting layout: a transparent, out-of-flow ::before that extends the
+        // clickable region past the digit on all sides. It's part of the link,
+        // so taps on it still navigate.
+        "before:absolute before:-inset-x-2.5 before:-inset-y-2 before:content-['']",
       )}
     >
       {count}
