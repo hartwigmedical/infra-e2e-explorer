@@ -528,6 +528,7 @@ function RunRangePopover({
   endIso: string | null;
 }) {
   const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLSpanElement>(null);
   const openTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -569,7 +570,12 @@ function RunRangePopover({
   };
 
   return (
-    <span className="relative inline-flex" onMouseEnter={handleEnter} onMouseLeave={handleLeave}>
+    <span
+      ref={containerRef}
+      className="relative inline-flex"
+      onMouseEnter={handleEnter}
+      onMouseLeave={handleLeave}
+    >
       <span
         tabIndex={0}
         onFocus={() => {
@@ -577,7 +583,15 @@ function RunRangePopover({
           clearCloseTimer();
           setOpen(true);
         }}
-        onBlur={() => setOpen(false)}
+        onBlur={(e) => {
+          // Keep the popover open when focus moves INTO it (e.g. onto a copy
+          // button) - only close when focus leaves the whole control. Without
+          // this, mousedown on a copy button blurs the trigger and tears the
+          // popover down before the click lands, so the copy never fires.
+          if (!containerRef.current?.contains(e.relatedTarget as Node | null)) {
+            setOpen(false);
+          }
+        }}
         className="inline-flex items-center gap-1.5 rounded outline-none focus-visible:ring-1 focus-visible:ring-ring"
       >
         <Clock size={12} className="shrink-0" />
