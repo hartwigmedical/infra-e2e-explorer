@@ -28,17 +28,18 @@ const PAGE_CONCURRENCY = 8;
 const storage = new Storage();
 const bucket = storage.bucket(BUCKET_NAME);
 
-// ---------- run-folder listing cache (~60s TTL) ----------
-// Mirrors middle-layer's small in-memory cache TTL idea (see server/datasources.ts).
+// ---------- run-folder listing (~60s TTL caches) ----------
+// One folder per run, named "YYYY-MM-DD-HHMM-<suffix>/", so run ids sort
+// lexicographically == chronologically. A `since` query therefore needs only
+// the folders in [since, ..), which we bound with GCS `startOffset` rather than
+// enumerating the whole bucket - the full enumeration is O(total history) and
+// dwarfs the window on a long-lived bucket. Mirrors middle-layer's small
+// in-memory TTL cache idea (see server/datasources.ts).
 
-let runIdCache: { runIds: string[]; fetchedAt: number } | null = null;
-
-async function listRunIds(): Promise<string[]> {
-  const now = Date.now();
-  if (runIdCache && now - runIdCache.fetchedAt < RUN_LIST_CACHE_TTL_MS) {
-    return runIdCache.runIds;
-  }
-
+/** List run-folder ids (newest-first). With a delimiter GCS returns folder
+ *  prefixes; `startOffset` bounds them lexicographically (== chronologically),
+ *  so passing a date lists only that run and everything newer. */
+async function listRunIdPrefixes(startOffset?: string): Promise<string[]> {
   const prefixes: string[] = [];
   let pageToken: string | undefined;
   do {
@@ -47,6 +48,7 @@ async function listRunIds(): Promise<string[]> {
       autoPaginate: false,
       maxResults: 1000,
       pageToken,
+      ...(startOffset ? { startOffset } : {}),
     });
     const response = apiResponse as { prefixes?: string[] } | undefined;
     if (Array.isArray(response?.prefixes)) {
@@ -55,16 +57,60 @@ async function listRunIds(): Promise<string[]> {
     pageToken = (nextQuery as { pageToken?: string } | undefined)?.pageToken;
   } while (pageToken);
 
-  // Prefixes look like "2026-07-09-0200-failed-2-of-42/"; run_id sorts lexicographically
-  // = chronologically, so descending string sort gives newest-first.
-  const runIds = prefixes
+  return prefixes
     .map((p) => p.replace(/\/+$/, ""))
     .filter(Boolean)
     .sort()
     .reverse();
+}
 
+// Full-bucket listing (newest-first), for the legacy limit/offset path. Still
+// O(total history); the `since` path below avoids it.
+let runIdCache: { runIds: string[]; fetchedAt: number } | null = null;
+
+async function listRunIds(): Promise<string[]> {
+  const now = Date.now();
+  if (runIdCache && now - runIdCache.fetchedAt < RUN_LIST_CACHE_TTL_MS) {
+    return runIdCache.runIds;
+  }
+  const runIds = await listRunIdPrefixes();
   runIdCache = { runIds, fetchedAt: now };
   return runIds;
+}
+
+// Windowed listing keyed by `since` (append-only bucket -> short TTL is enough).
+// Cheap to rebuild, so a soft size cap is fine to bound memory across days of
+// shifting window cutoffs.
+const sinceListCache = new Map<
+  string,
+  { runIds: string[]; fetchedAt: number }
+>();
+
+async function listRunIdsSince(since: string): Promise<string[]> {
+  const now = Date.now();
+  const cached = sinceListCache.get(since);
+  if (cached && now - cached.fetchedAt < RUN_LIST_CACHE_TTL_MS) {
+    return cached.runIds;
+  }
+  const runIds = await listRunIdPrefixes(since);
+  if (sinceListCache.size > 64) sinceListCache.clear();
+  sinceListCache.set(since, { runIds, fetchedAt: now });
+  return runIds;
+}
+
+/** Whether any run folder exists strictly older than `since` - a single-object
+ *  probe (`endOffset` + maxResults:1), so the client can still decide whether a
+ *  wider window ("Load more") would reveal anything without a full-bucket count. */
+async function anyRunOlderThan(since: string): Promise<boolean> {
+  const [, , apiResponse] = await bucket.getFiles({
+    delimiter: "/",
+    autoPaginate: false,
+    maxResults: 1,
+    endOffset: since,
+  });
+  const prefixes = (apiResponse as { prefixes?: string[] } | undefined)
+    ?.prefixes;
+  return Array.isArray(prefixes) && prefixes.length > 0;
 }
 
 // ---------- per-run metadata resolution cache (no TTL — objects are immutable) ----------
@@ -192,9 +238,33 @@ function sinceParam(value: unknown): string | undefined {
 app.get("/api/runs", async (req, res) => {
   const since = sinceParam(req.query.since);
 
-  let allRunIds: string[];
+  // run_id.slice(0, 10) is the run's date and string-compares correctly
+  // against `since`. Newest-first from the listing helpers.
+  let pageRunIds: string[];
+  let limit: number | undefined;
+  let offset: number | undefined;
+  let hasOlder = false;
+  let grandTotal: number | null = null;
   try {
-    allRunIds = await listRunIds();
+    if (since) {
+      // Window query: list only [since, ..) via startOffset instead of the
+      // whole bucket, and probe once for anything older so the client can still
+      // tell whether widening the window ("Load more") would reveal more.
+      const [windowRunIds, older] = await Promise.all([
+        listRunIdsSince(since),
+        anyRunOlderThan(since),
+      ]);
+      pageRunIds = windowRunIds
+        .filter((runId) => runId.slice(0, 10) >= since)
+        .slice(0, SINCE_MAX_RUNS);
+      hasOlder = older;
+    } else {
+      const allRunIds = await listRunIds();
+      grandTotal = allRunIds.length;
+      limit = clamp(intParam(req.query.limit, 60), 1, 500);
+      offset = Math.max(0, intParam(req.query.offset, 0));
+      pageRunIds = allRunIds.slice(offset, offset + limit);
+    }
   } catch (err) {
     console.error(
       "Failed to list run folders from GCS:",
@@ -202,23 +272,6 @@ app.get("/api/runs", async (req, res) => {
     );
     res.status(502).json({ error: "failed to list run folders from GCS" });
     return;
-  }
-
-  const total = allRunIds.length;
-
-  // allRunIds is newest-first (see listRunIds); run_id.slice(0, 10) is the
-  // run's date and string-compares correctly against `since`.
-  let pageRunIds: string[];
-  let limit: number | undefined;
-  let offset: number | undefined;
-  if (since) {
-    pageRunIds = allRunIds
-      .filter((runId) => runId.slice(0, 10) >= since)
-      .slice(0, SINCE_MAX_RUNS);
-  } else {
-    limit = clamp(intParam(req.query.limit, 60), 1, 500);
-    offset = Math.max(0, intParam(req.query.offset, 0));
-    pageRunIds = allRunIds.slice(offset, offset + limit);
   }
 
   let signWarning: string | undefined;
@@ -243,12 +296,21 @@ app.get("/api/runs", async (req, res) => {
     },
   );
 
+  const runsOut = runs.filter((r) => r !== null);
+
+  // A window query doesn't enumerate the whole bucket, so there's no true grand
+  // total. The client uses `total` only to decide whether older runs exist
+  // beyond the window (hasMore = runCount < total), so "returned + 1 if anything
+  // older exists" preserves that behaviour exactly without the full-bucket scan.
+  const total =
+    grandTotal != null ? grandTotal : runsOut.length + (hasOlder ? 1 : 0);
+
   res.json({
     total,
     ...(limit !== undefined ? { limit } : {}),
     ...(offset !== undefined ? { offset } : {}),
     ...(since ? { since } : {}),
-    runs: runs.filter((r) => r !== null),
+    runs: runsOut,
     ...(signWarning ? { warning: `signing unavailable: ${signWarning}` } : {}),
   });
 });

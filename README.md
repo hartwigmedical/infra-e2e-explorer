@@ -39,8 +39,8 @@ raw JSON twice.
 > Why IndexedDB and not OPFS: the app is deployed over plain HTTP on an internal host, which is
 > not a secure context — OPFS, the Cache API and `navigator.storage` are all unavailable there,
 > but IndexedDB works. Cache staleness is handled by `SCHEMA_VERSION` (a hash of the extraction
-> schema): change the *set of raw fields extracted* and every client's cache self-clears on next
-> load; changing only *analysis* logic needs no invalidation, since that re-runs over the cache.
+> schema): change the _set of raw fields extracted_ and every client's cache self-clears on next
+> load; changing only _analysis_ logic needs no invalidation, since that re-runs over the cache.
 
 > Note: the slim extraction uses an explicit `columns=` schema rather than `read_json`
 > auto-detection — auto-detection OOMs the wasm heap across dozens of files. Explicit typing also
@@ -62,11 +62,11 @@ different window with `N=120 npm run sync-data`.
 
 ## Routes
 
-| Route             | What it shows                                                             |
-| ----------------- | ------------------------------------------------------------------------- |
-| `/`               | Recent Runs dashboard (status, failed/total, scenario counts, trend)      |
-| `/runs/:runId`    | Run detail — features → scenarios → steps, failures surfaced, step errors |
-| `/scenarios`      | Scenario history — cross-run pass/fail strip + step × run grid            |
+| Route          | What it shows                                                             |
+| -------------- | ------------------------------------------------------------------------- |
+| `/`            | Recent Runs dashboard (status, failed/total, scenario counts, trend)      |
+| `/runs/:runId` | Run detail — features → scenarios → steps, failures surfaced, step errors |
+| `/scenarios`   | Scenario history — cross-run pass/fail strip + step × run grid            |
 
 ## Data source
 
@@ -97,8 +97,17 @@ signed URLs so DuckDB-Wasm can `read_json` each run's Cucumber report directly f
 ### `GET /api/runs`
 
 ```
-GET /api/runs?limit=60&offset=0
+GET /api/runs?since=2026-07-15      # windowed (what the app uses)
+GET /api/runs?limit=60&offset=0     # legacy paged
 ```
+
+`since` (a `YYYY-MM-DD` cutoff, the mode the client uses) lists **only** run folders in that
+window, bounded with GCS `startOffset` rather than enumerating the whole bucket — so the cost
+scales with the window, not the bucket's total history. Because that means the whole bucket is
+never counted, `total` in a `since` response is **not** the grand total: it's `runs.length` plus
+1 when any run exists older than `since`, which is all the client needs (it uses `total` only to
+decide whether "Load more"/a wider window would reveal older runs). The legacy `limit`/`offset`
+path still enumerates the full bucket and returns the real grand total.
 
 ```json
 {
@@ -126,11 +135,11 @@ GET /api/runs?limit=60&offset=0
 
 ### Env vars
 
-| Var                       | Default                    |
-| ------------------------- | --------------------------- |
-| `PORT`                    | `3001`                       |
-| `E2E_BUCKET`               | `infra-e2e-test-reports`     |
-| `SIGNED_URL_TTL_SECONDS`   | `900`                         |
+| Var                      | Default                  |
+| ------------------------ | ------------------------ |
+| `PORT`                   | `3001`                   |
+| `E2E_BUCKET`             | `infra-e2e-test-reports` |
+| `SIGNED_URL_TTL_SECONDS` | `900`                    |
 
 The server uses `new Storage()` — Application Default Credentials only, never a hardcoded key or
 service account. Locally that's your `gcloud` user; in Cloud Run/GKE it's the attached workload
@@ -200,7 +209,7 @@ service account for this repo before relying on it; it hasn't been run.
 - **More filters**: date-range and tag filters (nightly-only, feature, search, and failures-only
   are implemented).
 - **Server-side slim derivation**: the per-run slim Parquet is computed client-side and cached in
-  IndexedDB (see "Per-run slim cache" above), so a *cold* load still downloads full raw reports.
+  IndexedDB (see "Per-run slim cache" above), so a _cold_ load still downloads full raw reports.
   Precomputing the slim Parquet server-side (derive-once into GCS, sign those URLs) would cut the
   cold-load download too — the client cache already covers warm loads and `loadMore`.
 
