@@ -28,13 +28,14 @@ immediately (folder names only); scenario/step details finish a moment later. Re
 same-origin from `public/data/` (dev server), so there's no CORS or auth to deal with locally.
 
 **Per-run slim cache (fast repeat loads).** A raw report is ~90% base64 embedding blobs the app
-never uses. So each run's report is parsed exactly once into a compact "slim" Parquet — the
-feature/scenario/step structure with those blobs stripped (a ~9 MB report → tens of KB) — which
-is cached in **IndexedDB** keyed by the immutable `run_id` (see `app/lib/report-cache.ts`). A
-repeat session or `loadMore` registers the cached Parquet straight into DuckDB (no fetch, no
-parse) and only pays for genuinely new runs; a warm window does zero report I/O. All analysis
-(`v_scenarios`/`v_steps`/`test_ids`) runs over the slim Parquet, so it's a single pass, never the
-raw JSON twice.
+mostly doesn't need. So each run's report is parsed exactly once into a compact "slim" Parquet —
+the feature/scenario/step structure with those blobs stripped, but keeping the decoded `text/plain`
+scenario **log** (a ~9 MB report → ~150 KB) — which is cached in **IndexedDB** keyed by the
+immutable `run_id` (see `app/lib/report-cache.ts`). A repeat session or `loadMore` registers the
+cached Parquet straight into DuckDB (no fetch, no parse) and only pays for genuinely new runs; a
+warm window does zero report I/O. All analysis (`v_scenarios`/`v_steps`/`test_ids`/`service_versions`),
+**and** the run-detail Log button, run over the slim Parquet — so once a run is cached nothing
+ever re-reads the raw JSON.
 
 > Why IndexedDB and not OPFS: the app is deployed over plain HTTP on an internal host, which is
 > not a secure context — OPFS, the Cache API and `navigator.storage` are all unavailable there,
@@ -44,7 +45,21 @@ raw JSON twice.
 
 > Note: the slim extraction uses an explicit `columns=` schema rather than `read_json`
 > auto-detection — auto-detection OOMs the wasm heap across dozens of files. Explicit typing also
-> sidesteps schema drift between report eras, and is what drops the embedding `data` blobs.
+> sidesteps schema drift between report eras. The schema pulls the `text/plain` embedding's `data`
+> so the log can be decoded at parse time, but `buildSlimSelectSql` stores only the decoded string
+> and drops every base64 blob — so the huge screenshot/video zips are read transiently (one report
+> at a time, bounding parse memory) yet never land in the slim Parquet.
+
+**Service versions (deployment tracking).** Every scenario's log embeds a `Running services:`
+block (`service = image:tag` for each deployment in the cluster the run tested against). Because
+the log is stored in the slim Parquet (above), we parse that block as plain **analysis over the
+cached slim data** — like `test_ids`, not a separate read of the raw report — into a per-run
+`(service, image, version, …)` set (see `app/lib/e2e-views.ts` `buildServiceVersionsSelectSql`).
+It's surfaced on the run-detail page as "what was deployed" plus a diff against the previous run,
+so a failure can be lined up with a deployment (`app/components/ServiceVersions.tsx`). The scenarios
+in a run agree on their versions in practice (validated across all local reports); the rare
+disagreement is surfaced with a disclaimer rather than modelled per-scenario. Only the version
+block is read — the rest of each log (which carries synthetic patient/hospital ids) is ignored.
 
 ## Quick start
 
@@ -76,8 +91,10 @@ odd-time folders are manual re-runs (`is_nightly=false`, filtered out of history
 Current-era reports are `cucumber-parallel.json`; pre-2025 are `cucumber.json` (the sync script
 normalizes both to `cucumber.json` locally). This is **synthetic** test-infrastructure data.
 
-Attachment/embedding blobs in the reports (base64 logs) are **deliberately excluded** from the
-data model — nothing in the app loads or renders them.
+The reports' large base64 embedding blobs (screenshot/video zips) are **deliberately excluded**
+from the data model — nothing loads or renders them. The one exception is each scenario's
+`text/plain` log, which is decoded at extraction time and kept (see the slim cache above); it
+drives the Log button and service-versions parsing.
 
 ## Scripts
 
@@ -212,6 +229,10 @@ service account for this repo before relying on it; it hasn't been run.
   IndexedDB (see "Per-run slim cache" above), so a _cold_ load still downloads full raw reports.
   Precomputing the slim Parquet server-side (derive-once into GCS, sign those URLs) would cut the
   cold-load download too — the client cache already covers warm loads and `loadMore`.
+- **Service-versions timeline (Phase 2)**: the per-run service versions (see "Service versions"
+  above) are so far surfaced only on run detail. A dedicated services × runs view — each service's
+  version history across runs, with change points highlighted — would answer "what changed
+  between runs" at a glance and make regressions line up with deployments across the whole window.
 
 Built on the DuckDB-Wasm patterns from the [`middle-layer`](../middle-layer) project (React 19 +
 React Router 7/8 SPA + Vite + Tailwind/shadcn).

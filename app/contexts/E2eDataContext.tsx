@@ -18,6 +18,8 @@ import {
   buildFeaturesViewSql,
   buildScenariosStepsViewsSql,
   buildTestIdsSelectSql,
+  buildServiceVersionsSelectSql,
+  slimParquetName,
 } from "~/lib/e2e-views";
 import { openReportCache, type CachedSlimReport } from "~/lib/report-cache";
 import { queryE2e } from "~/lib/e2e-data";
@@ -133,13 +135,6 @@ export interface E2eDataContextValue {
   /** Number of runs currently loaded into the `runs` table (i.e. runs whose
    *  date falls within the current window preset). */
   runCount: number;
-  /** Maps each currently-loaded run's `run_id` to the report URL it was
-   *  materialized from (the run's signed `cucumberUrl` in API mode, or the
-   *  same-origin `/data/.../cucumber*.json` URL in LOCAL mode). Lets a route
-   *  read a single run's report file on demand - e.g. run-detail's "Log"
-   *  button via `buildScenarioLogsSql` - without keeping every report's raw
-   *  JSON around. */
-  reportUrlByRunId: Record<string, string>;
   /** Total runs available at the source, regardless of the current window.
    *  In API mode this is the grand total across the whole bucket (see
    *  server/index.ts). In LOCAL mode this is the full synced manifest count.
@@ -217,9 +212,6 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
   const [dataSource, setDataSource] = useState<E2eDataSource | null>(null);
   const [runCount, setRunCount] = useState(0);
   const [totalRuns, setTotalRuns] = useState(0);
-  const [reportUrlByRunId, setReportUrlByRunId] = useState<
-    Record<string, string>
-  >({});
   const [windowIndex, setWindowIndex] = useState(DEFAULT_WINDOW_INDEX);
   const [loadingMore, setLoadingMore] = useState(false);
   // Bumped whenever the tables are rebuilt in place (soft load-more) so mounted
@@ -262,7 +254,6 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
       let nextDataSource: E2eDataSource = "local";
       let nextRunCount = 0;
       let nextTotal = 0;
-      let nextReportUrlByRunId: Record<string, string> = {};
       let runInfos: RunInfo[] = [];
 
       const conn = await database.connect();
@@ -332,10 +323,6 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
           nextTotal = fullManifest.length;
         }
 
-        nextReportUrlByRunId = Object.fromEntries(
-          runInfos.map((r) => [r.run_id, r.url]),
-        );
-
         // v_runs is cheap/lazy - reads only the (tiny) run list, no reports.
         await conn.query(buildRunsViewSql(runsJsonUrl));
         await conn.query(
@@ -346,7 +333,6 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
           setDataSource(nextDataSource);
           setRunCount(nextRunCount);
           setTotalRuns(nextTotal);
-          setReportUrlByRunId(nextReportUrlByRunId);
           setRunsReady(true);
           setStatus("runs-ready");
         }
@@ -370,7 +356,7 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
 
         const slimNames: string[] = [];
         for (const info of runInfos) {
-          const name = `slim_${info.run_id}.parquet`;
+          const name = slimParquetName(info.run_id);
           const hit = cachedByRunId.get(info.run_id);
 
           // A run folder is effectively immutable, so a hit whose size_bytes +
@@ -464,7 +450,7 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
           // still materialize `scenarios` on its own (smaller - no steps list,
           // no cross join) so the dashboard's per-run pass/fail/skip counts and
           // the sparkline still work. Step-level history (Phase 3) would then
-          // read a single run's report file on demand instead of hitting a
+          // read a single run's slim Parquet on demand instead of hitting a
           // global `steps` table.
           console.warn(
             "[E2eDataProvider] STAGE 2 full materialization (scenarios + steps) failed, " +
@@ -480,6 +466,31 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
           setStepsFallback(true);
         }
 
+        // service_versions table - ANALYSIS over v_features's stored logs (like
+        // test_ids), NOT a separate read of the raw report. The log now lives in
+        // the slim Parquet, so parsing the "Running services" block is a cheap
+        // in-memory pass. Its own try/catch (a regex/parse hiccup shouldn't block
+        // the run/scenario views); the SELECT's columns are typed by expression,
+        // so an empty window still yields a correctly typed (empty) table.
+        try {
+          await conn.query(
+            `CREATE OR REPLACE TABLE service_versions AS ${buildServiceVersionsSelectSql()};`,
+          );
+        } catch (svcTableErr) {
+          console.warn(
+            "[E2eDataProvider] service_versions build failed; " +
+              "deployment panel will be empty this session:",
+            svcTableErr,
+          );
+          await conn.query(
+            `CREATE OR REPLACE TABLE service_versions (
+               run_id VARCHAR, service VARCHAR, spec VARCHAR, image VARCHAR,
+               version VARCHAR, pipeline_version VARCHAR,
+               n_scenarios BIGINT, distinct_blocks BIGINT
+             );`,
+          );
+        }
+
         if (soft) {
           // Soft (load-more) done: publish the wider window's source/counts/label
           // and bump dataVersion so consumers re-query and swap in the new rows
@@ -487,7 +498,6 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
           setDataSource(nextDataSource);
           setRunCount(nextRunCount);
           setTotalRuns(nextTotal);
-          setReportUrlByRunId(nextReportUrlByRunId);
           setWindowIndex(windowIndexRef.current);
           setDataVersion((v) => v + 1);
         } else {
@@ -558,7 +568,6 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
     dataSource,
     runCount,
     totalRuns,
-    reportUrlByRunId,
     windowLabel: WINDOW_STEPS[windowIndex]?.label ?? "",
     nextWindowLabel:
       windowIndex < WINDOW_STEPS.length - 1

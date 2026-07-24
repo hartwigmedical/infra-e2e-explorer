@@ -1,18 +1,51 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { Link, useParams, useSearchParams } from "react-router";
-import { Check, ChevronRight, ChevronsDownUp, ChevronsUpDown, Clock, Copy, FileText, History, Link2, Search, TriangleAlert } from "lucide-react";
+import {
+  Check,
+  ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  Clock,
+  Copy,
+  FileText,
+  History,
+  Link2,
+  Search,
+  TriangleAlert,
+} from "lucide-react";
 import { toast } from "sonner";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
-import { buildScenarioLogsSql } from "~/lib/e2e-views";
+import { buildRunScenarioLogsSql } from "~/lib/e2e-views";
 import StatusBadge from "~/components/StatusBadge";
 import StatusMark from "~/components/StatusMark";
-import RunGantt, { computeRunTiming, formatElapsed } from "~/components/RunGantt";
+import RunGantt, {
+  computeRunTiming,
+  formatElapsed,
+} from "~/components/RunGantt";
+import ServiceVersions from "~/components/ServiceVersions";
 import Spinner from "~/components/Spinner";
 import CluecumberLink from "~/components/CluecumberLink";
 import TagFilter from "~/components/TagFilter";
-import { statusKindFromRunToken, statusKindFromScenario, statusLabel } from "~/lib/status";
+import {
+  statusKindFromRunToken,
+  statusKindFromScenario,
+  statusLabel,
+} from "~/lib/status";
 import { scenarioHistoryPath, utcRunRange, utcRunRangeIso } from "~/lib/format";
-import { cn, copyShortcutLabel, copyText, selectElementText } from "~/lib/utils";
+import {
+  cn,
+  copyShortcutLabel,
+  copyText,
+  selectElementText,
+} from "~/lib/utils";
 import { fireCelebration } from "~/lib/celebrate";
 
 interface RunRow {
@@ -115,7 +148,7 @@ function TypeBadge({ isNightly }: { isNightly: boolean }) {
         "inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium whitespace-nowrap",
         isNightly
           ? "bg-sky-500/15 text-sky-600 dark:text-sky-400"
-          : "bg-zinc-500/10 text-muted-foreground"
+          : "bg-zinc-500/10 text-muted-foreground",
       )}
     >
       {isNightly ? "Nightly" : "Manual"}
@@ -124,7 +157,11 @@ function TypeBadge({ isNightly }: { isNightly: boolean }) {
 }
 
 // Order for surfacing failures first within a feature's scenario list.
-const STATUS_SORT_RANK: Record<string, number> = { failed: 0, skipped: 1, passed: 2 };
+const STATUS_SORT_RANK: Record<string, number> = {
+  failed: 0,
+  skipped: 1,
+  passed: 2,
+};
 
 // Minimum length of a consecutive SAME-status run (all passed, or all skipped)
 // before it gets collapsed into a "first … (N hidden) … last" affordance.
@@ -196,7 +233,8 @@ function StepList({
   const [showBackground, setShowBackground] = useState(false);
   // Step ordinals a hovered "collapse …" control is about to fold away, so we
   // can preview which rows will disappear. null when nothing is hovered.
-  const [collapseHoverOrdinals, setCollapseHoverOrdinals] = useState<Set<number> | null>(null);
+  const [collapseHoverOrdinals, setCollapseHoverOrdinals] =
+    useState<Set<number> | null>(null);
   const stepRefs = useRef<Map<number, HTMLLIElement>>(new Map());
 
   const toggleError = (ordinal: number) => {
@@ -225,7 +263,9 @@ function StepList({
     const step = steps.find((s) => s.step_ordinal === focusStepOrdinal);
     if (!step) return;
     if (step.has_error) {
-      setOpenErrors((prev) => (prev.has(focusStepOrdinal) ? prev : new Set(prev).add(focusStepOrdinal)));
+      setOpenErrors((prev) =>
+        prev.has(focusStepOrdinal) ? prev : new Set(prev).add(focusStepOrdinal),
+      );
     }
     // A focused background step lives in the collapsed section — open it so the
     // scroll/highlight has something to land on (showBackground is in the deps
@@ -238,7 +278,8 @@ function StepList({
   // error panel in this list. Guarded by a ref so it fires once per token (not
   // again when `steps` re-resolves), leaving later manual closes untouched.
   useEffect(() => {
-    if (!revealErrorsToken || revealErrorsToken === revealedTokenRef.current) return;
+    if (!revealErrorsToken || revealErrorsToken === revealedTokenRef.current)
+      return;
     revealedTokenRef.current = revealErrorsToken;
     setOpenErrors((prev) => {
       const next = new Set(prev);
@@ -246,16 +287,24 @@ function StepList({
       return next;
     });
     // If a failure is in the (hidden) background, reveal that section too.
-    if (steps.some((s) => s.is_background && s.has_error)) setShowBackground(true);
+    if (steps.some((s) => s.is_background && s.has_error))
+      setShowBackground(true);
   }, [revealErrorsToken, steps]);
 
   const bgSteps = useMemo(() => steps.filter((s) => s.is_background), [steps]);
-  const bodySteps = useMemo(() => steps.filter((s) => !s.is_background), [steps]);
+  const bodySteps = useMemo(
+    () => steps.filter((s) => !s.is_background),
+    [steps],
+  );
   const items = useMemo(() => buildStepItems(bodySteps), [bodySteps]);
   const bgHasFailure = bgSteps.some((s) => s.status === "failed");
 
   if (steps.length === 0) {
-    return <p className="py-3 pr-4 pl-10 text-xs text-muted-foreground">No steps recorded.</p>;
+    return (
+      <p className="py-3 pr-4 pl-10 text-xs text-muted-foreground">
+        No steps recorded.
+      </p>
+    );
   }
 
   const renderStep = (step: StepRow) => {
@@ -275,12 +324,22 @@ function StepList({
           // offset by its chevron + gap); pr-4 keeps the right edge flush.
           "py-1.5 pr-4 pl-10 text-[13px]",
           !isFocused && willCollapse && "bg-muted/70",
-          isFocused && "rounded bg-accent ring-1 ring-inset ring-ring"
+          isFocused && "rounded bg-accent ring-1 ring-inset ring-ring",
         )}
       >
         <div className="flex items-center gap-2">
-          <StatusMark kind={kind} shape="dot" size={9} title={statusLabel(kind)} />
-          <span className={cn("flex-1 truncate", step.is_background && "text-muted-foreground")}>
+          <StatusMark
+            kind={kind}
+            shape="dot"
+            size={9}
+            title={statusLabel(kind)}
+          />
+          <span
+            className={cn(
+              "flex-1 truncate",
+              step.is_background && "text-muted-foreground",
+            )}
+          >
             {step.step_label}
           </span>
           <span className="shrink-0 font-mono text-xs text-muted-foreground">
@@ -314,15 +373,22 @@ function StepList({
               type="button"
               onClick={() => setShowBackground((v) => !v)}
               onMouseEnter={() => {
-                if (showBackground) setCollapseHoverOrdinals(new Set(bgSteps.map((s) => s.step_ordinal)));
+                if (showBackground)
+                  setCollapseHoverOrdinals(
+                    new Set(bgSteps.map((s) => s.step_ordinal)),
+                  );
               }}
               onMouseLeave={() => setCollapseHoverOrdinals(null)}
-              title={showBackground ? "Collapse background steps" : "Show background steps"}
+              title={
+                showBackground
+                  ? "Collapse background steps"
+                  : "Show background steps"
+              }
               className={cn(
                 "flex w-full items-center gap-2 rounded py-0.5 text-xs hover:bg-muted/40",
                 !showBackground && bgHasFailure
                   ? "text-red-600 hover:text-red-700 dark:text-red-400"
-                  : "text-muted-foreground hover:text-foreground"
+                  : "text-muted-foreground hover:text-foreground",
               )}
             >
               {showBackground ? (
@@ -349,7 +415,8 @@ function StepList({
         // step (`?step=`) falls inside its hidden middle - otherwise the scroll
         // + highlight effect above would have nothing to find in the DOM.
         const containsFocus =
-          focusStepOrdinal != null && item.steps.some((s) => s.step_ordinal === focusStepOrdinal);
+          focusStepOrdinal != null &&
+          item.steps.some((s) => s.step_ordinal === focusStepOrdinal);
         const isExpanded = containsFocus || expandedGroups.has(item.key);
         const hiddenCount = item.steps.length - 2;
 
@@ -361,7 +428,11 @@ function StepList({
                 <button
                   type="button"
                   onClick={() => toggleGroup(item.key)}
-                  onMouseEnter={() => setCollapseHoverOrdinals(new Set(item.steps.map((s) => s.step_ordinal)))}
+                  onMouseEnter={() =>
+                    setCollapseHoverOrdinals(
+                      new Set(item.steps.map((s) => s.step_ordinal)),
+                    )
+                  }
                   onMouseLeave={() => setCollapseHoverOrdinals(null)}
                   className="flex w-full items-center gap-2 rounded py-0.5 text-xs text-muted-foreground hover:bg-muted/40 hover:text-foreground"
                 >
@@ -446,11 +517,16 @@ function CopyButton({
     }
     // No clipboard access (insecure origin) — highlight the value so the user
     // can copy it manually, and leave the hint up a little longer.
-    if (valueRef?.current && selectElementText(valueRef.current)) flash("selected", 3000);
+    if (valueRef?.current && selectElementText(valueRef.current))
+      flash("selected", 3000);
   };
 
   const label =
-    status === "copied" ? "Copied" : status === "selected" ? `Press ${copyShortcutLabel()} to copy` : title;
+    status === "copied"
+      ? "Copied"
+      : status === "selected"
+        ? `Press ${copyShortcutLabel()} to copy`
+        : title;
 
   return (
     <span className="relative inline-flex">
@@ -461,7 +537,11 @@ function CopyButton({
         aria-label={label}
         className="inline-flex shrink-0 items-center rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
       >
-        {status === "copied" ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
+        {status === "copied" ? (
+          <Check size={12} className="text-emerald-500" />
+        ) : (
+          <Copy size={12} />
+        )}
       </button>
       {status === "selected" && (
         // Floating hint — absolutely positioned so it never shifts the row.
@@ -505,7 +585,11 @@ function IsoCopyRow({ label, iso }: { label: string; iso: string }) {
   return (
     <div className="flex items-center gap-2 text-xs whitespace-nowrap">
       <span className="w-8 shrink-0 text-muted-foreground">{label}</span>
-      <CopyableValue value={iso} valueClassName="text-foreground" title={`Copy ${label.toLowerCase()} (ISO 8601)`} />
+      <CopyableValue
+        value={iso}
+        valueClassName="text-foreground"
+        title={`Copy ${label.toLowerCase()} (ISO 8601)`}
+      />
     </div>
   );
 }
@@ -544,10 +628,13 @@ function RunRangePopover({
       closeTimer.current = null;
     }
   };
-  useEffect(() => () => {
-    clearOpenTimer();
-    clearCloseTimer();
-  }, []);
+  useEffect(
+    () => () => {
+      clearOpenTimer();
+      clearCloseTimer();
+    },
+    [],
+  );
 
   // Enter (text or popover): cancel any pending close; arm the open delay.
   const handleEnter = () => {
@@ -633,8 +720,12 @@ function ScenarioMeta({ scenario }: { scenario: ScenarioRow }) {
     items.push(
       <span key="test-id" className="inline-flex items-center gap-1.5">
         <span>Test ID:</span>
-        <CopyableValue value={scenario.test_id} valueClassName="font-medium text-foreground" title="Copy Test ID" />
-      </span>
+        <CopyableValue
+          value={scenario.test_id}
+          valueClassName="font-medium text-foreground"
+          title="Copy Test ID"
+        />
+      </span>,
     );
   }
   if (runRange && runRangeIso) {
@@ -644,7 +735,7 @@ function ScenarioMeta({ scenario }: { scenario: ScenarioRow }) {
         display={runRange}
         startIso={runRangeIso.start}
         endIso={runRangeIso.end}
-      />
+      />,
     );
   }
   if (tagList.length > 0) {
@@ -658,7 +749,7 @@ function ScenarioMeta({ scenario }: { scenario: ScenarioRow }) {
             {tag}
           </span>
         ))}
-      </span>
+      </span>,
     );
   }
 
@@ -785,10 +876,20 @@ function ScenarioRow_({
         >
           <ChevronRight
             size={14}
-            className={cn("shrink-0 text-muted-foreground transition-transform", isOpen && "rotate-90")}
+            className={cn(
+              "shrink-0 text-muted-foreground transition-transform",
+              isOpen && "rotate-90",
+            )}
           />
-          <StatusMark kind={kind} shape="dot" size={10} title={statusLabel(kind)} />
-          <span className="min-w-0 flex-1 truncate">{scenario.scenario_name}</span>
+          <StatusMark
+            kind={kind}
+            shape="dot"
+            size={10}
+            title={statusLabel(kind)}
+          />
+          <span className="min-w-0 flex-1 truncate">
+            {scenario.scenario_name}
+          </span>
           <span className="shrink-0 font-mono text-xs text-muted-foreground">
             {formatDuration(scenario.duration_s)}
           </span>
@@ -807,7 +908,10 @@ function ScenarioRow_({
               <Link2 size={14} />
             </button>
             <Link
-              to={scenarioHistoryPath(scenario.feature_uri, scenario.scenario_id)}
+              to={scenarioHistoryPath(
+                scenario.feature_uri,
+                scenario.scenario_id,
+              )}
               // Select this scenario (replacing the current history entry) before
               // leaving, so Back from the history view lands here with it selected.
               onClick={() => onSelect({ replace: true })}
@@ -822,10 +926,14 @@ function ScenarioRow_({
               title="View scenario log"
               className={cn(
                 "inline-flex items-center rounded p-1 hover:bg-muted hover:text-foreground",
-                isLogOpen && "bg-muted text-foreground"
+                isLogOpen && "bg-muted text-foreground",
               )}
             >
-              {isLogOpen && logsLoading ? <Spinner size={14} /> : <FileText size={14} />}
+              {isLogOpen && logsLoading ? (
+                <Spinner size={14} />
+              ) : (
+                <FileText size={14} />
+              )}
             </button>
           </div>
         )}
@@ -872,7 +980,6 @@ export default function RunDetail() {
     status: dataStatus,
     error: dataError,
     query,
-    reportUrlByRunId,
     windowLabel,
     nextWindowLabel,
     hasMore,
@@ -906,13 +1013,18 @@ export default function RunDetail() {
   // per run on first click, cached by scenario_id. `scenarioLogsRunIdRef`
   // tracks which run the cache (if any) belongs to, so switching runs (or a
   // failed fetch) triggers a fresh load rather than reusing stale data.
-  const [scenarioLogs, setScenarioLogs] = useState<Map<string, string | null> | null>(null);
+  const [scenarioLogs, setScenarioLogs] = useState<Map<
+    string,
+    string | null
+  > | null>(null);
   const [logsLoading, setLogsLoading] = useState(false);
   const [logsError, setLogsError] = useState<Error | null>(null);
   // Which scenarios' log panels are open, by scenario_id. A Set so any number
   // can be open at once, independent of expand and of the `?scenario=`
   // selection - opening a log neither collapses nor selects anything.
-  const [openLogScenarioIds, setOpenLogScenarioIds] = useState<Set<string>>(new Set());
+  const [openLogScenarioIds, setOpenLogScenarioIds] = useState<Set<string>>(
+    new Set(),
+  );
   const scenarioLogsRunIdRef = useRef<string | null>(null);
 
   // Reset the log cache/panels whenever the run changes.
@@ -926,17 +1038,14 @@ export default function RunDetail() {
 
   async function loadScenarioLogsIfNeeded() {
     if (scenarioLogsRunIdRef.current === runId) return; // already loaded/loading for this run
-    const reportUrl = reportUrlByRunId[runId];
-    if (!reportUrl) {
-      setLogsError(new Error("No report URL available for this run"));
-      return;
-    }
     scenarioLogsRunIdRef.current = runId;
     setLogsLoading(true);
     setLogsError(null);
     try {
+      // Logs live in the run's cached slim Parquet (decoded at extraction time),
+      // so this reads that ~100 KB file - never the raw report.
       const rows = await query<{ scenario_id: string; log: string | null }>(
-        buildScenarioLogsSql(reportUrl)
+        buildRunScenarioLogsSql(runId),
       );
       setScenarioLogs(new Map(rows.map((r) => [r.scenario_id, r.log])));
     } catch (e) {
@@ -970,7 +1079,9 @@ export default function RunDetail() {
   const focusScenarioId = safeDecodeURIComponent(searchParams.get("scenario"));
   const focusStepParam = searchParams.get("step");
   const focusStepOrdinal =
-    focusStepParam != null && /^\d+$/.test(focusStepParam) ? Number(focusStepParam) : null;
+    focusStepParam != null && /^\d+$/.test(focusStepParam)
+      ? Number(focusStepParam)
+      : null;
 
   // Filters live in the URL so they survive deep links and Back navigation.
   // Each value is derived straight from the search params; `patchFilters` (the
@@ -981,7 +1092,10 @@ export default function RunDetail() {
   // touch the URL - featureGroups depends on it.
   const failuresOnly = searchParams.get("failures") === "1";
   const testIdQuery = searchParams.get("testId") ?? "";
-  const selectedTags = useMemo(() => searchParams.getAll("tag"), [searchParams]);
+  const selectedTags = useMemo(
+    () => searchParams.getAll("tag"),
+    [searchParams],
+  );
 
   const patchFilters = useCallback(
     (mutate: (params: URLSearchParams) => void) => {
@@ -991,19 +1105,23 @@ export default function RunDetail() {
           mutate(next);
           return next;
         },
-        { replace: true, preventScrollReset: true }
+        { replace: true, preventScrollReset: true },
       );
     },
-    [setSearchParams]
+    [setSearchParams],
   );
 
   const setFailuresOnly = useCallback(
-    (on: boolean) => patchFilters((p) => (on ? p.set("failures", "1") : p.delete("failures"))),
-    [patchFilters]
+    (on: boolean) =>
+      patchFilters((p) => (on ? p.set("failures", "1") : p.delete("failures"))),
+    [patchFilters],
   );
   const setTestIdQuery = useCallback(
-    (value: string) => patchFilters((p) => (value ? p.set("testId", value) : p.delete("testId"))),
-    [patchFilters]
+    (value: string) =>
+      patchFilters((p) =>
+        value ? p.set("testId", value) : p.delete("testId"),
+      ),
+    [patchFilters],
   );
   const setSelectedTags = useCallback(
     (tags: string[]) =>
@@ -1011,7 +1129,7 @@ export default function RunDetail() {
         p.delete("tag");
         for (const tag of tags) p.append("tag", tag);
       }),
-    [patchFilters]
+    [patchFilters],
   );
 
   // Clear the `?scenario`/`?step` selection, removing the highlight. Shared by
@@ -1027,7 +1145,7 @@ export default function RunDetail() {
         next.delete("step");
         return next;
       },
-      { replace: true, preventScrollReset: true }
+      { replace: true, preventScrollReset: true },
     );
   }, [setSearchParams]);
 
@@ -1053,7 +1171,7 @@ export default function RunDetail() {
         window.history.replaceState(
           window.history.state,
           "",
-          `${window.location.pathname}${search ? `?${search}` : ""}`
+          `${window.location.pathname}${search ? `?${search}` : ""}`,
         );
         return;
       }
@@ -1064,10 +1182,10 @@ export default function RunDetail() {
           next.delete("step");
           return next;
         },
-        { preventScrollReset: true }
+        { preventScrollReset: true },
       );
     },
-    [setSearchParams]
+    [setSearchParams],
   );
 
   // Two ways to deselect: pressing Escape, or clicking anywhere that isn't
@@ -1096,7 +1214,9 @@ export default function RunDetail() {
     if (!focusScenarioId && focusStepParam == null) return;
     function onClick(e: MouseEvent) {
       const target = e.target as Element | null;
-      const clickedId = target?.closest?.("[data-scenario-id]")?.getAttribute("data-scenario-id");
+      const clickedId = target
+        ?.closest?.("[data-scenario-id]")
+        ?.getAttribute("data-scenario-id");
       if (clickedId === focusScenarioId) return;
       clearSelection();
     }
@@ -1114,7 +1234,7 @@ export default function RunDetail() {
                 (SELECT max(run_id) FROM runs) AS newest_run_id
          FROM runs WHERE run_id = ${runIdLit}`
       : null,
-    [runId]
+    [runId],
   );
 
   const {
@@ -1127,19 +1247,16 @@ export default function RunDetail() {
                 epoch_ms(started_at)::DOUBLE AS started_ms, status, test_id
          FROM scenarios WHERE run_id = ${runIdLit}`
       : null,
-    [detailsReady, runId]
+    [detailsReady, runId],
   );
 
   // Fetch all steps for the run once; group client-side per scenario on expand.
-  const {
-    rows: allSteps,
-    loading: stepsLoading,
-  } = useE2eQuery<StepRow>(
+  const { rows: allSteps, loading: stepsLoading } = useE2eQuery<StepRow>(
     detailsReady && runId
       ? `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status, duration_s, has_error, error_message, is_background, glue_location
          FROM steps WHERE run_id = ${runIdLit} ORDER BY scenario_id, step_ordinal`
       : null,
-    [detailsReady, runId]
+    [detailsReady, runId],
   );
 
   // Resolve the focused scenario from the run's own scenario list (not the
@@ -1158,7 +1275,11 @@ export default function RunDetail() {
   // manually collapses it afterwards isn't fought by this effect.
   useEffect(() => {
     if (!focusedScenarioKey) return;
-    setOpenScenarios((prev) => (prev.has(focusedScenarioKey) ? prev : new Set(prev).add(focusedScenarioKey)));
+    setOpenScenarios((prev) =>
+      prev.has(focusedScenarioKey)
+        ? prev
+        : new Set(prev).add(focusedScenarioKey),
+    );
   }, [focusedScenarioKey]);
 
   const stepsByScenario = useMemo(() => {
@@ -1205,8 +1326,13 @@ export default function RunDetail() {
       // The scenario targeted by `?scenario=` must always render, regardless
       // of the current filters - e.g. a passed scenario opened from a green
       // step-history cell must still show even with "Failures only" checked.
-      if (focusedScenarioKey && `${s.feature_uri}::${s.scenario_id}` === focusedScenarioKey) return true;
-      if (failuresOnly && s.status !== "failed" && s.status !== "skipped") return false;
+      if (
+        focusedScenarioKey &&
+        `${s.feature_uri}::${s.scenario_id}` === focusedScenarioKey
+      )
+        return true;
+      if (failuresOnly && s.status !== "failed" && s.status !== "skipped")
+        return false;
       // Union semantics: keep the scenario if it has ANY of the selected tags.
       // tag_names comes back from duckdb-wasm as a list-like value, not a plain
       // Array (see the Array.from(...) usage in ScenarioRow_ below) - wrap it
@@ -1219,17 +1345,28 @@ export default function RunDetail() {
       }
       // Case-insensitive substring match on test_id; a scenario with no
       // test_id (background/parse miss) never matches a non-empty query.
-      if (trimmedTestIdQuery !== "" && !s.test_id?.toLowerCase().includes(trimmedTestIdQuery)) {
+      if (
+        trimmedTestIdQuery !== "" &&
+        !s.test_id?.toLowerCase().includes(trimmedTestIdQuery)
+      ) {
         return false;
       }
       return true;
     });
 
-    const byFeature = new Map<string, { feature_name: string; feature_uri: string; scenarios: ScenarioRow[] }>();
+    const byFeature = new Map<
+      string,
+      { feature_name: string; feature_uri: string; scenarios: ScenarioRow[] }
+    >();
     for (const s of filtered) {
       const g = byFeature.get(s.feature_uri);
       if (g) g.scenarios.push(s);
-      else byFeature.set(s.feature_uri, { feature_name: s.feature_name, feature_uri: s.feature_uri, scenarios: [s] });
+      else
+        byFeature.set(s.feature_uri, {
+          feature_name: s.feature_name,
+          feature_uri: s.feature_uri,
+          scenarios: [s],
+        });
     }
 
     for (const g of byFeature.values()) {
@@ -1245,20 +1382,30 @@ export default function RunDetail() {
     // feature: order feature groups by their worst-status scenario first
     // (failed < skipped < passed), falling back to feature name.
     return Array.from(byFeature.values()).sort((a, b) => {
-      const worstA = Math.min(...a.scenarios.map((s) => STATUS_SORT_RANK[s.status] ?? 3));
-      const worstB = Math.min(...b.scenarios.map((s) => STATUS_SORT_RANK[s.status] ?? 3));
+      const worstA = Math.min(
+        ...a.scenarios.map((s) => STATUS_SORT_RANK[s.status] ?? 3),
+      );
+      const worstB = Math.min(
+        ...b.scenarios.map((s) => STATUS_SORT_RANK[s.status] ?? 3),
+      );
       if (worstA !== worstB) return worstA - worstB;
       return a.feature_name.localeCompare(b.feature_name);
     });
-  }, [scenarios, failuresOnly, selectedTags, trimmedTestIdQuery, focusedScenarioKey]);
+  }, [
+    scenarios,
+    failuresOnly,
+    selectedTags,
+    trimmedTestIdQuery,
+    focusedScenarioKey,
+  ]);
 
   // Keys of every scenario currently visible (post-filter), for expand-all.
   const visibleScenarioKeys = useMemo(
     () =>
       featureGroups.flatMap((g) =>
-        g.scenarios.map((s) => `${s.feature_uri}::${s.scenario_id}`)
+        g.scenarios.map((s) => `${s.feature_uri}::${s.scenario_id}`),
       ),
-    [featureGroups]
+    [featureGroups],
   );
   const allExpanded =
     visibleScenarioKeys.length > 0 &&
@@ -1271,9 +1418,9 @@ export default function RunDetail() {
       featureGroups.flatMap((g) =>
         g.scenarios
           .filter((s) => s.status === "failed")
-          .map((s) => `${s.feature_uri}::${s.scenario_id}`)
+          .map((s) => `${s.feature_uri}::${s.scenario_id}`),
       ),
-    [featureGroups]
+    [featureGroups],
   );
 
   // Expand every failed scenario (additively - passed rows already open stay
@@ -1340,8 +1487,9 @@ export default function RunDetail() {
           {canLoadMore ? (
             <>
               <p className="text-sm text-muted-foreground">
-                Run <span className="font-mono">{runId}</span> isn't in the loaded data. It may be
-                older than the current <span className="font-medium">{windowLabel}</span> window.
+                Run <span className="font-mono">{runId}</span> isn't in the
+                loaded data. It may be older than the current{" "}
+                <span className="font-medium">{windowLabel}</span> window.
               </p>
               <button
                 type="button"
@@ -1376,7 +1524,11 @@ export default function RunDetail() {
           <div className="flex flex-wrap items-center gap-2">
             <TypeBadge isNightly={run.is_nightly} />
             <StatusBadge kind={statusKindFromRunToken(run.status_token)} />
-            <CluecumberLink runId={run.run_id} label="Report" className="text-sm" />
+            <CluecumberLink
+              runId={run.run_id}
+              label="Report"
+              className="text-sm"
+            />
           </div>
         </div>
 
@@ -1407,7 +1559,11 @@ export default function RunDetail() {
                   type="button"
                   onClick={() => setTimelineOpen((open) => !open)}
                   aria-expanded={timelineOpen}
-                  title={timelineOpen ? "Hide execution timeline" : "Show execution timeline"}
+                  title={
+                    timelineOpen
+                      ? "Hide execution timeline"
+                      : "Show execution timeline"
+                  }
                   className="ml-auto inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs text-muted-foreground hover:bg-muted/50 hover:text-foreground"
                 >
                   <Clock size={13} className="shrink-0" />
@@ -1422,7 +1578,10 @@ export default function RunDetail() {
                   <span>parallel</span>
                   <ChevronRight
                     size={14}
-                    className={cn("shrink-0 transition-transform", timelineOpen && "rotate-90")}
+                    className={cn(
+                      "shrink-0 transition-transform",
+                      timelineOpen && "rotate-90",
+                    )}
                   />
                 </button>
               )}
@@ -1441,9 +1600,13 @@ export default function RunDetail() {
         )}
       </div>
 
+      <ServiceVersions runId={runId} />
+
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-1.5">
-          <h2 className="text-sm font-semibold text-muted-foreground">Features &amp; scenarios</h2>
+          <h2 className="text-sm font-semibold text-muted-foreground">
+            Features &amp; scenarios
+          </h2>
           <div className="flex items-center">
             <button
               type="button"
@@ -1476,9 +1639,16 @@ export default function RunDetail() {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-3">
-          <TagFilter allTags={availableTags} selected={selectedTags} onChange={setSelectedTags} />
+          <TagFilter
+            allTags={availableTags}
+            selected={selectedTags}
+            onChange={setSelectedTags}
+          />
           <div className="relative">
-            <Search size={13} className="absolute top-1/2 left-2 -translate-y-1/2 text-muted-foreground" />
+            <Search
+              size={13}
+              className="absolute top-1/2 left-2 -translate-y-1/2 text-muted-foreground"
+            />
             <input
               ref={testIdInputRef}
               type="text"
@@ -1519,7 +1689,10 @@ export default function RunDetail() {
       ) : (
         <div className="space-y-3">
           {featureGroups.map((group) => (
-            <div key={group.feature_uri} className="overflow-hidden rounded-lg border bg-card">
+            <div
+              key={group.feature_uri}
+              className="overflow-hidden rounded-lg border bg-card"
+            >
               <div className="border-b bg-muted/30 px-4 py-2 text-sm font-medium">
                 {group.feature_name}
                 <span className="ml-2 font-mono text-xs text-muted-foreground">
@@ -1541,7 +1714,9 @@ export default function RunDetail() {
                       isFocused={isFocused}
                       focusStepOrdinal={focusStepOrdinal}
                       revealErrorsToken={revealErrorsToken}
-                      onSelect={(opts) => selectScenario(scenario.scenario_id, opts)}
+                      onSelect={(opts) =>
+                        selectScenario(scenario.scenario_id, opts)
+                      }
                       isLogOpen={openLogScenarioIds.has(scenario.scenario_id)}
                       logsLoading={logsLoading}
                       logsError={logsError}
