@@ -499,7 +499,7 @@ export default function Services() {
                           className="group absolute top-0 flex flex-col"
                         >
                           <span
-                            className="flex items-center justify-center border-b text-[11px] tabular-nums text-muted-foreground group-hover:text-foreground"
+                            className="flex items-center justify-center border-b text-[11px] font-medium tabular-nums text-muted-foreground group-hover:text-foreground"
                             style={{ height: DATE_H }}
                           >
                             {runDayLabel(runId)}
