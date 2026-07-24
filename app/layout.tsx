@@ -31,8 +31,21 @@ function NavLinks() {
   // "Recent Runs" stays selected on a run's detail page (a drill-down from it);
   // "Scenarios" covers the matrix and the scenario detail view.
   const items = [
-    { to: "/", label: "Recent Runs", active: pathname === "/" || pathname.startsWith("/runs") },
-    { to: "/scenarios", label: "Scenarios", active: pathname.startsWith("/scenarios") },
+    {
+      to: "/",
+      label: "Recent Runs",
+      active: pathname === "/" || pathname.startsWith("/runs"),
+    },
+    {
+      to: "/scenarios",
+      label: "Scenarios",
+      active: pathname.startsWith("/scenarios"),
+    },
+    {
+      to: "/services",
+      label: "Services",
+      active: pathname.startsWith("/services"),
+    },
   ];
   return (
     <nav className="flex items-center gap-1 text-sm">
@@ -45,7 +58,7 @@ function NavLinks() {
             "rounded-md px-2.5 py-1 transition-colors",
             item.active
               ? "bg-muted font-medium text-foreground"
-              : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+              : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
           )}
         >
           {item.label}
@@ -60,21 +73,21 @@ export default function Layout() {
     <DuckDBProvider>
       <E2eDataProvider>
         <RunScopeProvider>
-        <div className="min-h-screen bg-background text-foreground">
-          <header className="flex h-(--header-height) items-center justify-between border-b px-4">
-            <div className="flex items-center gap-6">
-              <span className="font-semibold">E2E Explorer</span>
-              <NavLinks />
-            </div>
-            <div className="flex items-center gap-4">
-              <GlobalStatus />
-              <DateRangeControl />
-            </div>
-          </header>
-          <main className="p-4">
-            <Outlet />
-          </main>
-        </div>
+          <div className="min-h-screen bg-background text-foreground">
+            <header className="flex h-(--header-height) items-center justify-between border-b px-4">
+              <div className="flex items-center gap-6">
+                <span className="font-semibold">E2E Explorer</span>
+                <NavLinks />
+              </div>
+              <div className="flex items-center gap-4">
+                <GlobalStatus />
+                <DateRangeControl />
+              </div>
+            </header>
+            <main className="p-4">
+              <Outlet />
+            </main>
+          </div>
         </RunScopeProvider>
       </E2eDataProvider>
     </DuckDBProvider>

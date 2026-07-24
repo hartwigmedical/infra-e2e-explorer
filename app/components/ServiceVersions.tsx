@@ -9,6 +9,7 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
+import { useRunScope } from "~/contexts/RunScopeContext";
 import { cn } from "~/lib/utils";
 
 /** One (current ⟕ previous) service row from the deployment-diff query. */
@@ -92,6 +93,13 @@ function ChangeGlyph({ kind }: { kind: ChangeKind }) {
  */
 export default function ServiceVersions({ runId }: { runId: string }) {
   const { detailsReady } = useE2eData();
+  // Diff against the previous run in the SAME scope as the Services timeline
+  // (RunScopeContext) - so when nightly-only is on, this run's baseline is the
+  // previous NIGHTLY, not an intervening manual re-run. Otherwise the two views
+  // disagree: a nightly can read "no change" here (vs a same-day manual run that
+  // already picked up the deploy) while the Services page shows it changed vs the
+  // prior nightly.
+  const { nightlyOnly } = useRunScope();
   const [showAll, setShowAll] = useState(false);
 
   const runIdLit = sqlLit(runId);
@@ -103,7 +111,9 @@ export default function ServiceVersions({ runId }: { runId: string }) {
         FROM service_versions WHERE run_id = ${runIdLit}
       ),
       prev_id AS (
-        SELECT max(run_id) AS pid FROM runs WHERE run_id < ${runIdLit}
+        SELECT max(sv.run_id) AS pid
+        FROM service_versions sv JOIN runs r USING (run_id)
+        WHERE sv.run_id < ${runIdLit}${nightlyOnly ? " AND r.is_nightly" : ""}
       ),
       prev AS (
         SELECT sv.service, sv.spec, sv.version, sv.pipeline_version
@@ -120,7 +130,7 @@ export default function ServiceVersions({ runId }: { runId: string }) {
       FROM cur FULL OUTER JOIN prev ON cur.service = prev.service
       ORDER BY service`
       : null,
-    [detailsReady, runId],
+    [detailsReady, runId, nightlyOnly],
   );
 
   const model = useMemo(() => {
