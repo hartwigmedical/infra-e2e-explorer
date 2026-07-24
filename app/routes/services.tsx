@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import { Boxes, TriangleAlert } from "lucide-react";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
@@ -145,10 +145,22 @@ export default function Services() {
   const { nightlyOnly } = useRunScope();
   const [showUnchanged, setShowUnchanged] = useState(false);
   // `?run=` deep-link (from the run-detail Services panel's timeline button):
-  // scroll that run's column into view and highlight it.
-  const [searchParams] = useSearchParams();
+  // scroll that run's column into view and outline its date. Cleared by Escape
+  // or a click outside the outlined date (see below).
+  const [searchParams, setSearchParams] = useSearchParams();
   const focusRun = searchParams.get("run");
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  const clearFocus = useCallback(() => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        next.delete("run");
+        return next;
+      },
+      { replace: true, preventScrollReset: true },
+    );
+  }, [setSearchParams]);
 
   const versionsSql = useMemo(
     () => buildVersionsSql(nightlyOnly),
@@ -199,6 +211,26 @@ export default function Services() {
       focusIdx * COL_W - (el.clientWidth - COL_W) / 2,
     );
   }, [focusIdx, runIds.length]);
+
+  // Clear the selection on Escape or a click outside the outlined date. Both
+  // listeners are attached only while a run is selected.
+  useEffect(() => {
+    if (focusIdx == null) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") clearFocus();
+    };
+    const onClick = (e: MouseEvent) => {
+      const target = e.target as Element | null;
+      if (target?.closest("[data-run-focus]")) return;
+      clearFocus();
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("click", onClick);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("click", onClick);
+    };
+  }, [focusIdx, clearFocus]);
 
   const metaByRun = useMemo(() => {
     const m = new Map<string, RunMetaRow>();
@@ -464,14 +496,6 @@ export default function Services() {
                     ) : null,
                   )}
 
-                  {/* Deep-linked run (?run=) highlight, above the bands/lanes. */}
-                  {focusIdx != null && (
-                    <div
-                      className="pointer-events-none absolute inset-y-0 z-20 rounded-sm bg-sky-500/[0.06] ring-2 ring-inset ring-sky-500/70"
-                      style={{ left: focusIdx * COL_W, width: COL_W }}
-                    />
-                  )}
-
                   {/* Two-row header: date over a uniform status bar, with a solid
                       bottom divider and the same shading as the side columns. */}
                   <div
@@ -490,6 +514,7 @@ export default function Services() {
                           : st === "known"
                             ? `failure · ${failures} known error${failures === 1 ? "" : "s"}`
                             : "success";
+                      const isFocused = focusIdx === i;
                       return (
                         <Link
                           key={runId}
@@ -502,7 +527,15 @@ export default function Services() {
                             className="flex items-center justify-center border-b text-[11px] font-medium tabular-nums text-muted-foreground group-hover:text-foreground"
                             style={{ height: DATE_H }}
                           >
-                            {runDayLabel(runId)}
+                            <span
+                              {...(isFocused ? { "data-run-focus": "" } : {})}
+                              className={cn(
+                                "rounded-full px-2 py-0.5",
+                                isFocused && "text-foreground ring-1 ring-ring",
+                              )}
+                            >
+                              {runDayLabel(runId)}
+                            </span>
                           </span>
                           <span
                             className="flex items-center justify-center"
