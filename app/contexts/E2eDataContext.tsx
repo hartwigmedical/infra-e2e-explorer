@@ -84,10 +84,23 @@ export const DEFAULT_WINDOW_INDEX = 0;
  *  picks the window to load. */
 const WINDOW_INDEX_STORAGE_KEY = "e2e:windowIndex";
 
-/** The persisted window-preset index, clamped to a valid preset; falls back to
- *  DEFAULT_WINDOW_INDEX when it's absent/invalid or localStorage is unavailable. */
+/** localStorage mirror of the slim-cache SCHEMA_VERSION last seen by this
+ *  client. When it differs from the current SCHEMA_VERSION the slim cache has
+ *  been (or is about to be) cleared - see report-cache.ts - so the next load is
+ *  a COLD one that must re-extract every run in the window from raw JSON. We
+ *  use it to reset the window to the default on such a launch, so a previously
+ *  widened window ("All time") doesn't force a huge cold re-extraction. */
+const CACHE_SCHEMA_STORAGE_KEY = "e2e:cacheSchemaVersion";
+
+/** The persisted window-preset index, clamped to a valid preset. Falls back to
+ *  DEFAULT_WINDOW_INDEX when it's absent/invalid, when localStorage is
+ *  unavailable, or on a COLD launch (SCHEMA_VERSION changed since last seen -
+ *  the cache is empty, so keep the re-extraction small). */
 function readStoredWindowIndex(): number {
   try {
+    if (localStorage.getItem(CACHE_SCHEMA_STORAGE_KEY) !== SCHEMA_VERSION) {
+      return DEFAULT_WINDOW_INDEX;
+    }
     const raw = localStorage.getItem(WINDOW_INDEX_STORAGE_KEY);
     if (raw == null) return DEFAULT_WINDOW_INDEX;
     const i = Number(raw);
@@ -259,6 +272,18 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
       // localStorage unavailable/full - the range just won't persist.
     }
   }, [windowIndex]);
+
+  // Record the current slim-cache schema version, so the NEXT launch can tell a
+  // cold launch (schema changed → cache cleared) apart and reset the window
+  // then. On a cold launch this stamp runs after readStoredWindowIndex has
+  // already fallen back to the default.
+  useEffect(() => {
+    try {
+      localStorage.setItem(CACHE_SCHEMA_STORAGE_KEY, SCHEMA_VERSION);
+    } catch {
+      // localStorage unavailable - cold-launch detection just won't fire.
+    }
+  }, []);
 
   const runInit = useCallback(
     async (
