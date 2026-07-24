@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { Link } from "react-router";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router";
 import { Boxes, TriangleAlert } from "lucide-react";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
 import { useRunScope } from "~/contexts/RunScopeContext";
@@ -144,6 +144,11 @@ export default function Services() {
   const { status, error, detailsReady, windowLabel } = useE2eData();
   const { nightlyOnly } = useRunScope();
   const [showUnchanged, setShowUnchanged] = useState(false);
+  // `?run=` deep-link (from the run-detail Services panel's timeline button):
+  // scroll that run's column into view and highlight it.
+  const [searchParams] = useSearchParams();
+  const focusRun = searchParams.get("run");
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   const versionsSql = useMemo(
     () => buildVersionsSql(nightlyOnly),
@@ -181,6 +186,19 @@ export default function Services() {
     runIds.forEach((id, i) => m.set(id, i));
     return m;
   }, [runIds]);
+
+  const focusIdx = focusRun != null ? (runIndex.get(focusRun) ?? null) : null;
+
+  // Center the deep-linked run's column once the timeline is populated.
+  useEffect(() => {
+    if (focusIdx == null) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollLeft = Math.max(
+      0,
+      focusIdx * COL_W - (el.clientWidth - COL_W) / 2,
+    );
+  }, [focusIdx, runIds.length]);
 
   const metaByRun = useMemo(() => {
     const m = new Map<string, RunMetaRow>();
@@ -376,7 +394,10 @@ export default function Services() {
             Services
           </h1>
           <p className="mt-0.5 text-sm text-muted-foreground">
-            Deployed versions per run. If a run has new failures (vs. the run before it), a version deployed in that run becomes a suspect. If those failures later clear while that version is still deployed, that version is no longer a suspect.
+            Deployed versions per run. If a run has new failures (vs. the run
+            before it), a version deployed in that run becomes a suspect. If
+            those failures later clear while that version is still deployed,
+            that version is no longer a suspect.
           </p>
         </div>
         {changedCount < lanes.length && (
@@ -407,7 +428,7 @@ export default function Services() {
               {/* Left: fixed service-name column. */}
               <div className="shrink-0 border-r" style={{ width: NAME_W }}>
                 <div
-                  className="flex items-end border-b bg-muted/30 px-3 pb-1.5 text-xs font-medium text-muted-foreground"
+                  className="flex items-end border-b bg-muted/30 px-3 pb-1.5 text-xs font-semibold text-muted-foreground"
                   style={{ height: HEADER_H }}
                 >
                   Service
@@ -427,7 +448,7 @@ export default function Services() {
               </div>
 
               {/* Middle: horizontally-scrollable timeline. */}
-              <div className="min-w-0 flex-1 overflow-x-auto">
+              <div ref={scrollRef} className="min-w-0 flex-1 overflow-x-auto">
                 <div
                   className="relative"
                   style={{ width: trackWidth, height: bodyHeight }}
@@ -441,6 +462,14 @@ export default function Services() {
                         style={{ left: i * COL_W, width: COL_W }}
                       />
                     ) : null,
+                  )}
+
+                  {/* Deep-linked run (?run=) highlight, above the bands/lanes. */}
+                  {focusIdx != null && (
+                    <div
+                      className="pointer-events-none absolute inset-y-0 z-20 rounded-sm bg-sky-500/[0.06] ring-2 ring-inset ring-sky-500/70"
+                      style={{ left: focusIdx * COL_W, width: COL_W }}
+                    />
                   )}
 
                   {/* Two-row header: date over a uniform status bar, with a solid
@@ -545,7 +574,7 @@ export default function Services() {
                   same spot on every row regardless of the counts. */}
               <div className="shrink-0 border-l" style={{ width: SUMMARY_W }}>
                 <div
-                  className="flex items-end justify-end border-b bg-muted/30 px-3 pb-1.5 text-right text-xs font-medium text-muted-foreground"
+                  className="flex items-end justify-end border-b bg-muted/30 px-3 pb-1.5 text-right text-xs font-semibold text-muted-foreground"
                   style={{ height: HEADER_H }}
                 >
                   Deploys

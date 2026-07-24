@@ -4,6 +4,7 @@ import {
   ArrowRight,
   Boxes,
   ChevronRight,
+  History,
   Minus,
   Plus,
   TriangleAlert,
@@ -192,6 +193,13 @@ export default function ServiceVersions({ runId }: { runId: string }) {
           <span className="font-normal text-muted-foreground">
             ({curCount})
           </span>
+          <Link
+            to={`/services?run=${encodeURIComponent(runId)}`}
+            title="See this run on the Services timeline"
+            className="inline-flex items-center rounded p-1 font-normal text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <History size={14} />
+          </Link>
         </h2>
         <div className="text-xs text-muted-foreground">
           {!hasBaseline ? (
