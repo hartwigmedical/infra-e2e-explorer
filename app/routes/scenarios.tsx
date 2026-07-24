@@ -8,14 +8,12 @@ import {
 } from "react";
 import { Link, useSearchParams } from "react-router";
 import {
-  ArrowDown,
   ArrowRight,
-  ArrowUp,
   ChevronRight,
   Clock,
   Search,
+  Triangle,
   X,
-  Zap,
 } from "lucide-react";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
 import { useRunScope } from "~/contexts/RunScopeContext";
@@ -79,29 +77,43 @@ const FLIP_KINDS: ReadonlySet<StabilityKind> = new Set([
   "explained-recover",
 ]);
 
-/** The glyph for a stability cell: a lightning bolt for flaky flips (coloured
- *  by direction), a faint arrow for deploy-explained ones, a dot for other
- *  changes, and a muted dash for no change. */
-function StabilityGlyph({ kind }: { kind: StabilityKind }) {
-  switch (kind) {
-    case "flaky-regress":
-      return <Zap size={13} className="text-red-600 dark:text-red-400" />;
-    case "flaky-recover":
-      return (
-        <Zap size={13} className="text-emerald-600 dark:text-emerald-400" />
-      );
-    case "explained-regress":
-      return <ArrowDown size={13} className="text-red-500/50" />;
-    case "explained-recover":
-      return <ArrowUp size={13} className="text-emerald-500/60" />;
-    case "other-change":
-      return (
-        <span className="text-sm leading-none text-muted-foreground">·</span>
-      );
-    case "none":
-    default:
-      return <span className="text-muted-foreground/40">–</span>;
+/** The glyph for a stability cell. A change gets the normal rounded-square
+ *  status indicator (in its new status's colour); a FLAKY change (unexplained
+ *  by a deploy) gets a triangle in that same success/fail colour instead; no
+ *  change is a muted dash. `statusKind` is the cell's (new) status. */
+function StabilityGlyph({
+  kind,
+  statusKind,
+}: {
+  kind: StabilityKind;
+  statusKind: StatusKind;
+}) {
+  if (kind === "none")
+    return <span className="text-muted-foreground/40">–</span>;
+  if (kind === "flaky-regress" || kind === "flaky-recover") {
+    return (
+      <Triangle
+        size={15}
+        className={cn(
+          "translate-y-px",
+          statusKind === "failed"
+            ? "fill-red-500 text-red-500"
+            : "fill-emerald-500 text-emerald-500",
+        )}
+      />
+    );
   }
+  // Deploy-explained flip, or a skipped-involved change: the normal square,
+  // muted so the flaky triangles stand out.
+  return (
+    <StatusMark
+      kind={statusKind}
+      shape="square"
+      size={16}
+      title=""
+      className="opacity-40"
+    />
+  );
 }
 
 function stabilityTip(kind: StabilityKind): string {
@@ -696,7 +708,10 @@ function ScenarioMatrix({
                                 title={`${sc.scenario_name}\n${runId}\n${stabilityTip(skind)}`}
                                 className="mx-auto flex w-fit items-center justify-center transition-transform hover:scale-125"
                               >
-                                <StabilityGlyph kind={skind} />
+                                <StabilityGlyph
+                                  kind={skind}
+                                  statusKind={kind}
+                                />
                               </Link>
                             </td>
                           );
@@ -2178,7 +2193,7 @@ export default function Scenarios() {
                   ? " Summary is pass rate over runs shown."
                   : metric === "duration"
                     ? " Cells are per-run duration; summary is the mean ±CV over passed runs only."
-                    : " Cells flag each status change vs the previous run — ⚡ flaky (a pass→fail with no suspect deploy, or a fail→pass with no deploy) vs a faint arrow when a deploy explains it; summary is the flaky share of flips."}
+                    : " Each status change vs the previous run shows the new status as a square; a flaky change (a pass→fail with no suspect deploy, or a fail→pass with no deploy) is a triangle instead. Summary is the flaky share of flips."}
               </p>
             </>
           )}
