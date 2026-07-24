@@ -6,6 +6,7 @@ import { useRunScope } from "~/contexts/RunScopeContext";
 import Spinner from "~/components/Spinner";
 import StatusMark from "~/components/StatusMark";
 import { statusKindFromRunToken } from "~/lib/status";
+import { makeIsSuspectDeploy } from "~/lib/deployments";
 import { cn } from "~/lib/utils";
 
 /** One (run, service) version cell, straight from service_versions ⋈ runs. */
@@ -307,25 +308,8 @@ export default function Services() {
 
     // A deploy at [startIdx..endIdx] (the version's tenure) is a suspect when it
     // introduced new failures that were NOT resolved later while this same
-    // version was still deployed. If every scenario that newly failed at the
-    // deploy passes again on a later run within the tenure, the version cleared
-    // itself → not a suspect (transient/flaky, or fixed without a version bump).
-    const isSuspect = (startIdx: number, endIdx: number): boolean => {
-      const nf = newlyFailedByIdx.get(startIdx);
-      if (!nf || nf.size === 0) return false;
-      for (const sid of nf) {
-        const seq = statusByScenario.get(sid);
-        let resolved = false;
-        for (let k = startIdx + 1; k <= endIdx; k++) {
-          if (seq?.get(k) === "passed") {
-            resolved = true;
-            break;
-          }
-        }
-        if (!resolved) return true; // this new failure lingered under this version
-      }
-      return false;
-    };
+    // version was still deployed (shared with the Scenarios stability view).
+    const isSuspect = makeIsSuspectDeploy(statusByScenario, newlyFailedByIdx);
 
     const out: ServiceLane[] = [];
     for (const [service, byRun] of byService) {
