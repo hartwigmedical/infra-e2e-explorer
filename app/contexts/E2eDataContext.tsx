@@ -78,6 +78,27 @@ export const WINDOW_STEPS: { label: string; days: number | null }[] = [
 ];
 export const DEFAULT_WINDOW_INDEX = 0;
 
+/** localStorage key for the user's selected window preset, so the chosen data
+ *  range survives a refresh. localStorage works on the plain-HTTP prod host
+ *  (unlike OPFS/navigator.storage), and a stale value is harmless - it just
+ *  picks the window to load. */
+const WINDOW_INDEX_STORAGE_KEY = "e2e:windowIndex";
+
+/** The persisted window-preset index, clamped to a valid preset; falls back to
+ *  DEFAULT_WINDOW_INDEX when it's absent/invalid or localStorage is unavailable. */
+function readStoredWindowIndex(): number {
+  try {
+    const raw = localStorage.getItem(WINDOW_INDEX_STORAGE_KEY);
+    if (raw == null) return DEFAULT_WINDOW_INDEX;
+    const i = Number(raw);
+    return Number.isInteger(i) && i >= 0 && i < WINDOW_STEPS.length
+      ? i
+      : DEFAULT_WINDOW_INDEX;
+  } catch {
+    return DEFAULT_WINDOW_INDEX;
+  }
+}
+
 /** `since` cutoff (YYYY-MM-DD) for a given window preset. "all time" (days=null)
  *  uses a far-past date so the server's `since` path still returns everything. */
 function sinceCutoff(windowIndex: number): string {
@@ -212,7 +233,8 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
   const [dataSource, setDataSource] = useState<E2eDataSource | null>(null);
   const [runCount, setRunCount] = useState(0);
   const [totalRuns, setTotalRuns] = useState(0);
-  const [windowIndex, setWindowIndex] = useState(DEFAULT_WINDOW_INDEX);
+  // Restored from localStorage so the selected data range survives a refresh.
+  const [windowIndex, setWindowIndex] = useState(readStoredWindowIndex);
   const [loadingMore, setLoadingMore] = useState(false);
   // Bumped whenever the tables are rebuilt in place (soft load-more) so mounted
   // useE2eQuery consumers re-run without runsReady/detailsReady flipping (which
@@ -222,10 +244,21 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
 
   const startedRef = useRef(false);
   const dbRef = useRef<AsyncDuckDB | null>(null);
-  // Current window preset index (into WINDOW_STEPS). Persists across `reload()`
-  // calls so retrying doesn't silently shrink what `loadMore` had grown it to.
-  // Used to compute the `since` cutoff in both API and LOCAL mode.
-  const windowIndexRef = useRef(DEFAULT_WINDOW_INDEX);
+  // Current window preset index (into WINDOW_STEPS). Seeded from the persisted
+  // value (so the first load restores the user's range), then persists across
+  // `reload()` calls so retrying doesn't silently shrink what `loadMore` had
+  // grown it to. Used to compute the `since` cutoff in both API and LOCAL mode.
+  const windowIndexRef = useRef(windowIndex);
+
+  // Persist the selected window preset (see readStoredWindowIndex). Fires on the
+  // initial restore (a harmless no-op write) and on every loadMore widening.
+  useEffect(() => {
+    try {
+      localStorage.setItem(WINDOW_INDEX_STORAGE_KEY, String(windowIndex));
+    } catch {
+      // localStorage unavailable/full - the range just won't persist.
+    }
+  }, [windowIndex]);
 
   const runInit = useCallback(
     async (
