@@ -428,7 +428,7 @@ export default function Services() {
               {/* Left: fixed service-name column. */}
               <div className="shrink-0 border-r" style={{ width: NAME_W }}>
                 <div
-                  className="flex items-end border-b bg-muted/30 px-3 pb-1.5 text-xs font-semibold text-muted-foreground"
+                  className="flex items-end border-b bg-muted/30 px-3 pb-1.5 text-xs font-medium text-muted-foreground"
                   style={{ height: HEADER_H }}
                 >
                   Service
@@ -574,7 +574,7 @@ export default function Services() {
                   same spot on every row regardless of the counts. */}
               <div className="shrink-0 border-l" style={{ width: SUMMARY_W }}>
                 <div
-                  className="flex items-end justify-end border-b bg-muted/30 px-3 pb-1.5 text-right text-xs font-semibold text-muted-foreground"
+                  className="flex items-end justify-end border-b bg-muted/30 px-3 pb-1.5 text-right text-xs font-medium text-muted-foreground"
                   style={{ height: HEADER_H }}
                 >
                   Deploys
