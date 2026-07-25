@@ -81,39 +81,56 @@ const FLIP_KINDS: ReadonlySet<StabilityKind> = new Set([
  *  status indicator (in its new status's colour); a FLAKY change (unexplained
  *  by a deploy) gets a triangle in that same success/fail colour instead; no
  *  change is a muted dash. `statusKind` is the cell's (new) status. */
-function StabilityGlyph({
-  kind,
-  statusKind,
-}: {
-  kind: StabilityKind;
+/** A run of consecutive same-status runs for one scenario (a bar in the
+ *  stability timeline). `flip` classifies the transition INTO this run vs the
+ *  scenario's previous run ("none" for its first appearance). */
+interface StatusSegment {
+  startIdx: number;
+  runCount: number;
   statusKind: StatusKind;
-}) {
-  if (kind === "none")
-    return <span className="text-muted-foreground/40">–</span>;
-  if (kind === "flaky-regress" || kind === "flaky-recover") {
-    return (
-      <Triangle
-        size={15}
-        className={cn(
-          "translate-y-px",
-          statusKind === "failed"
-            ? "fill-red-500 text-red-500"
-            : "fill-emerald-500 text-emerald-500",
-        )}
-      />
-    );
+  flip: StabilityKind;
+  startRunId: string;
+  endRunId: string;
+}
+
+/** Collapse a scenario's per-run statuses into status-interval segments, tagging
+ *  each segment's leading transition (flip) and tallying flaky/total flips. An
+ *  absent run breaks a segment (gap); the flip compares to the previous
+ *  segment's status (i.e. the scenario's previous appearance). */
+function buildStatusSegments(
+  cells: Map<string, MatrixCell>,
+  runIds: string[],
+  runFlags: Map<string, RunDeployFlags>,
+): { segments: StatusSegment[]; flaky: number; flips: number } {
+  const segments: StatusSegment[] = [];
+  let flaky = 0;
+  let flips = 0;
+  let prevStatus: string | null = null;
+  let i = 0;
+  while (i < runIds.length) {
+    const cell = cells.get(runIds[i]);
+    if (!cell) {
+      i++;
+      continue;
+    }
+    const status = cell.status;
+    let j = i + 1;
+    while (j < runIds.length && cells.get(runIds[j])?.status === status) j++;
+    const flip = classifyStability(prevStatus, status, runFlags.get(runIds[i]));
+    if (FLIP_KINDS.has(flip)) flips++;
+    if (FLAKY_KINDS.has(flip)) flaky++;
+    segments.push({
+      startIdx: i,
+      runCount: j - i,
+      statusKind: statusKindFromScenario(status),
+      flip,
+      startRunId: runIds[i],
+      endRunId: runIds[j - 1],
+    });
+    prevStatus = status;
+    i = j;
   }
-  // Deploy-explained flip, or a skipped-involved change: the normal square,
-  // muted so the flaky triangles stand out.
-  return (
-    <StatusMark
-      kind={statusKind}
-      shape="square"
-      size={16}
-      title=""
-      className="opacity-40"
-    />
-  );
+  return { segments, flaky, flips };
 }
 
 function stabilityTip(kind: StabilityKind): string {
@@ -472,7 +489,7 @@ function ScenarioMatrix({
   metric: Metric;
   /** Per-run outcome tallies for the header popover. */
   runStats: Map<string, RunStat>;
-  /** Per-run deploy flags (by run_id), for classifying stability changes. */
+  /** Per-run deploy flags (by run_id), for classifying stability flips. */
   runFlags: Map<string, RunDeployFlags>;
   /** Active per-run filter (its header shows an underline), or null. */
   filterRunId: string | null;
@@ -496,37 +513,23 @@ function ScenarioMatrix({
   const MIN_RUN_W = metric === "duration" ? 58 : 30;
   const minTableWidth = NAME_W + SUMMARY_W + runIds.length * MIN_RUN_W;
 
-  // Per-scenario stability: classify each run's status change vs the scenario's
-  // previous appearance, and tally flaky flips / total flips for the summary.
-  // Only computed in stability mode.
+  // Stability mode: collapse each scenario's per-run statuses into status
+  // intervals (the bars) + a flaky/total-flips tally (the summary). The bars are
+  // rendered as ONE colSpan cell per row so they can span run columns while the
+  // rest of the table chrome (row height, header, groups, sticky columns) is
+  // shared with status/duration mode.
   const stabilityByScenario = useMemo(() => {
     const m = new Map<
       string,
-      { kinds: Map<string, StabilityKind>; flaky: number; flips: number }
+      { segments: StatusSegment[]; flaky: number; flips: number }
     >();
     if (metric !== "stability") return m;
-    for (const group of groups) {
-      for (const sc of group.scenarios) {
-        const kinds = new Map<string, StabilityKind>();
-        let flaky = 0;
-        let flips = 0;
-        let prev: string | null = null;
-        for (const runId of runIds) {
-          const cell = sc.cells.get(runId);
-          if (!cell) continue; // absent: keep prev at the last appearance
-          const kind = classifyStability(
-            prev,
-            cell.status,
-            runFlags.get(runId),
-          );
-          kinds.set(runId, kind);
-          if (FLIP_KINDS.has(kind)) flips++;
-          if (FLAKY_KINDS.has(kind)) flaky++;
-          prev = cell.status;
-        }
-        m.set(`${sc.feature_uri}::${sc.scenario_id}`, { kinds, flaky, flips });
-      }
-    }
+    for (const g of groups)
+      for (const sc of g.scenarios)
+        m.set(
+          `${sc.feature_uri}::${sc.scenario_id}`,
+          buildStatusSegments(sc.cells, runIds, runFlags),
+        );
     return m;
   }, [metric, groups, runIds, runFlags]);
 
@@ -664,97 +667,130 @@ function ScenarioMatrix({
                           </span>
                         </button>
                       </td>
-                      {runIds.map((runId) => {
-                        const cell = sc.cells.get(runId);
-                        // Scenario didn't run in this run: render an explicit
-                        // "no data" mark (status) / em-dash (duration) so every
-                        // column has a cell and the grid stays aligned.
-                        if (!cell) {
-                          return metric === "status" ? (
-                            <td
-                              key={runId}
-                              className="border-b p-0.5 text-center group-hover:bg-muted"
-                            >
-                              <StatusMark
-                                kind="unknown"
-                                shape="square"
-                                size={16}
-                                title="No data"
-                                className="mx-auto"
-                              />
-                            </td>
-                          ) : (
-                            <td
-                              key={runId}
-                              title="No data"
-                              className="border-b px-2 py-1 text-center text-muted-foreground group-hover:bg-muted"
-                            >
-                              —
-                            </td>
-                          );
-                        }
-                        const kind = statusKindFromScenario(cell.status);
-                        const href = `/runs/${encodeURIComponent(runId)}?scenario=${encodeURIComponent(sc.scenario_id)}`;
-                        const tip = `${sc.scenario_name}\n${runId}\n${statusLabel(kind)} · ${formatDuration(cell.duration_s)}`;
-                        if (metric === "stability") {
-                          const skind = stab?.kinds.get(runId) ?? "none";
-                          return (
-                            <td
-                              key={runId}
-                              className="border-b p-0.5 text-center group-hover:bg-muted"
-                            >
-                              <Link
-                                to={href}
-                                title={`${sc.scenario_name}\n${runId}\n${stabilityTip(skind)}`}
-                                className="mx-auto flex w-fit items-center justify-center transition-transform hover:scale-125"
+                      {metric === "stability" ? (
+                        // One cell spanning all run columns; status-interval
+                        // bars are positioned as a % of it, so they line up with
+                        // the header's run columns. A colour change is a flip; a
+                        // ▲ (centered in the flip's first column) marks a flaky one.
+                        <td
+                          colSpan={runIds.length}
+                          className="border-b p-0 align-middle group-hover:bg-muted"
+                        >
+                          <div className="relative my-1.5 h-4">
+                            {stab?.segments.map((seg) => {
+                              const flaky = FLAKY_KINDS.has(seg.flip);
+                              const span =
+                                seg.runCount === 1
+                                  ? seg.startRunId.slice(5, 10)
+                                  : `${seg.startRunId.slice(5, 10)} → ${seg.endRunId.slice(5, 10)}`;
+                              return (
+                                <div
+                                  key={seg.startIdx}
+                                  title={`${sc.scenario_name}\n${statusLabel(seg.statusKind)} · ${span}${seg.flip !== "none" ? `\n${stabilityTip(seg.flip)}` : ""}`}
+                                  className={cn(
+                                    "absolute top-0 bottom-0 rounded-sm",
+                                    statusDotClass(seg.statusKind),
+                                  )}
+                                  style={{
+                                    left: `calc(${(seg.startIdx / runIds.length) * 100}% + 1.5px)`,
+                                    width: `calc(${(seg.runCount / runIds.length) * 100}% - 3px)`,
+                                  }}
+                                >
+                                  {flaky && (
+                                    // Only the flaky marker is interactive: it
+                                    // links to the run where the flip happened.
+                                    <Link
+                                      to={`/runs/${encodeURIComponent(seg.startRunId)}?scenario=${encodeURIComponent(sc.scenario_id)}`}
+                                      title={`${stabilityTip(seg.flip)}\nopen ${seg.startRunId.slice(5, 10)}`}
+                                      className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2"
+                                      style={{
+                                        left: `${(0.5 / seg.runCount) * 100}%`,
+                                      }}
+                                    >
+                                      <Triangle
+                                        size={11}
+                                        className="fill-white text-white transition-transform hover:scale-125"
+                                      />
+                                    </Link>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </td>
+                      ) : (
+                        runIds.map((runId) => {
+                          const cell = sc.cells.get(runId);
+                          // Scenario didn't run in this run: render an explicit
+                          // "no data" mark (status) / em-dash (duration) so every
+                          // column has a cell and the grid stays aligned.
+                          if (!cell) {
+                            return metric === "status" ? (
+                              <td
+                                key={runId}
+                                className="border-b p-0.5 text-center group-hover:bg-muted"
                               >
-                                <StabilityGlyph
-                                  kind={skind}
-                                  statusKind={kind}
+                                <StatusMark
+                                  kind="unknown"
+                                  shape="square"
+                                  size={16}
+                                  title="No data"
+                                  className="mx-auto"
                                 />
-                              </Link>
-                            </td>
-                          );
-                        }
-                        if (metric === "status") {
+                              </td>
+                            ) : (
+                              <td
+                                key={runId}
+                                title="No data"
+                                className="border-b px-2 py-1 text-center text-muted-foreground group-hover:bg-muted"
+                              >
+                                —
+                              </td>
+                            );
+                          }
+                          const kind = statusKindFromScenario(cell.status);
+                          const href = `/runs/${encodeURIComponent(runId)}?scenario=${encodeURIComponent(sc.scenario_id)}`;
+                          const tip = `${sc.scenario_name}\n${runId}\n${statusLabel(kind)} · ${formatDuration(cell.duration_s)}`;
+                          if (metric === "status") {
+                            return (
+                              <td
+                                key={runId}
+                                className="border-b p-0.5 text-center group-hover:bg-muted"
+                              >
+                                <Link
+                                  to={href}
+                                  title={tip}
+                                  className="mx-auto block w-fit transition-transform hover:scale-125"
+                                >
+                                  <StatusMark
+                                    kind={kind}
+                                    shape="square"
+                                    size={16}
+                                    title=""
+                                  />
+                                </Link>
+                              </td>
+                            );
+                          }
                           return (
                             <td
                               key={runId}
-                              className="border-b p-0.5 text-center group-hover:bg-muted"
+                              className="border-b px-2 py-1 text-center group-hover:bg-muted"
                             >
                               <Link
                                 to={href}
                                 title={tip}
-                                className="mx-auto block w-fit transition-transform hover:scale-125"
+                                className={cn(
+                                  "block whitespace-nowrap font-mono tabular-nums hover:underline",
+                                  durationClass(cell.status),
+                                )}
                               >
-                                <StatusMark
-                                  kind={kind}
-                                  shape="square"
-                                  size={16}
-                                  title=""
-                                />
+                                {formatDuration(cell.duration_s)}
                               </Link>
                             </td>
                           );
-                        }
-                        return (
-                          <td
-                            key={runId}
-                            className="border-b px-2 py-1 text-center group-hover:bg-muted"
-                          >
-                            <Link
-                              to={href}
-                              title={tip}
-                              className={cn(
-                                "block whitespace-nowrap font-mono tabular-nums hover:underline",
-                                durationClass(cell.status),
-                              )}
-                            >
-                              {formatDuration(cell.duration_s)}
-                            </Link>
-                          </td>
-                        );
-                      })}
+                        })
+                      )}
                       <td className="sticky right-0 z-10 border-b border-l bg-card px-2 py-1 text-right group-hover:bg-muted">
                         {metric === "status" ? (
                           <span className="whitespace-nowrap">
@@ -2187,13 +2223,12 @@ export default function Scenarios() {
               />
               <p className="text-xs text-muted-foreground">
                 {filteredScenarios.length} scenario(s) · {runIds.length} run(s),
-                oldest → newest. Hover a run column to filter by its passed /
-                failed / skipped scenarios.
+                oldest → newest.
                 {metric === "status"
-                  ? " Summary is pass rate over runs shown."
+                  ? " Hover a run column to filter by its passed / failed / skipped scenarios. Summary is pass rate over runs shown."
                   : metric === "duration"
                     ? " Cells are per-run duration; summary is the mean ±CV over passed runs only."
-                    : " Each status change vs the previous run shows the new status as a square; a flaky change (a pass→fail with no suspect deploy, or a fail→pass with no deploy) is a triangle instead. Summary is the flaky share of flips."}
+                    : " Bars are each scenario's status held across runs; a colour change is a flip. A ▲ marks a flaky flip (a pass→fail with no suspect deploy, or a fail→pass with no deploy); summary is the flaky share of flips."}
               </p>
             </>
           )}
