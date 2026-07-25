@@ -1,5 +1,10 @@
 import { useMemo } from "react";
-import { statusKindFromScenario, statusDotClass, statusLabel, type StatusKind } from "~/lib/status";
+import {
+  statusKindFromScenario,
+  statusDotClass,
+  statusLabel,
+  type StatusKind,
+} from "~/lib/status";
 import { cn } from "~/lib/utils";
 
 /**
@@ -27,7 +32,10 @@ interface PlacedScenario extends GanttScenario {
 }
 
 /** A scenario with the numeric start/duration the timeline needs to place it. */
-type PlaceableScenario = GanttScenario & { started_ms: number; duration_s: number };
+type PlaceableScenario = GanttScenario & {
+  started_ms: number;
+  duration_s: number;
+};
 
 /** Scenarios that can actually be positioned on the timeline (finite start +
  *  duration). Shared by `computeRunTiming` (the collapsed header summary) and
@@ -61,7 +69,9 @@ export function computeRunTiming(scenarios: GanttScenario[]): RunTiming | null {
   const placeable = getPlaceable(scenarios);
   if (placeable.length < 2) return null;
   const t0 = Math.min(...placeable.map((s) => s.started_ms));
-  const tN = Math.max(...placeable.map((s) => s.started_ms + s.duration_s * 1000));
+  const tN = Math.max(
+    ...placeable.map((s) => s.started_ms + s.duration_s * 1000),
+  );
   const makespanMs = tN - t0;
   if (makespanMs <= 0) return null;
   const busyMs = placeable.reduce((sum, s) => sum + s.duration_s * 1000, 0);
@@ -114,7 +124,9 @@ function packLanes(scenarios: GanttScenario[]): {
   }
 
   const t0 = Math.min(...placeable.map((s) => s.started_ms));
-  const tN = Math.max(...placeable.map((s) => s.started_ms + s.duration_s * 1000));
+  const tN = Math.max(
+    ...placeable.map((s) => s.started_ms + s.duration_s * 1000),
+  );
   const makespanMs = Math.max(0, tN - t0);
   const busyMs = placeable.reduce((sum, s) => sum + s.duration_s * 1000, 0);
   const maxDurMs = Math.max(...placeable.map((s) => s.duration_s * 1000));
@@ -230,12 +242,17 @@ export default function RunGantt({
                       type="button"
                       onClick={() => onSelectScenario?.(p.scenario_id)}
                       title={`${p.scenario_name}\n${statusLabel(kind)} · ${formatDuration(p.duration_s ?? 0)} · starts +${formatElapsed(p.startOffMs)}${p.isLongPole ? "\nLong pole (critical path)" : ""}`}
-                      style={{ left: `${leftPct}%`, width: `${widthPct}%`, minWidth: 3 }}
+                      style={{
+                        left: `${leftPct}%`,
+                        width: `${widthPct}%`,
+                        minWidth: 3,
+                      }}
                       className={cn(
                         "absolute top-0 flex h-5 items-center overflow-hidden rounded px-1 text-left text-[10px] whitespace-nowrap text-white/95 transition-[filter] hover:brightness-110",
                         barClass(kind),
                         p.isLongPole && "ring-1 ring-foreground/40",
-                        isFocused && "outline outline-2 outline-offset-1 outline-ring",
+                        isFocused &&
+                          "outline outline-2 outline-offset-1 outline-ring",
                       )}
                     >
                       {p.scenario_name}
@@ -250,12 +267,18 @@ export default function RunGantt({
       <div className="mt-3 flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
         {(["passed", "failed", "skipped"] as StatusKind[]).map((kind) => (
           <span key={kind} className="inline-flex items-center gap-1.5">
-            <span className={cn("inline-block size-2.5 rounded-[3px]", barClass(kind))} />
+            <span
+              className={cn(
+                "inline-block size-2.5 rounded-[3px]",
+                barClass(kind),
+              )}
+            />
             {statusLabel(kind)}
           </span>
         ))}
         <span className="ml-auto tabular-nums">
-          {laneCount} lanes · {formatElapsed(busyMs)} busy
+          {laneCount} lanes · {formatElapsed(busyMs)} busy ·{" "}
+          {(busyMs / makespanMs).toFixed(1)}× parallel
           {excluded > 0 && ` · ${excluded} not shown`}
         </span>
       </div>

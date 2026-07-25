@@ -9,6 +9,7 @@ import {
 } from "react";
 import { Link, useParams, useSearchParams } from "react-router";
 import {
+  Boxes,
   Check,
   ChevronRight,
   ChevronsDownUp,
@@ -23,6 +24,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
+import { useRunScope } from "~/contexts/RunScopeContext";
 import { buildRunScenarioLogsSql } from "~/lib/e2e-views";
 import StatusBadge from "~/components/StatusBadge";
 import StatusMark from "~/components/StatusMark";
@@ -30,7 +32,11 @@ import RunGantt, {
   computeRunTiming,
   formatElapsed,
 } from "~/components/RunGantt";
-import ServiceVersions from "~/components/ServiceVersions";
+import {
+  useServiceVersions,
+  ServiceVersionsBody,
+} from "~/components/ServiceVersions";
+import RunResultBar, { HatchSwatch } from "~/components/RunResultBar";
 import Spinner from "~/components/Spinner";
 import CluecumberLink from "~/components/CluecumberLink";
 import TagFilter from "~/components/TagFilter";
@@ -39,7 +45,12 @@ import {
   statusKindFromScenario,
   statusLabel,
 } from "~/lib/status";
-import { scenarioHistoryPath, utcRunRange, utcRunRangeIso } from "~/lib/format";
+import {
+  relativeTime,
+  scenarioHistoryPath,
+  utcRunRange,
+  utcRunRangeIso,
+} from "~/lib/format";
 import {
   cn,
   copyShortcutLabel,
@@ -51,6 +62,9 @@ import { fireCelebration } from "~/lib/celebrate";
 interface RunRow {
   run_id: string;
   run_time: string | null;
+  /** Report last-modified instant (UTC ISO), for the header's relative time.
+   *  Null in older data → fall back to the run_id date + run_time. */
+  updated: string | null;
   status_token: string;
   failed_count: number | null;
   total_count: number | null;
@@ -60,6 +74,11 @@ interface RunRow {
    *  below). The window `runs` is materialized from is always anchored at
    *  "now", so it always contains the actual newest run. */
   newest_run_id: string | null;
+  /** run_id of the most recent earlier run in scope for the header's
+   *  pass/fail-ratio comparison. Respects the global nightly/all-runs setting
+   *  (nightly-only → previous nightly; all runs → immediately preceding run).
+   *  Null when no such earlier run is in the loaded window. */
+  prev_run_id: string | null;
 }
 
 interface ScenarioRow {
@@ -131,6 +150,22 @@ function formatTime(runTime: string | null | undefined): string {
   return `${runTime.slice(0, 2)}:${runTime.slice(2, 4)}`;
 }
 
+// UTC ISO instant built from the run_id's embedded date and the run_time
+// column, used as a fallback when `updated` is null so relativeTime/
+// absoluteDateTime still have something to work with (mirrors index.tsx).
+function fallbackInstant(
+  runId: string,
+  runTime: string | null | undefined,
+): string | null {
+  const datePart = runId.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(datePart)) return null;
+  const timePart =
+    runTime && runTime.length === 4
+      ? `${runTime.slice(0, 2)}:${runTime.slice(2, 4)}`
+      : "00:00";
+  return `${datePart}T${timePart}:00Z`;
+}
+
 /** Format seconds as "1.2s" (< 60s) or "1m03s" (>= 60s). */
 function formatDuration(durationS: number | null | undefined): string {
   if (durationS == null) return "—";
@@ -162,6 +197,23 @@ const STATUS_SORT_RANK: Record<string, number> = {
   skipped: 1,
   passed: 2,
 };
+
+/** Scenario statuses that can be toggled as feature-list filters (via the
+ *  result bar / legend). Order matches the legend. */
+const FILTERABLE_STATUSES = ["passed", "failed", "skipped"] as const;
+type FilterableStatus = (typeof FILTERABLE_STATUSES)[number];
+
+/** Solid dot colour per filterable status, for the legend chips. */
+const STATUS_DOT: Record<FilterableStatus, string> = {
+  passed: "bg-emerald-500",
+  failed: "bg-red-500",
+  skipped: "bg-amber-500",
+};
+
+/** Vs-previous-run change filters (from the comparison chips): scenarios that
+ *  flipped passed→failed ("new-failure") or failed→passed ("fixed"). */
+const CHANGE_FILTERS = ["new-failure", "fixed"] as const;
+type ChangeFilter = (typeof CHANGE_FILTERS)[number];
 
 // Minimum length of a consecutive SAME-status run (all passed, or all skipped)
 // before it gets collapsed into a "first … (N hidden) … last" affordance.
@@ -986,6 +1038,9 @@ export default function RunDetail() {
     loadingMore,
     loadMore,
   } = useE2eData();
+  // Global nightly/all-runs scope; governs which run counts as "previous" for
+  // the header ratio-bar comparison (see the prev_run_id subquery below).
+  const { nightlyOnly } = useRunScope();
   // Which scenarios are expanded, keyed by `${feature_uri}::${scenario_id}`.
   // A Set (rather than a single key) so several can be open at once - this is
   // purely expand/collapse state and is independent of the `?scenario=`
@@ -997,7 +1052,11 @@ export default function RunDetail() {
   // The execution-timeline Gantt is collapsed by default (the page's job is
   // browsing scenarios/steps); a compact wall-clock + parallelism toggle in
   // the run header expands it on demand. Persists across run navigation.
-  const [timelineOpen, setTimelineOpen] = useState(false);
+  // The one expandable header panel currently open (timeline or services), or
+  // null. Mutually exclusive: opening one closes the other.
+  const [headerPanel, setHeaderPanel] = useState<
+    "timeline" | "services" | null
+  >(null);
   const testIdInputRef = useRef<HTMLInputElement | null>(null);
 
   const toggleScenario = useCallback((key: string) => {
@@ -1090,7 +1149,27 @@ export default function RunDetail() {
   // Tags use repeated `?tag=` params (no delimiter to escape). `selectedTags`
   // is memoized so its array identity is stable across renders that don't
   // touch the URL - featureGroups depends on it.
-  const failuresOnly = searchParams.get("failures") === "1";
+  // Status filters for the feature list, toggled from the result bar/legend.
+  // Repeated `?status=` params (like `?tag=`); empty = show every status.
+  const selectedStatuses = useMemo(
+    () =>
+      searchParams
+        .getAll("status")
+        .filter((s): s is FilterableStatus =>
+          (FILTERABLE_STATUSES as readonly string[]).includes(s),
+        ),
+    [searchParams],
+  );
+  // Vs-previous-run change filters (repeated `?change=`); empty = no change filter.
+  const selectedChanges = useMemo(
+    () =>
+      searchParams
+        .getAll("change")
+        .filter((c): c is ChangeFilter =>
+          (CHANGE_FILTERS as readonly string[]).includes(c),
+        ),
+    [searchParams],
+  );
   const testIdQuery = searchParams.get("testId") ?? "";
   const selectedTags = useMemo(
     () => searchParams.getAll("tag"),
@@ -1111,9 +1190,28 @@ export default function RunDetail() {
     [setSearchParams],
   );
 
-  const setFailuresOnly = useCallback(
-    (on: boolean) =>
-      patchFilters((p) => (on ? p.set("failures", "1") : p.delete("failures"))),
+  const toggleStatus = useCallback(
+    (status: FilterableStatus) =>
+      patchFilters((p) => {
+        const current = p.getAll("status");
+        p.delete("status");
+        const next = current.includes(status)
+          ? current.filter((s) => s !== status)
+          : [...current, status];
+        for (const s of next) p.append("status", s);
+      }),
+    [patchFilters],
+  );
+  const toggleChange = useCallback(
+    (change: ChangeFilter) =>
+      patchFilters((p) => {
+        const current = p.getAll("change");
+        p.delete("change");
+        const next = current.includes(change)
+          ? current.filter((c) => c !== change)
+          : [...current, change];
+        for (const c of next) p.append("change", c);
+      }),
     [patchFilters],
   );
   const setTestIdQuery = useCallback(
@@ -1230,11 +1328,13 @@ export default function RunDetail() {
     error: runError,
   } = useE2eQuery<RunRow>(
     runId
-      ? `SELECT run_id, run_time, status_token, failed_count, total_count, is_nightly,
-                (SELECT max(run_id) FROM runs) AS newest_run_id
+      ? `SELECT run_id, run_time, updated, status_token, failed_count, total_count, is_nightly,
+                (SELECT max(run_id) FROM runs) AS newest_run_id,
+                (SELECT max(r2.run_id) FROM runs r2
+                   WHERE r2.run_id < runs.run_id ${nightlyOnly ? "AND r2.is_nightly" : ""}) AS prev_run_id
          FROM runs WHERE run_id = ${runIdLit}`
       : null,
-    [runId],
+    [runId, nightlyOnly],
   );
 
   const {
@@ -1259,9 +1359,30 @@ export default function RunDetail() {
     [detailsReady, runId],
   );
 
+  // Previous run of the same kind (see RunRow.prev_run_id) — just the per-
+  // scenario statuses, to diff against this run for the header ratio bar's
+  // new-failure / newly-fixed cross-hatching.
+  const prevRunId = runRows[0]?.prev_run_id ?? null;
+  const { rows: prevScenarios } = useE2eQuery<{
+    feature_uri: string;
+    scenario_id: string;
+    status: string;
+  }>(
+    detailsReady && prevRunId
+      ? `SELECT feature_uri, scenario_id, status
+         FROM scenarios WHERE run_id = ${sqlLit(prevRunId)}`
+      : null,
+    [detailsReady, prevRunId],
+  );
+
+  // Deployed service versions + diff for this run, surfaced as an expandable
+  // header panel (see the Services toggle below).
+  const svc = useServiceVersions(runId);
+  const hasServices = !svc.loading && svc.curCount > 0;
+
   // Resolve the focused scenario from the run's own scenario list (not the
-  // filtered view) so it can be exempted from "failures only"/tag filters
-  // below, and so its identity is available before scenarios finish loading.
+  // filtered view) so it can be exempted from the status/tag filters below, and
+  // so its identity is available before scenarios finish loading.
   const focusedScenario = useMemo(() => {
     if (!focusScenarioId) return null;
     return scenarios.find((s) => s.scenario_id === focusScenarioId) ?? null;
@@ -1303,7 +1424,34 @@ export default function RunDetail() {
     return counts;
   }, [scenarios]);
 
-  const totalStepCount = allSteps.length;
+  // Diff this run against the previous same-kind run, matching scenarios by
+  // (feature_uri, scenario_id) — the same identity the Scenarios matrix uses.
+  // newFailures = passed → failed (regressions), newSuccesses = failed → passed
+  // (fixes). Scenarios absent from the previous run count as neither.
+  const runComparison = useMemo(() => {
+    if (!prevRunId || prevScenarios.length === 0) return null;
+    const prevStatus = new Map<string, string>();
+    for (const p of prevScenarios) {
+      prevStatus.set(`${p.feature_uri}::${p.scenario_id}`, p.status);
+    }
+    // Scenario keys (feature_uri::scenario_id) so these can double as filters.
+    const newFailureKeys = new Set<string>();
+    const fixedKeys = new Set<string>();
+    for (const s of scenarios) {
+      const key = `${s.feature_uri}::${s.scenario_id}`;
+      const prev = prevStatus.get(key);
+      if (prev == null) continue;
+      if (s.status === "failed" && prev === "passed") newFailureKeys.add(key);
+      else if (s.status === "passed" && prev === "failed") fixedKeys.add(key);
+    }
+    return {
+      prevRunId,
+      newFailures: newFailureKeys.size,
+      newSuccesses: fixedKeys.size,
+      newFailureKeys,
+      fixedKeys,
+    };
+  }, [scenarios, prevScenarios, prevRunId]);
 
   // Wall-clock + avg-parallelism summary for the collapsed header toggle; null
   // (toggle hidden) when there aren't enough placeable scenarios to draw the
@@ -1325,14 +1473,29 @@ export default function RunDetail() {
     const filtered = scenarios.filter((s) => {
       // The scenario targeted by `?scenario=` must always render, regardless
       // of the current filters - e.g. a passed scenario opened from a green
-      // step-history cell must still show even with "Failures only" checked.
+      // step-history cell must still show even with a status filter active.
       if (
         focusedScenarioKey &&
         `${s.feature_uri}::${s.scenario_id}` === focusedScenarioKey
       )
         return true;
-      if (failuresOnly && s.status !== "failed" && s.status !== "skipped")
+      // Status filter: when any are selected, keep only those statuses.
+      if (
+        selectedStatuses.length > 0 &&
+        !selectedStatuses.includes(s.status as FilterableStatus)
+      )
         return false;
+      // Change filter (vs previous run): keep scenarios matching any selected
+      // change kind. new failures / fixes come from the comparison memo.
+      if (selectedChanges.length > 0) {
+        const key = `${s.feature_uri}::${s.scenario_id}`;
+        const matches =
+          (selectedChanges.includes("new-failure") &&
+            (runComparison?.newFailureKeys.has(key) ?? false)) ||
+          (selectedChanges.includes("fixed") &&
+            (runComparison?.fixedKeys.has(key) ?? false));
+        if (!matches) return false;
+      }
       // Union semantics: keep the scenario if it has ANY of the selected tags.
       // tag_names comes back from duckdb-wasm as a list-like value, not a plain
       // Array (see the Array.from(...) usage in ScenarioRow_ below) - wrap it
@@ -1393,7 +1556,9 @@ export default function RunDetail() {
     });
   }, [
     scenarios,
-    failuresOnly,
+    selectedStatuses,
+    selectedChanges,
+    runComparison,
     selectedTags,
     trimmedTestIdQuery,
     focusedScenarioKey,
@@ -1516,9 +1681,19 @@ export default function RunDetail() {
       <div className="rounded-lg border bg-card p-6">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h1 className="font-mono text-lg font-semibold">{run.run_id}</h1>
+            <h1 className="text-lg font-semibold" title={run.run_id}>
+              {relativeTime(
+                run.updated ?? fallbackInstant(run.run_id, run.run_time),
+              ) || run.run_id}
+            </h1>
             <p className="mt-1 text-sm text-muted-foreground">
               {formatDate(run.run_id)} at {formatTime(run.run_time)}
+              {detailsReady && (
+                <>
+                  {" · "}
+                  {scenarios.length} scenario{scenarios.length === 1 ? "" : "s"}
+                </>
+              )}
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -1532,64 +1707,177 @@ export default function RunDetail() {
           </div>
         </div>
 
-        <div className="mt-4 flex flex-wrap items-center gap-4 text-sm">
+        <div className="mt-4">
           {!detailsReady ? (
-            <span className="flex items-center gap-2 text-muted-foreground">
+            <span className="flex items-center gap-2 text-sm text-muted-foreground">
               <Spinner size={13} /> Loading scenario details…
             </span>
           ) : (
-            <>
-              <span className="inline-flex items-center gap-1.5">
-                <span className="size-1.5 rounded-full bg-emerald-500" />
-                {scenarioCounts.passed} passed
-              </span>
-              <span className="inline-flex items-center gap-1.5">
-                <span className="size-1.5 rounded-full bg-red-500" />
-                {scenarioCounts.failed} failed
-              </span>
-              <span className="inline-flex items-center gap-1.5">
-                <span className="size-1.5 rounded-full bg-amber-500" />
-                {scenarioCounts.skipped} skipped
-              </span>
-              <span className="text-muted-foreground">
-                {scenarios.length} scenario(s) · {totalStepCount} step(s)
-              </span>
-              {runTiming && (
-                <button
-                  type="button"
-                  onClick={() => setTimelineOpen((open) => !open)}
-                  aria-expanded={timelineOpen}
-                  title={
-                    timelineOpen
-                      ? "Hide execution timeline"
-                      : "Show execution timeline"
-                  }
-                  className="ml-auto inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-                >
-                  <Clock size={13} className="shrink-0" />
-                  <span className="font-medium tabular-nums text-foreground">
-                    {formatElapsed(runTiming.makespanMs)}
-                  </span>
-                  <span>wall-clock</span>
-                  <span className="text-border">·</span>
-                  <span className="font-medium tabular-nums text-foreground">
-                    {runTiming.avgParallelism.toFixed(1)}×
-                  </span>
-                  <span>parallel</span>
-                  <ChevronRight
-                    size={14}
-                    className={cn(
-                      "shrink-0 transition-transform",
-                      timelineOpen && "rotate-90",
+            <div className="space-y-3">
+              <RunResultBar
+                passed={scenarioCounts.passed}
+                failed={scenarioCounts.failed}
+                skipped={scenarioCounts.skipped}
+                newFailures={runComparison?.newFailures}
+                newSuccesses={runComparison?.newSuccesses}
+                comparedToRunId={runComparison?.prevRunId}
+                selectedStatuses={selectedStatuses}
+                onToggleStatus={toggleStatus}
+              />
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-2 text-sm">
+                {FILTERABLE_STATUSES.map((st) => {
+                  const active = selectedStatuses.includes(st);
+                  const dimmed = selectedStatuses.length > 0 && !active;
+                  return (
+                    <button
+                      key={st}
+                      type="button"
+                      onClick={() => toggleStatus(st)}
+                      aria-pressed={active}
+                      title={
+                        active
+                          ? `Stop filtering by ${st}`
+                          : `Show only ${st} scenarios`
+                      }
+                      className={cn(
+                        "inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 transition-colors",
+                        active
+                          ? "bg-muted font-medium text-foreground ring-1 ring-border ring-inset"
+                          : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+                        dimmed && "opacity-50",
+                      )}
+                    >
+                      <span
+                        className={cn("size-1.5 rounded-full", STATUS_DOT[st])}
+                      />
+                      {scenarioCounts[st]} {st}
+                    </button>
+                  );
+                })}
+
+                {runComparison &&
+                (runComparison.newFailures > 0 ||
+                  runComparison.newSuccesses > 0) ? (
+                  <span
+                    className="ml-1 inline-flex items-center gap-2"
+                    title={`Compared with previous run ${runComparison.prevRunId}`}
+                  >
+                    <span aria-hidden className="mr-1 h-4 w-px bg-border" />
+                    {runComparison.newFailures > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => toggleChange("new-failure")}
+                        aria-pressed={selectedChanges.includes("new-failure")}
+                        title={
+                          selectedChanges.includes("new-failure")
+                            ? "Stop filtering by new failures"
+                            : "Show only new failures (passed → failed)"
+                        }
+                        className={cn(
+                          "inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-red-600 transition-colors dark:text-red-400",
+                          selectedChanges.includes("new-failure")
+                            ? "bg-muted font-medium ring-1 ring-border ring-inset"
+                            : "hover:bg-muted/50",
+                          selectedChanges.length > 0 &&
+                            !selectedChanges.includes("new-failure") &&
+                            "opacity-50",
+                        )}
+                      >
+                        <HatchSwatch colorClassName="bg-red-500" />
+                        {runComparison.newFailures} new failure
+                        {runComparison.newFailures === 1 ? "" : "s"}
+                      </button>
                     )}
-                  />
-                </button>
-              )}
-            </>
+                    {runComparison.newSuccesses > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => toggleChange("fixed")}
+                        aria-pressed={selectedChanges.includes("fixed")}
+                        title={
+                          selectedChanges.includes("fixed")
+                            ? "Stop filtering by fixes"
+                            : "Show only fixes (failed → passed)"
+                        }
+                        className={cn(
+                          "inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-emerald-600 transition-colors dark:text-emerald-400",
+                          selectedChanges.includes("fixed")
+                            ? "bg-muted font-medium ring-1 ring-border ring-inset"
+                            : "hover:bg-muted/50",
+                          selectedChanges.length > 0 &&
+                            !selectedChanges.includes("fixed") &&
+                            "opacity-50",
+                        )}
+                      >
+                        <HatchSwatch colorClassName="bg-emerald-500" />
+                        {runComparison.newSuccesses} fixed
+                      </button>
+                    )}
+                  </span>
+                ) : runComparison ? (
+                  <span className="ml-1 text-xs text-muted-foreground">
+                    No pass/fail changes vs previous run
+                  </span>
+                ) : null}
+
+                {(runTiming || hasServices) && (
+                  <div className="ml-auto inline-flex items-center rounded-md border p-0.5">
+                    {runTiming && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setHeaderPanel((p) =>
+                            p === "timeline" ? null : "timeline",
+                          )
+                        }
+                        aria-pressed={headerPanel === "timeline"}
+                        title="Execution timeline"
+                        className={cn(
+                          "inline-flex items-center gap-1.5 rounded px-2.5 py-1 text-xs transition-colors",
+                          headerPanel === "timeline"
+                            ? "bg-muted text-foreground"
+                            : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+                        )}
+                      >
+                        <Clock size={13} className="shrink-0" />
+                        <span className="font-medium tabular-nums">
+                          {formatElapsed(runTiming.makespanMs)}
+                        </span>
+                      </button>
+                    )}
+                    {hasServices && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setHeaderPanel((p) =>
+                            p === "services" ? null : "services",
+                          )
+                        }
+                        aria-pressed={headerPanel === "services"}
+                        title="Deployed service versions"
+                        className={cn(
+                          "inline-flex items-center gap-1.5 rounded px-2.5 py-1 text-xs transition-colors",
+                          headerPanel === "services"
+                            ? "bg-muted text-foreground"
+                            : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+                        )}
+                      >
+                        <Boxes size={13} className="shrink-0" />
+                        Services
+                        {svc.changes.length > 0 && (
+                          <span className="rounded-full bg-amber-500/15 px-1.5 text-[11px] font-medium text-amber-600 dark:text-amber-400">
+                            {svc.changes.length} changed
+                          </span>
+                        )}
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
           )}
         </div>
 
-        {detailsReady && timelineOpen && scenarios.length > 1 && (
+        {detailsReady && headerPanel === "timeline" && scenarios.length > 1 && (
           <div className="mt-4 border-t pt-4">
             <RunGantt
               scenarios={scenarios}
@@ -1598,9 +1886,13 @@ export default function RunDetail() {
             />
           </div>
         )}
-      </div>
 
-      <ServiceVersions runId={runId} />
+        {detailsReady && headerPanel === "services" && hasServices && (
+          <div className="mt-4 border-t pt-4">
+            <ServiceVersionsBody model={svc} runId={runId} />
+          </div>
+        )}
+      </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-1.5">
@@ -1659,16 +1951,6 @@ export default function RunDetail() {
               className="w-40 rounded-md border bg-background py-1 pr-2 pl-7 text-sm outline-none focus:ring-1 focus:ring-ring"
             />
           </div>
-          <label className="flex items-center gap-2 text-sm whitespace-nowrap">
-            <input
-              type="checkbox"
-              name="failures-only"
-              checked={failuresOnly}
-              onChange={(e) => setFailuresOnly(e.target.checked)}
-              className="size-3.5 accent-red-500"
-            />
-            Failures only
-          </label>
         </div>
       </div>
 
@@ -1682,7 +1964,10 @@ export default function RunDetail() {
         </div>
       ) : featureGroups.length === 0 ? (
         <div className="rounded-lg border bg-card p-6 text-sm text-muted-foreground">
-          {failuresOnly || selectedTags.length > 0 || trimmedTestIdQuery !== ""
+          {selectedStatuses.length > 0 ||
+          selectedChanges.length > 0 ||
+          selectedTags.length > 0 ||
+          trimmedTestIdQuery !== ""
             ? "No scenarios match the current filters."
             : "No scenarios in this run."}
         </div>

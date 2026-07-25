@@ -2,7 +2,6 @@ import { useMemo, useState } from "react";
 import { Link } from "react-router";
 import {
   ArrowRight,
-  Boxes,
   ChevronRight,
   History,
   Minus,
@@ -83,16 +82,25 @@ function ChangeGlyph({ kind }: { kind: ChangeKind }) {
   );
 }
 
+export interface ServiceVersionsModel {
+  loading: boolean;
+  curRows: SvcRow[];
+  curCount: number;
+  prevRunId: string | null;
+  hasBaseline: boolean;
+  distinctBlocks: number | null;
+  nScenarios: number | null;
+  changes: { row: SvcRow; kind: ChangeKind }[];
+}
+
 /**
- * The "what was deployed for this run" panel on the run-detail page: the service
- * image versions the run executed against (parsed from the "Running services"
- * log block - see buildServiceVersionsSelectSql), plus a diff against the
- * previous run so a failure can be lined up with a deployment.
- *
- * Renders nothing when there's no version data for this run (extraction failed,
- * or an era/report without the block). Gated by the caller on `detailsReady`.
+ * Data + diff for the "what was deployed for this run" panel: the service image
+ * versions the run executed against (parsed from the "Running services" log
+ * block), plus a diff against the previous run so a failure can be lined up with
+ * a deployment. Shared by the run-detail header button (summary) and the panel
+ * body below it. `curCount === 0` means there's nothing to show.
  */
-export default function ServiceVersions({ runId }: { runId: string }) {
+export function useServiceVersions(runId: string): ServiceVersionsModel {
   const { detailsReady } = useE2eData();
   // Diff against the previous run in the SAME scope as the Services timeline
   // (RunScopeContext) - so when nightly-only is on, this run's baseline is the
@@ -101,7 +109,6 @@ export default function ServiceVersions({ runId }: { runId: string }) {
   // already picked up the deploy) while the Services page shows it changed vs the
   // prior nightly.
   const { nightlyOnly } = useRunScope();
-  const [showAll, setShowAll] = useState(false);
 
   const runIdLit = sqlLit(runId);
   const { rows, loading } = useE2eQuery<SvcRow>(
@@ -166,6 +173,7 @@ export default function ServiceVersions({ runId }: { runId: string }) {
     );
 
     return {
+      loading,
       curRows,
       curCount: curRows.length,
       prevRunId,
@@ -174,34 +182,33 @@ export default function ServiceVersions({ runId }: { runId: string }) {
       nScenarios,
       changes,
     };
-  }, [rows]);
+  }, [rows, loading]);
 
-  // Nothing to show: no current-run version data (extraction failed, or a
-  // report era without the block). Stay quiet rather than render an empty card.
-  if (loading || model.curCount === 0) return null;
+  return model;
+}
 
+/**
+ * The service-versions panel body, rendered inside the run-detail header card
+ * when the "Services" toggle is open (the surrounding card + the count/"N
+ * changed" summary live on the toggle button itself). Assumes the caller has
+ * already checked `model.curCount > 0`.
+ */
+export function ServiceVersionsBody({
+  model,
+  runId,
+}: {
+  model: ServiceVersionsModel;
+  runId: string;
+}) {
+  const [showAll, setShowAll] = useState(false);
   const { curRows, curCount, prevRunId, hasBaseline, distinctBlocks, changes } =
     model;
   const inconsistent = (distinctBlocks ?? 1) > 1;
 
   return (
-    <div className="overflow-hidden rounded-lg border bg-card">
-      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b bg-muted/30 px-4 py-2.5">
-        <h2 className="inline-flex items-center gap-2 text-sm font-medium">
-          <Boxes size={15} className="shrink-0 text-muted-foreground" />
-          Services
-          <span className="font-normal text-muted-foreground">
-            ({curCount})
-          </span>
-          <Link
-            to={`/services?run=${encodeURIComponent(runId)}`}
-            title="See this run on the Services timeline"
-            className="inline-flex items-center rounded p-1 font-normal text-muted-foreground hover:bg-muted hover:text-foreground"
-          >
-            <History size={14} />
-          </Link>
-        </h2>
-        <div className="text-xs text-muted-foreground">
+    <div className="overflow-hidden rounded-md border bg-card">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b bg-muted/30 px-4 py-2 text-xs text-muted-foreground">
+        <div>
           {!hasBaseline ? (
             "No earlier run loaded to compare against"
           ) : changes.length === 0 ? (
@@ -219,6 +226,14 @@ export default function ServiceVersions({ runId }: { runId: string }) {
             </span>
           )}
         </div>
+        <Link
+          to={`/services?run=${encodeURIComponent(runId)}`}
+          title="See this run on the Services timeline"
+          className="inline-flex items-center gap-1 rounded p-1 hover:bg-muted hover:text-foreground"
+        >
+          <History size={13} />
+          Timeline
+        </Link>
       </div>
 
       {inconsistent && (
