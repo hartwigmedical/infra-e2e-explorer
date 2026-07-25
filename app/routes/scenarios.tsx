@@ -77,13 +77,9 @@ const FLIP_KINDS: ReadonlySet<StabilityKind> = new Set([
   "explained-recover",
 ]);
 
-/** The glyph for a stability cell. A change gets the normal rounded-square
- *  status indicator (in its new status's colour); a FLAKY change (unexplained
- *  by a deploy) gets a triangle in that same success/fail colour instead; no
- *  change is a muted dash. `statusKind` is the cell's (new) status. */
-/** A run of consecutive same-status runs for one scenario (a bar in the
+/** A run of consecutive same-status runs for one scenario or step (a bar in the
  *  stability timeline). `flip` classifies the transition INTO this run vs the
- *  scenario's previous run ("none" for its first appearance). */
+ *  previous appearance ("none" for the first one). */
 interface StatusSegment {
   startIdx: number;
   runCount: number;
@@ -93,12 +89,12 @@ interface StatusSegment {
   endRunId: string;
 }
 
-/** Collapse a scenario's per-run statuses into status-interval segments, tagging
- *  each segment's leading transition (flip) and tallying flaky/total flips. An
- *  absent run breaks a segment (gap); the flip compares to the previous
- *  segment's status (i.e. the scenario's previous appearance). */
-function buildStatusSegments(
-  cells: Map<string, MatrixCell>,
+/** Collapse a per-run status sequence (a scenario's, or a single step's) into
+ *  status-interval segments, tagging each segment's leading transition (flip)
+ *  and tallying flaky/total flips. An absent run breaks a segment (gap); the
+ *  flip compares to the previous segment's status (the previous appearance). */
+function buildStatusSegments<C extends { status: string }>(
+  cells: Map<string, C>,
   runIds: string[],
   runFlags: Map<string, RunDeployFlags>,
 ): { segments: StatusSegment[]; flaky: number; flips: number } {
@@ -148,6 +144,64 @@ function stabilityTip(kind: StabilityKind): string {
     default:
       return "no change";
   }
+}
+
+/** The stability timeline for one row (a scenario, or a single step): status-
+ *  interval bars laid across `runCount` columns, each coloured by its status; a
+ *  ▲ marks a flaky flip and links to the run where it happened. `label` heads
+ *  each bar's tooltip; `linkFor(runId)` builds the flaky-flip link target. */
+function StabilityBars({
+  segments,
+  runCount,
+  label,
+  linkFor,
+}: {
+  segments: StatusSegment[];
+  runCount: number;
+  label: string;
+  linkFor: (runId: string) => string;
+}) {
+  return (
+    <div className="relative my-1.5 h-4">
+      {segments.map((seg) => {
+        const flaky = FLAKY_KINDS.has(seg.flip);
+        const span =
+          seg.runCount === 1
+            ? seg.startRunId.slice(5, 10)
+            : `${seg.startRunId.slice(5, 10)} → ${seg.endRunId.slice(5, 10)}`;
+        return (
+          <div
+            key={seg.startIdx}
+            title={`${label}\n${statusLabel(seg.statusKind)} · ${span}${seg.flip !== "none" ? `\n${stabilityTip(seg.flip)}` : ""}`}
+            className={cn(
+              "absolute top-0 bottom-0 rounded-sm",
+              statusDotClass(seg.statusKind),
+            )}
+            style={{
+              left: `calc(${(seg.startIdx / runCount) * 100}% + 1.5px)`,
+              width: `calc(${(seg.runCount / runCount) * 100}% - 3px)`,
+            }}
+          >
+            {flaky && (
+              // Only the flaky marker is interactive: it links to the run where
+              // the flip happened.
+              <Link
+                to={linkFor(seg.startRunId)}
+                title={`${stabilityTip(seg.flip)}\nopen ${seg.startRunId.slice(5, 10)}`}
+                className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2"
+                style={{ left: `${(0.5 / seg.runCount) * 100}%` }}
+              >
+                <Triangle
+                  size={11}
+                  className="fill-white text-white transition-transform hover:scale-125"
+                />
+              </Link>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 /** Per-run tally of scenario outcomes, for the column-header popover. */
@@ -668,55 +722,21 @@ function ScenarioMatrix({
                         </button>
                       </td>
                       {metric === "stability" ? (
-                        // One cell spanning all run columns; status-interval
+                        // One cell spanning all run columns; the status-interval
                         // bars are positioned as a % of it, so they line up with
-                        // the header's run columns. A colour change is a flip; a
-                        // ▲ (centered in the flip's first column) marks a flaky one.
+                        // the header's run columns.
                         <td
                           colSpan={runIds.length}
                           className="border-b p-0 align-middle group-hover:bg-muted"
                         >
-                          <div className="relative my-1.5 h-4">
-                            {stab?.segments.map((seg) => {
-                              const flaky = FLAKY_KINDS.has(seg.flip);
-                              const span =
-                                seg.runCount === 1
-                                  ? seg.startRunId.slice(5, 10)
-                                  : `${seg.startRunId.slice(5, 10)} → ${seg.endRunId.slice(5, 10)}`;
-                              return (
-                                <div
-                                  key={seg.startIdx}
-                                  title={`${sc.scenario_name}\n${statusLabel(seg.statusKind)} · ${span}${seg.flip !== "none" ? `\n${stabilityTip(seg.flip)}` : ""}`}
-                                  className={cn(
-                                    "absolute top-0 bottom-0 rounded-sm",
-                                    statusDotClass(seg.statusKind),
-                                  )}
-                                  style={{
-                                    left: `calc(${(seg.startIdx / runIds.length) * 100}% + 1.5px)`,
-                                    width: `calc(${(seg.runCount / runIds.length) * 100}% - 3px)`,
-                                  }}
-                                >
-                                  {flaky && (
-                                    // Only the flaky marker is interactive: it
-                                    // links to the run where the flip happened.
-                                    <Link
-                                      to={`/runs/${encodeURIComponent(seg.startRunId)}?scenario=${encodeURIComponent(sc.scenario_id)}`}
-                                      title={`${stabilityTip(seg.flip)}\nopen ${seg.startRunId.slice(5, 10)}`}
-                                      className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2"
-                                      style={{
-                                        left: `${(0.5 / seg.runCount) * 100}%`,
-                                      }}
-                                    >
-                                      <Triangle
-                                        size={11}
-                                        className="fill-white text-white transition-transform hover:scale-125"
-                                      />
-                                    </Link>
-                                  )}
-                                </div>
-                              );
-                            })}
-                          </div>
+                          <StabilityBars
+                            segments={stab?.segments ?? []}
+                            runCount={runIds.length}
+                            label={sc.scenario_name}
+                            linkFor={(rid) =>
+                              `/runs/${encodeURIComponent(rid)}?scenario=${encodeURIComponent(sc.scenario_id)}`
+                            }
+                          />
                         </td>
                       ) : (
                         runIds.map((runId) => {
@@ -996,6 +1016,7 @@ function StepGrid({
   stepRows,
   scenarioId,
   metric,
+  runFlags,
   hoveredRunId,
   onHoverRun,
 }: {
@@ -1003,6 +1024,9 @@ function StepGrid({
   stepRows: StepHistoryRow[];
   scenarioId: string;
   metric: Metric;
+  /** Per-run deploy flags (by run_id), for classifying each step's flips in the
+   *  stability view — the same scope-wide flags the scenario matrix uses. */
+  runFlags: Map<string, RunDeployFlags>;
   hoveredRunId: string | null;
   onHoverRun: (runId: string | null, source: "strip" | "grid") => void;
 }) {
@@ -1063,6 +1087,22 @@ function StepGrid({
   const bgHasFailure = bgRows.some((r) => r.passed < r.total);
   const [showBackground, setShowBackground] = useState(false);
 
+  // Per-step stability: classify each step's status changes across runs into
+  // interval bars + a flaky/total-flips tally, exactly like the scenario matrix
+  // (a step flip counts as flaky when the run had no suspect deploy). This
+  // surfaces churn the scenario view hides — e.g. a scenario that stays failed
+  // while the *failing step* moves is two step flips but no scenario flip.
+  const stabilityByOrdinal = useMemo(() => {
+    const m = new Map<
+      number,
+      { segments: StatusSegment[]; flaky: number; flips: number }
+    >();
+    if (metric !== "stability") return m;
+    for (const row of gridRows)
+      m.set(row.step_ordinal, buildStatusSegments(row.cells, runIds, runFlags));
+    return m;
+  }, [metric, gridRows, runIds, runFlags]);
+
   if (gridRows.length === 0) {
     return (
       <p className="text-sm text-muted-foreground">
@@ -1071,10 +1111,15 @@ function StepGrid({
     );
   }
 
-  const summaryHeader = metric === "status" ? "Pass rate" : "Avg · CV";
+  const summaryHeader =
+    metric === "status"
+      ? "Pass rate"
+      : metric === "duration"
+        ? "Avg · CV"
+        : "Flakiness";
   const STEP_W = 320;
   const SUMMARY_W = 132;
-  const MIN_RUN_W = metric === "status" ? 30 : 58;
+  const MIN_RUN_W = metric === "duration" ? 58 : 30;
   const minTableWidth = STEP_W + SUMMARY_W + runIds.length * MIN_RUN_W;
   const colCount = runIds.length + 2;
 
@@ -1089,90 +1134,105 @@ function StepGrid({
       >
         {row.step_label}
       </td>
-      {runIds.map((runId) => {
-        const cell = row.cells.get(runId);
-        const isHoveredCol = hoveredRunId === runId;
-        const hoverProps = {
-          onMouseEnter: () => onHoverRun(runId, "grid"),
-          onMouseLeave: () => onHoverRun(null, "grid"),
-        };
-        const href = `/runs/${encodeURIComponent(runId)}?scenario=${encodeURIComponent(scenarioId)}&step=${row.step_ordinal}`;
-        if (!cell) {
-          return metric === "status" ? (
-            <td
-              key={runId}
-              {...hoverProps}
-              className={cn(
-                "border-b p-0.5 text-center",
-                isHoveredCol && "bg-accent",
-              )}
-            >
-              <StatusMark
-                kind="unknown"
-                shape="square"
-                size={16}
+      {metric === "stability" ? (
+        // One cell spanning all run columns; the status-interval bars line up
+        // with the header's run columns (positioned as a % of the span).
+        <td colSpan={runIds.length} className="border-b p-0 align-middle">
+          <StabilityBars
+            segments={stabilityByOrdinal.get(row.step_ordinal)?.segments ?? []}
+            runCount={runIds.length}
+            label={row.step_label}
+            linkFor={(rid) =>
+              `/runs/${encodeURIComponent(rid)}?scenario=${encodeURIComponent(scenarioId)}&step=${row.step_ordinal}`
+            }
+          />
+        </td>
+      ) : (
+        runIds.map((runId) => {
+          const cell = row.cells.get(runId);
+          const isHoveredCol = hoveredRunId === runId;
+          const hoverProps = {
+            onMouseEnter: () => onHoverRun(runId, "grid"),
+            onMouseLeave: () => onHoverRun(null, "grid"),
+          };
+          const href = `/runs/${encodeURIComponent(runId)}?scenario=${encodeURIComponent(scenarioId)}&step=${row.step_ordinal}`;
+          if (!cell) {
+            return metric === "status" ? (
+              <td
+                key={runId}
+                {...hoverProps}
+                className={cn(
+                  "border-b p-0.5 text-center",
+                  isHoveredCol && "bg-accent",
+                )}
+              >
+                <StatusMark
+                  kind="unknown"
+                  shape="square"
+                  size={16}
+                  title="No data"
+                  className="mx-auto"
+                />
+              </td>
+            ) : (
+              <td
+                key={runId}
+                {...hoverProps}
                 title="No data"
-                className="mx-auto"
-              />
-            </td>
-          ) : (
-            <td
-              key={runId}
-              {...hoverProps}
-              title="No data"
-              className={cn(
-                "border-b px-2 py-1 text-center text-muted-foreground",
-                isHoveredCol && "bg-accent",
-              )}
-            >
-              —
-            </td>
-          );
-        }
-        const kind = statusKindFromScenario(cell.status);
-        const tip = `${row.step_label}\n${runId}\n${statusLabel(kind)} · ${formatDuration(cell.duration_s)} — open run detail`;
-        if (metric === "status") {
+                className={cn(
+                  "border-b px-2 py-1 text-center text-muted-foreground",
+                  isHoveredCol && "bg-accent",
+                )}
+              >
+                —
+              </td>
+            );
+          }
+          const kind = statusKindFromScenario(cell.status);
+          const tip = `${row.step_label}\n${runId}\n${statusLabel(kind)} · ${formatDuration(cell.duration_s)} — open run detail`;
+          if (metric === "status") {
+            return (
+              <td
+                key={runId}
+                {...hoverProps}
+                className={cn(
+                  "border-b p-0.5 text-center",
+                  isHoveredCol && "bg-accent",
+                )}
+              >
+                <Link
+                  to={href}
+                  title={tip}
+                  className="mx-auto block w-fit transition-transform hover:scale-125"
+                >
+                  <StatusMark kind={kind} shape="square" size={16} title="" />
+                </Link>
+              </td>
+            );
+          }
           return (
             <td
               key={runId}
               {...hoverProps}
               className={cn(
-                "border-b p-0.5 text-center",
+                "border-b px-2 py-1 text-center",
                 isHoveredCol && "bg-accent",
               )}
             >
               <Link
                 to={href}
                 title={tip}
-                className="mx-auto block w-fit transition-transform hover:scale-125"
+                className={cn(
+                  "block whitespace-nowrap font-mono tabular-nums hover:underline",
+                  durationClass(cell.status),
+                )}
               >
-                <StatusMark kind={kind} shape="square" size={16} title="" />
+                {formatDuration(cell.duration_s)}
               </Link>
             </td>
           );
-        }
-        return (
-          <td
-            key={runId}
-            {...hoverProps}
-            className={cn(
-              "border-b px-2 py-1 text-center",
-              isHoveredCol && "bg-accent",
-            )}
-          >
-            <Link
-              to={href}
-              title={tip}
-              className={cn(
-                "block whitespace-nowrap font-mono tabular-nums hover:underline",
-                durationClass(cell.status),
-              )}
-            >
-              {formatDuration(cell.duration_s)}
-            </Link>
-          </td>
-        );
-      })}
+        })
+      )}
       <td className="sticky right-0 z-10 border-b border-l bg-card px-2 py-1 text-right">
         {metric === "status" ? (
           <span className="whitespace-nowrap">
@@ -1183,7 +1243,7 @@ function StepGrid({
               {row.passed}/{row.total}
             </span>
           </span>
-        ) : (
+        ) : metric === "duration" ? (
           <span className="whitespace-nowrap">
             <span className="font-medium tabular-nums">
               {row.durAvg != null ? formatDuration(row.durAvg) : "—"}
@@ -1192,90 +1252,127 @@ function StepGrid({
               {row.durCv != null ? `±${Math.round(row.durCv * 100)}%` : "—"}
             </span>
           </span>
+        ) : (
+          (() => {
+            const stab = stabilityByOrdinal.get(row.step_ordinal);
+            return (stab?.flips ?? 0) === 0 ? (
+              <span
+                className="text-muted-foreground"
+                title="No pass/fail flips"
+              >
+                —
+              </span>
+            ) : (
+              <span className="whitespace-nowrap">
+                <span
+                  className={cn(
+                    "font-medium tabular-nums",
+                    stab!.flaky > 0
+                      ? "text-amber-600 dark:text-amber-400"
+                      : "text-foreground",
+                  )}
+                >
+                  {Math.round((stab!.flaky / stab!.flips) * 100)}%
+                </span>
+                <span className="ml-1 text-[10px] text-muted-foreground">
+                  {stab!.flaky}/{stab!.flips}
+                </span>
+              </span>
+            );
+          })()
         )}
       </td>
     </tr>
   );
 
   return (
-    <div className="relative z-0 overflow-x-auto rounded-lg border">
-      <table
-        className="w-full table-fixed border-separate border-spacing-0 text-xs"
-        style={{ minWidth: minTableWidth }}
-      >
-        <thead>
-          <tr>
-            <th className="sticky left-0 top-0 z-30 w-[320px] border-b border-r bg-muted px-2 py-1.5 text-left font-medium text-muted-foreground">
-              Step
-            </th>
-            {runIds.map((runId) => (
-              <th
-                key={runId}
-                title={runId}
-                onMouseEnter={() => onHoverRun(runId, "grid")}
-                onMouseLeave={() => onHoverRun(null, "grid")}
-                className={cn(
-                  "sticky top-0 z-20 border-b bg-muted py-1.5 text-center font-normal text-muted-foreground",
-                  metric === "status" ? "px-1" : "px-2",
-                  hoveredRunId === runId && "bg-accent",
-                )}
-              >
-                <span
-                  className="inline-block whitespace-nowrap text-[10px]"
-                  style={{
-                    writingMode: "vertical-rl",
-                    transform: "rotate(180deg)",
-                  }}
-                >
-                  {runId.slice(5, 10)}
-                </span>
-              </th>
-            ))}
-            <th className="sticky right-0 top-0 z-30 w-[132px] border-b border-l bg-muted px-2 py-1.5 text-right font-medium text-muted-foreground">
-              {summaryHeader}
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {bgRows.length > 0 && (
+    <>
+      <div className="relative z-0 overflow-x-auto rounded-lg border">
+        <table
+          className="w-full table-fixed border-separate border-spacing-0 text-xs"
+          style={{ minWidth: minTableWidth }}
+        >
+          <thead>
             <tr>
-              <td colSpan={colCount} className="border-b bg-card p-0">
-                <button
-                  type="button"
-                  onClick={() => setShowBackground((v) => !v)}
-                  title={
-                    showBackground
-                      ? "Hide background steps"
-                      : "Show background steps"
-                  }
+              <th className="sticky left-0 top-0 z-30 w-[320px] border-b border-r bg-muted px-2 py-1.5 text-left font-medium text-muted-foreground">
+                Step
+              </th>
+              {runIds.map((runId) => (
+                <th
+                  key={runId}
+                  title={runId}
+                  onMouseEnter={() => onHoverRun(runId, "grid")}
+                  onMouseLeave={() => onHoverRun(null, "grid")}
                   className={cn(
-                    "flex w-full items-center gap-2 px-2 py-1 text-left text-[11px] hover:bg-muted/40",
-                    bgHasFailure
-                      ? "text-red-600 dark:text-red-400"
-                      : "text-muted-foreground hover:text-foreground",
+                    "sticky top-0 z-20 border-b bg-muted py-1.5 text-center font-normal text-muted-foreground",
+                    metric === "status" ? "px-1" : "px-2",
+                    hoveredRunId === runId && "bg-accent",
                   )}
                 >
-                  <ChevronRight
-                    size={12}
-                    className={cn(
-                      "shrink-0 transition-transform",
-                      showBackground && "rotate-90",
-                    )}
-                  />
-                  <span>
-                    {showBackground ? "Hide" : "Show"} {bgRows.length}{" "}
-                    background step{bgRows.length === 1 ? "" : "s"}
-                    {bgHasFailure ? " · contains a failure" : ""}
+                  <span
+                    className="inline-block whitespace-nowrap text-[10px]"
+                    style={{
+                      writingMode: "vertical-rl",
+                      transform: "rotate(180deg)",
+                    }}
+                  >
+                    {runId.slice(5, 10)}
                   </span>
-                </button>
-              </td>
+                </th>
+              ))}
+              <th className="sticky right-0 top-0 z-30 w-[132px] border-b border-l bg-muted px-2 py-1.5 text-right font-medium text-muted-foreground">
+                {summaryHeader}
+              </th>
             </tr>
-          )}
-          {showBackground && bgRows.map(renderRow)}
-          {bodyRows.map(renderRow)}
-        </tbody>
-      </table>
-    </div>
+          </thead>
+          <tbody>
+            {bgRows.length > 0 && (
+              <tr>
+                <td colSpan={colCount} className="border-b bg-card p-0">
+                  <button
+                    type="button"
+                    onClick={() => setShowBackground((v) => !v)}
+                    title={
+                      showBackground
+                        ? "Hide background steps"
+                        : "Show background steps"
+                    }
+                    className={cn(
+                      "flex w-full items-center gap-2 px-2 py-1 text-left text-[11px] hover:bg-muted/40",
+                      bgHasFailure
+                        ? "text-red-600 dark:text-red-400"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    <ChevronRight
+                      size={12}
+                      className={cn(
+                        "shrink-0 transition-transform",
+                        showBackground && "rotate-90",
+                      )}
+                    />
+                    <span>
+                      {showBackground ? "Hide" : "Show"} {bgRows.length}{" "}
+                      background step{bgRows.length === 1 ? "" : "s"}
+                      {bgHasFailure ? " · contains a failure" : ""}
+                    </span>
+                  </button>
+                </td>
+              </tr>
+            )}
+            {showBackground && bgRows.map(renderRow)}
+            {bodyRows.map(renderRow)}
+          </tbody>
+        </table>
+      </div>
+      {metric === "stability" && (
+        <p className="mt-2 text-xs text-muted-foreground">
+          Bars are each step&apos;s status held across runs; a colour change is
+          a flip. A ▲ marks a flaky flip (a pass→fail with no suspect deploy, or
+          a fail→pass with no deploy); summary is the flaky share of flips.
+        </p>
+      )}
+    </>
   );
 }
 
@@ -1502,6 +1599,7 @@ function ScenarioDetailPanel({
   tags,
   metric,
   setMetric,
+  runFlags,
   hoveredRunId,
   hoverSource,
   onHoverRun,
@@ -1511,6 +1609,8 @@ function ScenarioDetailPanel({
   tags: string[];
   metric: Metric;
   setMetric: (m: Metric) => void;
+  /** Per-run deploy flags (by run_id) for the step grid's stability view. */
+  runFlags: Map<string, RunDeployFlags>;
   hoveredRunId: string | null;
   hoverSource: "strip" | "grid" | null;
   onHoverRun: (runId: string | null, source: "strip" | "grid") => void;
@@ -1664,7 +1764,7 @@ function ScenarioDetailPanel({
             Step history ({runIds.length} run{runIds.length === 1 ? "" : "s"})
           </h3>
           <div className="inline-flex rounded-md border p-0.5 text-sm">
-            {(["status", "duration"] as Metric[]).map((m) => (
+            {(["status", "duration", "stability"] as Metric[]).map((m) => (
               <button
                 key={m}
                 type="button"
@@ -1691,6 +1791,7 @@ function ScenarioDetailPanel({
             stepRows={stepRows}
             scenarioId={selected.scenario_id}
             metric={metric}
+            runFlags={runFlags}
             hoveredRunId={hoveredRunId}
             onHoverRun={onHoverRun}
           />
@@ -1810,32 +1911,32 @@ export default function Scenarios() {
   const wantsSelection =
     decodedFeatureUri !== null && decodedScenarioId !== null;
 
+  // The matrix cells feed the matrix view, and — under the stability metric —
+  // the scope-wide per-run deploy flags the step grid also needs, so they're
+  // still loaded in the detail view when stability is active.
+  const needsScopeStability = metric === "stability";
   const matrixSql = useMemo(() => buildMatrixSql(nightlyOnly), [nightlyOnly]);
   const {
     rows: matrixRows,
     loading: matrixLoading,
     error: matrixError,
   } = useE2eQuery<MatrixCellRow>(
-    detailsReady && !wantsSelection ? matrixSql : null,
-    [detailsReady, matrixSql, wantsSelection],
+    detailsReady && (!wantsSelection || needsScopeStability) ? matrixSql : null,
+    [detailsReady, matrixSql, wantsSelection, needsScopeStability],
   );
 
   // Service versions in scope — loaded only when the stability metric needs
-  // them (to derive per-run deploy flags).
+  // them (to derive per-run deploy flags), in both the matrix and detail views.
   const versionsSql = useMemo(
     () =>
-      metric === "stability" ? buildServiceVersionsScopeSql(nightlyOnly) : null,
-    [metric, nightlyOnly],
+      needsScopeStability ? buildServiceVersionsScopeSql(nightlyOnly) : null,
+    [needsScopeStability, nightlyOnly],
   );
   const { rows: versionRows } = useE2eQuery<{
     run_id: string;
     service: string;
     spec: string | null;
-  }>(detailsReady && !wantsSelection ? versionsSql : null, [
-    detailsReady,
-    wantsSelection,
-    versionsSql,
-  ]);
+  }>(detailsReady ? versionsSql : null, [detailsReady, versionsSql]);
 
   // Resolved independently of the matrix's nightly/search/tag filters (no join
   // against `runs`), so a deep-linked scenario stays selected even when those
@@ -2116,10 +2217,9 @@ export default function Scenarios() {
             selected={selected}
             nightlyOnly={nightlyOnly}
             tags={selectedTagsList}
-            /* Stability is scenario-level (matrix only); the step grid falls
-               back to status. */
-            metric={metric === "stability" ? "status" : metric}
+            metric={metric}
             setMetric={setMetric}
+            runFlags={runFlagsByRunId}
             hoveredRunId={hoveredRunId}
             hoverSource={hoverSource}
             onHoverRun={handleHoverRun}
