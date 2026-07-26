@@ -206,6 +206,8 @@ carries only that bundle, the static client, and a minimal install of the one ex
 it doesn't ship the ~250 MB of client-only libraries (duckdb-wasm, react, lucide, …) that the
 server never uses. It runs on `node:24-alpine` **as the non-root `node` user** (~240 MB image).
 
+Quick local smoke test (no push):
+
 ```bash
 docker build -f Dockerfile.server -t e2e-explorer .
 docker run -p 3001:3001 -e PORT=3001 e2e-explorer
@@ -214,10 +216,81 @@ docker run -p 3001:3001 -e PORT=3001 e2e-explorer
 In production, mount/attach credentials via workload identity (Cloud Run/GKE) rather than a key
 file — the server never expects one.
 
-A `cloudbuild.yaml` mirroring middle-layer's is included (image
-`europe-west4-docker.pkg.dev/hmf-build/hmf-docker/e2e-explorer`), but its `serviceAccount:` is a
-placeholder copied from middle-layer's — **TODO**: create/verify the equivalent Cloud Build
-service account for this repo before relying on it; it hasn't been run.
+### Shipping a local build to Artifact Registry
+
+The registry image is `europe-west4-docker.pkg.dev/hmf-build/hmf-docker/e2e-explorer` (Artifact
+Registry, `europe-west4`). Everything is compiled inside the Dockerfile (`npm ci && npm run build
+&& npm run build:server`), so you don't need a local `npm` build first — just run these from the
+repo root.
+
+1. **Authenticate once per machine** (Docker → Artifact Registry, plus your gcloud login):
+
+   ```bash
+   gcloud auth login                                        # if not already logged in
+   gcloud auth configure-docker europe-west4-docker.pkg.dev # one-time Docker credential helper
+   ```
+
+2. **Bump the version** if this is a new release, so you don't overwrite an existing tag. Use
+   `npm version` rather than editing `package.json` by hand — it updates the lockfile and creates a
+   matching `vX.Y.Z` git tag (which is also what the Cloud Build path keys off). It refuses to run
+   with a dirty tree, so commit or stash first:
+
+   ```bash
+   npm version patch   # 0.4.5 -> 0.4.6  (minor/major for features/breaking; or pass an exact version)
+   ```
+
+3. **Set the image and tag.** Tag with the `package.json` version so the pushed tag matches the
+   release:
+
+   ```bash
+   IMAGE=europe-west4-docker.pkg.dev/hmf-build/hmf-docker/e2e-explorer
+   TAG=$(node -p "require('./package.json').version")   # e.g. 0.4.6
+   ```
+
+4. **Build.** Pass `SHORT_SHA` for provenance. On Apple silicon add `--platform linux/amd64` so the
+   image matches the amd64 runtime:
+
+   ```bash
+   docker build -f Dockerfile.server \
+     --platform linux/amd64 \
+     --build-arg SHORT_SHA=$(git rev-parse --short HEAD) \
+     -t $IMAGE:$TAG -t $IMAGE:latest .
+   ```
+
+5. **Smoke-test the built image** before pushing:
+
+   ```bash
+   docker run --rm -p 3001:3001 -e PORT=3001 $IMAGE:$TAG
+   # open http://localhost:3001 — Ctrl-C to stop
+   ```
+
+6. **Push both tags:**
+
+   ```bash
+   docker push $IMAGE:$TAG
+   docker push $IMAGE:latest
+   ```
+
+7. **Verify the push landed:**
+
+   ```bash
+   gcloud artifacts docker tags list $IMAGE --project=hmf-build
+   ```
+
+### Cloud Build (CI alternative)
+
+A `cloudbuild.yaml` mirroring middle-layer's is included (same image). It bumps the version to
+`$TAG_NAME`, then builds and pushes. Trigger it manually with:
+
+```bash
+gcloud builds submit --config=cloudbuild.yaml \
+  --substitutions=TAG_NAME=$(node -p "require('./package.json').version"),SHORT_SHA=$(git rev-parse --short HEAD) \
+  --project=hmf-build
+```
+
+⚠️ Its `serviceAccount:` is a placeholder copied from middle-layer's — **TODO**: create/verify the
+equivalent Cloud Build service account for this repo before relying on it; it hasn't been run. The
+local flow above sidesteps that.
 
 ## Not done yet (deferred)
 
