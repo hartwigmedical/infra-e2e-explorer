@@ -117,17 +117,33 @@ so the cache should be durable in GCS and/or warmed at startup.
   JSON, so exposing `/runs/:runId.json` (or `Accept`-header negotiation) from the
   same loader is near-zero cost. Optionally an `/llms.txt` index.
 
-### Phase 4 — Pre-warm the cache (the speed payoff)
-- Repurpose `scripts/sync-reports.mjs` into a startup + periodic warmer for the
-  default (7-day) and common windows. Consider streaming/deferred loaders so a
-  fast query paints while a slow one resolves. Doubly important now — a cold
-  cache hurts both humans and ingestion clients.
+### Phase 4 — Pre-warm the cache (the speed payoff) — ✅ DONE (startup + interval)
+- `server/data/warm.ts`: warms the configured windows (default: the 7-day
+  landing window, `E2E_WARM_WINDOWS`) once at startup and every
+  `E2E_WARM_INTERVAL_MS` (default 5 min) so the slim cache + materialized tables
+  stay hot and loaders hit the ~200 ms warm path.
+- Kicked off from `getStore()` and touched at `data.server` module load, so it
+  runs in the loaders' module graph (shares the store singleton) — at prod
+  startup and on the first dev request. Verified: `[warm] window 0: N runs ready
+  in ~190 ms`, then fast requests; browser hydration still clean.
+- **Deferred:** streaming/deferred loaders, and a durable GCS `cache/` mirror so
+  a fresh Cloud Run instance starts warm instead of re-extracting from the
+  bucket (the current warm cache is per-instance local disk, lost on scale-to-
+  zero).
 
 ### Phase 5 — Measure & ship
 - Baseline vs. after: TTFB, LCP/Lighthouse, JS bytes shipped, warm/cold loader
   timings.
 - Dockerfile: new base image, native duckdb external, Cloud Run memory sizing
   (native DuckDB + Parquet cache needs headroom).
+- **Add a real browser hydration check to the acceptance tests.** The `curl`
+  smoke tests only assert the *server* HTML; they cannot catch a broken client
+  (e.g. the dev `504 Outdated Optimize Dep` that left pages rendered but
+  un-hydrated — fast loads, dead buttons). Every route must be opened in a
+  browser with (a) a clean console and (b) one real interaction that requires an
+  attached handler (a metric toggle / expand / search), in BOTH dev and a
+  production build. This gap let a hydration regression ship past the smoke
+  tests once already.
 
 ## Phase 0 results
 

@@ -20,3 +20,10 @@ export async function ensureWindow(windowIndex: number) {
 export function query<T = Record<string, unknown>>(sql: string): Promise<T[]> {
   return getStore().query<T>(sql);
 }
+
+// Touch the store at module load so background warming (see warm.ts) starts as
+// early as possible: at server startup in prod (this module is in the RR server
+// build's static import graph, evaluated when the server boots), and on the
+// first request in dev (Vite loads it lazily). Errors are handled inside the
+// warmer; this call only constructs the singleton.
+getStore();

@@ -32,6 +32,7 @@ import {
 import { query as duckQuery, run as duckRun } from "./engine.ts";
 import { SlimCache } from "./slim-cache.ts";
 import { createReportSource, type ReportSource } from "./sources.ts";
+import { startWarming } from "./warm.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -185,6 +186,11 @@ export class E2eStore {
 /** Process-wide store (one materialized DuckDB shared across requests). */
 let storeSingleton: E2eStore | null = null;
 export function getStore(): E2eStore {
-  if (!storeSingleton) storeSingleton = new E2eStore();
+  if (!storeSingleton) {
+    storeSingleton = new E2eStore();
+    // Kick off background warming from here so it shares THIS singleton (see
+    // warm.ts for why the module graph matters).
+    startWarming(storeSingleton);
+  }
   return storeSingleton;
 }
