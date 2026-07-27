@@ -12,7 +12,6 @@ import {
   useFetcher,
   useLoaderData,
   useParams,
-  useRouteLoaderData,
   useSearchParams,
 } from "react-router";
 import {
@@ -31,10 +30,8 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import type { Route } from "./+types/runs.$runId";
-import type { ShellData } from "~/layout";
 import { useRunScope } from "~/contexts/RunScopeContext";
-import { ensureWindow, query } from "~/lib/data.server";
-import { windowIndexFromRequest, WINDOW_PARAM } from "~/lib/window";
+import { ensureData, query } from "~/lib/data.server";
 import StatusBadge from "~/components/StatusBadge";
 import StatusMark from "~/components/StatusMark";
 import RunGantt, {
@@ -104,8 +101,8 @@ interface ScenarioStatusRow {
  *  the current window. The nightly/all-runs toggle picks between the two scopes
  *  client-side, so both are fetched. Returns run:null when the run isn't in the
  *  window (the component then offers to widen it). */
-export async function loader({ request, params }: Route.LoaderArgs) {
-  await ensureWindow(windowIndexFromRequest(request));
+export async function loader({ params }: Route.LoaderArgs) {
+  await ensureData();
   const runId = params.runId ?? "";
   const runIdLit = sqlLit(runId);
 
@@ -142,8 +139,10 @@ export async function loader({ request, params }: Route.LoaderArgs) {
          FROM scenarios WHERE run_id = ${runIdLit}`,
       ),
       query<StepRow>(
+        // Steps come from the v_steps VIEW (slim Parquet, read on demand), not a
+        // materialized table - see server/data/store.ts.
         `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status, duration_s, has_error, error_message, is_background, glue_location
-         FROM steps WHERE run_id = ${runIdLit} ORDER BY scenario_id, step_ordinal`,
+         FROM v_steps WHERE run_id = ${runIdLit} ORDER BY scenario_id, step_ordinal`,
       ),
       run.prev_all_run_id
         ? query<ScenarioStatusRow>(statusesSql(run.prev_all_run_id)!)
@@ -1105,10 +1104,6 @@ export default function RunDetail() {
   const requestedRunId = rawRunId ? decodeURIComponent(rawRunId) : "";
   const runId = run?.run_id ?? requestedRunId;
 
-  // Window facts for the "run predates the window" prompt come from the shell
-  // loader (see app/layout.tsx).
-  const shell = useRouteLoaderData("layout") as ShellData | undefined;
-
   // Global nightly/all-runs scope; picks which precomputed baseline (previous
   // run / previous nightly) the header ratio-bar and service diff compare to.
   const { nightlyOnly } = useRunScope();
@@ -1188,12 +1183,7 @@ export default function RunDetail() {
     // Fetch once per run, on first open (one request covers all scenarios).
     if (willOpen && logsRunIdRef.current !== runId) {
       logsRunIdRef.current = runId;
-      const w = new URLSearchParams(
-        typeof window !== "undefined" ? window.location.search : "",
-      ).get(WINDOW_PARAM);
-      logsFetcher.load(
-        `/runs/${encodeURIComponent(runId)}/logs${w ? `?${WINDOW_PARAM}=${w}` : ""}`,
-      );
+      logsFetcher.load(`/runs/${encodeURIComponent(runId)}/logs`);
     }
   }
 
@@ -1648,35 +1638,14 @@ export default function RunDetail() {
   }, [run, runId]);
 
   if (!run) {
-    // Absent simply because it predates the loaded window (the tables are
-    // materialized for the current `?w=` range). Offer to widen the window
-    // before concluding it doesn't exist; only at the widest preset is it
-    // truly "not found".
-    const nextLabel = shell?.nextWindowLabel ?? null;
-    const nextWindow = (shell?.windowIndex ?? 0) + 1;
+    // The server holds every run, so an absent run genuinely doesn't exist
+    // (bad id / typo / deleted folder).
     return (
       <div className="mx-auto max-w-4xl space-y-4 p-6">
         <div className="rounded-lg border bg-card p-6">
-          {nextLabel ? (
-            <>
-              <p className="text-sm text-muted-foreground">
-                Run <span className="font-mono">{requestedRunId}</span> isn't in
-                the loaded data. It may be older than the current{" "}
-                <span className="font-medium">{shell?.windowLabel}</span> window.
-              </p>
-              <Link
-                to={`?${WINDOW_PARAM}=${nextWindow}`}
-                preventScrollReset
-                className="mt-3 inline-flex items-center justify-center gap-2 rounded-md border bg-card px-3 py-1.5 text-sm font-medium hover:bg-muted/50"
-              >
-                Load {nextLabel}
-              </Link>
-            </>
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              Run <span className="font-mono">{requestedRunId}</span> not found.
-            </p>
-          )}
+          <p className="text-sm text-muted-foreground">
+            Run <span className="font-mono">{requestedRunId}</span> not found.
+          </p>
         </div>
       </div>
     );

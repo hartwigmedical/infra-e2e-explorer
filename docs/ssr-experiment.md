@@ -234,6 +234,40 @@ Still blocked / pending (needs your environment):
 - **Cloud Run deploy + real A/B** (TTFB / LCP / warm-vs-cold on real hardware).
 - Cloud Run memory sizing for native DuckDB + the Parquet cache.
 
+## Follow-up: windowless, all-runs model
+
+With the server in place the client "window" (`?w=` presets) was vestigial — it
+only ever existed to bound the SPA's per-browser cache. Replaced it with:
+
+- **The store holds ALL runs** (`ensure()`, no `since`), refreshed on a short TTL
+  + the warmer. No window presets, no `?w=`, no `load more`.
+- **`steps` is not materialized** — it's ~90% of the rows and only needed one
+  run (run detail) or one scenario (step history) at a time. It stays the
+  `v_steps` VIEW over the slim Parquet and is read on demand, so resident memory
+  is ~0.1 MB/run instead of ~1 MB/run (measured; see `scripts/measure-footprint.ts`).
+  Resident tables: `runs`, `scenarios`, `test_ids`, `service_versions`.
+- **Nightly/all-runs** stays a shallow client-side filter over the loaded data
+  (`RunScopeContext`); the header control is now just that toggle + the loaded
+  range/sparkline.
+- **View scope ≠ cache.** The wide views (scenarios matrix, services timeline)
+  render one column per run, so they bound columns to the most recent `?runs=N`
+  (default 60) with a "show all" link — a UI/payload bound, not a data window
+  (`app/lib/view.ts`). Dashboard is a full recent-first list; run detail is one
+  run.
+- **On disk vs memory:** the slim Parquet cache stays (parse-once, durable,
+  serves steps/logs on demand). Dropping it would force re-parsing every raw
+  report on each cold start — the reason it's not "in-memory only".
+
+Measured footprint (60 local runs): DuckDB tables 58.5 MiB *with* steps, of which
+steps are ~93% of the rows; slim cache 118 KB/run. Bucket is "hundreds" of runs,
+so resident memory is a non-issue; steps-on-demand future-proofs the append-only
+growth. Verified in a browser (prod build): dashboard, matrix, services, run
+detail (steps via `v_steps`), and scenario step-history (cross-run `v_steps`)
+all render with clean consoles and working interactions.
+
+Still open: the recent-N default is fixed at 60 (could be smarter); the GCS
+`cache/` mirror for warm Cloud Run cold starts remains deferred.
+
 ## Guardrails
 
 - All work on the `ssr-experiment` branch; `main`'s SPA stays live for A/B.

@@ -17,8 +17,8 @@ import {
 } from "lucide-react";
 import type { Route } from "./+types/scenarios";
 import { useRunScope } from "~/contexts/RunScopeContext";
-import { ensureWindow, query } from "~/lib/data.server";
-import { windowIndexFromRequest } from "~/lib/window";
+import { ensureData, query } from "~/lib/data.server";
+import { recentRunsFromRequest, RUNS_PARAM } from "~/lib/view";
 import StatusMark from "~/components/StatusMark";
 import TagFilter from "~/components/TagFilter";
 import {
@@ -362,28 +362,32 @@ function formatDurShort(s: number): string {
   return m ? `${h}h${m}m` : `${h}h`;
 }
 
-/**
- * Every (scenario, run) cell in the window. The nightly/all-runs scope is
- * applied CLIENT-SIDE (it governs both which runs become columns and which
- * cells count), like search/tag/failed filters, so the loader fetches every run
- * and carries `is_nightly` per cell.
- */
-const MATRIX_SQL = `
+/** The matrix renders one COLUMN per run, so it's bounded to the most recent N
+ *  runs (a UI/payload bound - the server holds all runs). The nightly/all-runs
+ *  scope is then applied CLIENT-SIDE over those (like search/tag/failed
+ *  filters), so each cell carries `is_nightly`. */
+const recentCte = (n: number) =>
+  `SELECT run_id FROM runs ORDER BY run_id DESC LIMIT ${n}`;
+
+const matrixSql = (n: number) => `
     SELECT s.feature_uri, s.feature_name, s.scenario_id, s.scenario_name, s.tag_names,
            s.run_id, s.status, s.duration_s, r.is_nightly
     FROM scenarios s
     JOIN runs r USING (run_id)
+    WHERE s.run_id IN (${recentCte(n)})
     ORDER BY s.feature_name, s.scenario_name, s.run_id
   `;
 
-/** (run, service, spec) in the window — feeds the run-level deploy flags the
- *  stability view uses to tell flaky changes from deploy-caused ones. */
-const SERVICE_VERSIONS_SCOPE_SQL = `
+/** (run, service, spec) over the same recent-N runs — feeds the run-level
+ *  deploy flags the stability view uses to tell flaky changes from deploys. */
+const serviceVersionsScopeSql = (n: number) => `
     SELECT sv.run_id, sv.service, sv.spec
     FROM service_versions sv
-    JOIN runs r USING (run_id)
+    WHERE sv.run_id IN (${recentCte(n)})
   `;
 
+// Scenario detail history spans every run the scenario appears in (a single
+// scrollable row), so it's not column-bounded.
 function buildHistorySql(featureUri: string, scenarioId: string): string {
   return `
     SELECT s.run_id, s.status, s.duration_s, r.is_nightly
@@ -394,10 +398,12 @@ function buildHistorySql(featureUri: string, scenarioId: string): string {
   `;
 }
 
+// Steps come from the v_steps VIEW (read from the slim Parquet on demand), not a
+// materialized table - see server/data/store.ts.
 function buildStepHistorySql(featureUri: string, scenarioId: string): string {
   return `
     SELECT st.run_id, st.step_ordinal, st.step_label, st.status, st.duration_s, st.has_error, st.error_message, st.is_background, r.is_nightly
-    FROM steps st
+    FROM v_steps st
     JOIN runs r USING (run_id)
     WHERE st.feature_uri = ${sqlLit(featureUri)} AND st.scenario_id = ${sqlLit(scenarioId)}
     ORDER BY st.run_id, st.step_ordinal
@@ -431,20 +437,24 @@ function buildScenarioIdentitySql(
  * fetched for the whole window.
  */
 export async function loader({ request }: Route.LoaderArgs) {
-  await ensureWindow(windowIndexFromRequest(request));
+  await ensureData();
   const url = new URL(request.url);
   const feature = safeDecodeURIComponent(url.searchParams.get("feature"));
   const scenario = safeDecodeURIComponent(url.searchParams.get("scenario"));
   const wantsSelection = feature !== null && scenario !== null;
   const needsStability = url.searchParams.get("metric") === "stability";
+  const recentRuns = recentRunsFromRequest(request);
 
   const matrix =
     !wantsSelection || needsStability
-      ? await query<MatrixCellRow>(MATRIX_SQL)
+      ? await query<MatrixCellRow>(matrixSql(recentRuns))
       : null;
   const versions = needsStability
-    ? await query<VersionScopeRow>(SERVICE_VERSIONS_SCOPE_SQL)
+    ? await query<VersionScopeRow>(serviceVersionsScopeSql(recentRuns))
     : null;
+  const [{ total: totalRuns }] = await query<{ total: number }>(
+    "SELECT count(*) AS total FROM runs",
+  );
 
   let identity: ScenarioIdentityRow[] | null = null;
   let history: HistoryRow[] | null = null;
@@ -457,7 +467,7 @@ export async function loader({ request }: Route.LoaderArgs) {
     ]);
   }
 
-  return { matrix, versions, identity, history, steps };
+  return { matrix, versions, identity, history, steps, recentRuns, totalRuns };
 }
 
 function formatRunDateTime(runId: string): string {
@@ -1742,6 +1752,8 @@ export default function Scenarios() {
     identity,
     history: rawHistory,
     steps: rawSteps,
+    recentRuns,
+    totalRuns,
   } = useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
 
@@ -2213,6 +2225,20 @@ export default function Scenarios() {
               <p className="text-xs text-muted-foreground">
                 {filteredScenarios.length} scenario(s) · {runIds.length} run(s),
                 oldest → newest.
+                {totalRuns > recentRuns && (
+                  <>
+                    {" "}
+                    Showing the {recentRuns} most recent;{" "}
+                    <Link
+                      to={`?${RUNS_PARAM}=${totalRuns}`}
+                      preventScrollReset
+                      className="underline decoration-dotted underline-offset-2 hover:text-foreground"
+                    >
+                      show all {totalRuns}
+                    </Link>
+                    .
+                  </>
+                )}
                 {metric === "status"
                   ? " Hover a run column to filter by its passed / failed / skipped scenarios. Summary is pass rate over runs shown."
                   : metric === "duration"

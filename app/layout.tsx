@@ -3,22 +3,16 @@ import type { Route } from "./+types/layout";
 import { RunScopeProvider } from "~/contexts/RunScopeContext";
 import DateRangeControl from "~/components/DateRangeControl";
 import { cn } from "~/lib/utils";
-import { ensureWindow, query } from "~/lib/data.server";
-import {
-  windowIndexFromRequest,
-  windowLabel as labelForWindow,
-  nextWindowLabel as nextLabelForWindow,
-} from "~/lib/window";
+import { ensureData, query } from "~/lib/data.server";
 
 /**
- * Shell loader: resolves the current window (from `?w=`) server-side and returns
- * the facts the header needs (label, range, daily density, run count). Runs for
- * every route, so the header always has data without a client round-trip. The
+ * Shell loader: the server holds the full dataset, so this just reports the
+ * loaded-run range + daily density + total count for the header. Runs for every
+ * route, so the header always has data without a client round-trip. The
  * nightly/all-runs scope stays a client view preference (see RunScopeContext).
  */
-export async function loader({ request }: Route.LoaderArgs) {
-  const windowIndex = windowIndexFromRequest(request);
-  const state = await ensureWindow(windowIndex);
+export async function loader() {
+  const state = await ensureData();
 
   const [range] = await query<{ oldest: string | null; newest: string | null }>(
     "SELECT min(run_id) AS oldest, max(run_id) AS newest FROM runs",
@@ -28,9 +22,6 @@ export async function loader({ request }: Route.LoaderArgs) {
   );
 
   return {
-    windowIndex,
-    windowLabel: labelForWindow(windowIndex),
-    nextWindowLabel: nextLabelForWindow(windowIndex),
     runCount: state.runCount,
     range: range ?? { oldest: null, newest: null },
     daily,

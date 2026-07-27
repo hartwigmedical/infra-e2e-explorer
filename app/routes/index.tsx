@@ -1,10 +1,8 @@
 import { useState } from "react";
 import { Link, useLoaderData } from "react-router";
 import { EyeOff, X } from "lucide-react";
-import type { Route } from "./+types/index";
 import { useRunScope } from "~/contexts/RunScopeContext";
-import { ensureWindow, query } from "~/lib/data.server";
-import { windowIndexFromRequest } from "~/lib/window";
+import { ensureData, query } from "~/lib/data.server";
 import StatusBadge from "~/components/StatusBadge";
 import Sparkline from "~/components/Sparkline";
 import CluecumberLink from "~/components/CluecumberLink";
@@ -44,10 +42,11 @@ const SCENARIO_COUNTS_SQL = `
   GROUP BY run_id
 `;
 
-/** Load the window's runs + per-run scenario counts server-side, so the table
- *  and trend arrive as real HTML (no client DuckDB, no waterfall). */
-export async function loader({ request }: Route.LoaderArgs) {
-  await ensureWindow(windowIndexFromRequest(request));
+/** Load all runs + per-run scenario counts server-side, so the table and trend
+ *  arrive as real HTML (no client DuckDB, no waterfall). The list is newest-
+ *  first; the nightly/all scope is applied client-side. */
+export async function loader() {
+  await ensureData();
   const [runs, counts] = await Promise.all([
     query<RunRow>(RUNS_SQL),
     query<ScenarioCountRow>(SCENARIO_COUNTS_SQL),

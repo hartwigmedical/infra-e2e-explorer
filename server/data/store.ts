@@ -1,21 +1,22 @@
 /**
- * E2e data store for the server-side data layer (SSR experiment, Phase 1).
+ * E2e data store for the server-side data layer.
  *
- * The server-side replacement for app/contexts/E2eDataContext.tsx: it resolves a
- * window's run list, ensures each run's slim Parquet (slim-cache.ts), and
- * materializes the analytical tables the app queries - runs / scenarios / steps /
- * test_ids / service_versions - over the slim data. Route loaders then run plain
- * SQL against those tables via `query()`.
+ * Holds the FULL dataset (no window): it lists every run, ensures each run's
+ * slim Parquet (slim-cache.ts), and materializes the lightweight analytical
+ * tables the app queries broadly - runs / scenarios / test_ids /
+ * service_versions - over the slim data. Route loaders run plain SQL against
+ * those via `query()`.
  *
- * All SQL comes from app/lib/e2e-views.ts (the same builders the SPA uses), so
- * there is ONE source of truth for the schema and the analysis. The key
- * simplification vs. the WASM path: native DuckDB has real memory, so there is
- * no two-stage "runs-ready then details-ready" split and no wasm-OOM
- * scenarios-only fallback - the full materialization always runs.
+ * `steps` is deliberately NOT materialized: it's ~90% of the rows and is only
+ * needed one-run (run detail) or one-scenario (step history) at a time, so it's
+ * left as the `v_steps` VIEW over the slim Parquet and read on demand. That
+ * keeps the resident footprint small (~0.1 MB/run) as the append-only bucket
+ * grows.
  *
- * `refresh(since)` rebuilds the tables for the requested window (mirroring the
- * SPA's per-window materialization). It's serialized so concurrent SSR requests
- * asking for the same/overlapping window don't rebuild on top of each other.
+ * All SQL comes from app/lib/e2e-views.ts (one source of truth). `ensure()`
+ * (re)builds the tables over ALL runs, serialized so overlapping SSR requests
+ * don't race, and reused within a short TTL so bursts don't rebuild. The warmer
+ * re-runs it periodically to pick up new runs (see warm.ts).
  */
 
 import { writeFile, mkdir } from "node:fs/promises";
@@ -36,26 +37,25 @@ import { startWarming } from "./warm.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
-export interface WindowState {
-  since: string;
-  /** Runs materialized into the tables (i.e. within the window). */
+/** `since` that includes every run (run ids start with a 4-digit year). */
+const ALL_SINCE = "0000-01-01";
+
+export interface StoreState {
+  /** Number of runs materialized (i.e. the whole dataset). */
   runCount: number;
 }
 
 export class E2eStore {
   private cache: SlimCache;
   private workDir: string;
-  /** Serializes refreshes so overlapping SSR requests don't race the rebuild. */
-  private refreshChain: Promise<WindowState> = Promise.resolve({
-    since: "",
-    runCount: 0,
-  });
-  private current: WindowState | null = null;
+  /** Serializes rebuilds so overlapping SSR requests don't race. */
+  private chain: Promise<StoreState> = Promise.resolve({ runCount: 0 });
+  private current: StoreState | null = null;
   /** When `current` was last materialized (epoch ms); 0 = never. */
   private materializedAt = 0;
-  /** How long a materialized window is reused before a rebuild picks up new
-   *  runs. Short, like the server's run-list cache - the bucket is append-only. */
-  private readonly windowTtlMs = 60_000;
+  /** How long a materialization is reused before a rebuild picks up new runs.
+   *  Short, like the old run-list cache - the bucket is append-only. */
+  private readonly refreshTtlMs = 60_000;
 
   constructor(
     private source: ReportSource = createReportSource(),
@@ -67,51 +67,41 @@ export class E2eStore {
     this.workDir = workDir;
   }
 
-  /** The window currently materialized into the tables, if any. */
-  get window(): WindowState | null {
+  /** The materialized dataset, if any. */
+  get state(): StoreState | null {
     return this.current;
   }
 
   /**
-   * Rebuild runs/scenarios/steps/test_ids/service_versions for `since` (a
-   * YYYY-MM-DD cutoff; runs with run_id[:10] >= since are included). Returns the
-   * materialized window. Serialized via refreshChain.
+   * Ensure the full dataset is materialized, reusing it within refreshTtlMs.
+   * Concurrent loaders in one SSR request (layout + route) both call this;
+   * because the freshness check runs inside the serialized chain, only the first
+   * rebuilds and the rest are no-ops. Pass `force` to bypass the TTL (the warmer
+   * uses this to pick up new runs on its own cadence).
    */
-  refresh(since: string): Promise<WindowState> {
-    this.refreshChain = this.refreshChain
-      .catch(() => ({ since: "", runCount: 0 }) as WindowState)
-      .then(() => this.doRefresh(since));
-    return this.refreshChain;
-  }
-
-  /**
-   * Ensure `since`'s window is materialized, reusing it when it's the current
-   * window and still fresh (within windowTtlMs). Concurrent loaders in one SSR
-   * request (layout + route) both call this; because the check runs inside the
-   * serialized chain, only the first rebuilds and the rest are no-ops.
-   */
-  ensureWindow(since: string): Promise<WindowState> {
-    this.refreshChain = this.refreshChain
-      .catch(() => ({ since: "", runCount: 0 }) as WindowState)
+  ensure(force = false): Promise<StoreState> {
+    this.chain = this.chain
+      .catch(() => ({ runCount: 0 }) as StoreState)
       .then(() => {
         if (
-          this.current?.since === since &&
-          Date.now() - this.materializedAt < this.windowTtlMs
+          !force &&
+          this.current &&
+          Date.now() - this.materializedAt < this.refreshTtlMs
         ) {
           return this.current;
         }
-        return this.doRefresh(since);
+        return this.rebuild();
       });
-    return this.refreshChain;
+    return this.chain;
   }
 
-  private async doRefresh(since: string): Promise<WindowState> {
+  private async rebuild(): Promise<StoreState> {
     await mkdir(this.workDir, { recursive: true });
 
-    const runs = await this.source.listRuns(since);
+    const runs = await this.source.listRuns(ALL_SINCE);
 
-    // v_runs: reuse the exact run-list SQL (date/status/nightly parsing) by
-    // writing the window's run list to a JSON file read_json can consume.
+    // v_runs: reuse the run-list SQL (date/status/nightly parsing) by writing
+    // the run list to a JSON file read_json can consume.
     const runsJsonPath = path.join(this.workDir, "runs.json");
     await writeFile(
       runsJsonPath,
@@ -127,11 +117,11 @@ export class E2eStore {
     await duckRun(buildRunsViewSql(runsJsonPath));
     await duckRun(`CREATE OR REPLACE TABLE runs AS SELECT * FROM v_runs;`);
 
-    // Slim Parquet for the whole window (cached; only new runs pay to extract).
+    // Slim Parquet for every run (cached; only new runs pay to extract).
     const slimPaths = await this.cache.ensureMany(runs);
 
-    // v_features over the window's slim files. With none, write a typed
-    // zero-row placeholder so the views/tables still exist with the right schema.
+    // v_features over all slim files. With none, write a typed zero-row
+    // placeholder so the views/tables still exist with the right schema.
     let featureFiles = slimPaths;
     if (featureFiles.length === 0) {
       const placeholder = path.join(this.workDir, "slim_empty.parquet");
@@ -141,6 +131,8 @@ export class E2eStore {
       featureFiles = [placeholder];
     }
     await duckRun(buildFeaturesViewSql(featureFiles));
+    // Creates the v_scenarios + v_steps VIEWS. v_steps is queried on demand for
+    // run-detail steps and scenario step-history - we never materialize it.
     await duckRun(buildScenariosStepsViewsSql());
 
     // test_ids: one cheap pass over the slim data.
@@ -148,23 +140,13 @@ export class E2eStore {
       `CREATE OR REPLACE TABLE test_ids AS ${buildTestIdsSelectSql()};`,
     );
 
-    // scenarios + steps: the full materialization (no wasm-OOM fallback needed).
+    // scenarios: one row per (run, scenario) with its test_id, minus the heavy
+    // steps list (that stays in v_steps). Small enough to hold for all runs.
     await duckRun(`
-      CREATE OR REPLACE TABLE scenarios_raw AS SELECT * FROM v_scenarios;
-      CREATE OR REPLACE TABLE steps AS
-        SELECT sc.run_id, sc.feature_uri, sc.scenario_id, sc.scenario_name,
-          trim(s.keyword)||' '||s.name AS step_label, s.name AS step_name, trim(s.keyword) AS step_keyword,
-          row_number() OVER (PARTITION BY sc.run_id, sc.scenario_id ORDER BY s.line) AS step_ordinal,
-          s.is_background AS is_background,
-          s.result.status AS status, s.result.duration/1e9 AS duration_s,
-          (s.result.error_message IS NOT NULL) AS has_error,
-          left(s.result.error_message, 2000) AS error_message, s.match.location AS glue_location
-        FROM scenarios_raw sc, UNNEST(sc.steps) AS t(s);
       CREATE OR REPLACE TABLE scenarios AS
         SELECT sr.* EXCLUDE (steps), ti.test_id
-        FROM scenarios_raw sr
+        FROM v_scenarios sr
         LEFT JOIN test_ids ti USING (run_id, scenario_id);
-      DROP TABLE scenarios_raw;
     `);
 
     // service_versions: analysis over the stored logs.
@@ -172,12 +154,12 @@ export class E2eStore {
       `CREATE OR REPLACE TABLE service_versions AS ${buildServiceVersionsSelectSql()};`,
     );
 
-    this.current = { since, runCount: runs.length };
+    this.current = { runCount: runs.length };
     this.materializedAt = Date.now();
     return this.current;
   }
 
-  /** Run a SELECT against the materialized tables. */
+  /** Run a SELECT against the materialized tables / views. */
   query<T = Record<string, unknown>>(sql: string): Promise<T[]> {
     return duckQuery<T>(sql);
   }

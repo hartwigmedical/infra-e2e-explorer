@@ -3,8 +3,8 @@ import { Link, useLoaderData, useSearchParams } from "react-router";
 import { Boxes, TriangleAlert } from "lucide-react";
 import type { Route } from "./+types/services";
 import { useRunScope } from "~/contexts/RunScopeContext";
-import { ensureWindow, query } from "~/lib/data.server";
-import { windowIndexFromRequest } from "~/lib/window";
+import { ensureData, query } from "~/lib/data.server";
+import { recentRunsFromRequest, RUNS_PARAM } from "~/lib/view";
 import StatusMark from "~/components/StatusMark";
 import { statusKindFromRunToken } from "~/lib/status";
 import { makeIsSuspectDeploy } from "~/lib/deployments";
@@ -51,31 +51,41 @@ const STATUS_H = 28;
 const HEADER_H = DATE_H + STATUS_H;
 const LANE_H = 40;
 
-// All (run, service) versions, scenario outcomes, and run metadata for the
-// window. The nightly/all-runs scope is applied CLIENT-SIDE (it's a view
-// preference, see RunScopeContext) by filtering which runs become columns -
-// matching the dashboard. So the loader fetches every run in the window.
-const VERSIONS_SQL = `
+// The timeline renders one COLUMN per run, so it's bounded to the most recent
+// `?runs=N` runs (a UI/payload bound, not a data window - the server holds all
+// runs). The nightly/all-runs scope is then applied CLIENT-SIDE over those (a
+// view preference, see RunScopeContext), matching the dashboard.
+const recentCte = (n: number) =>
+  `SELECT run_id FROM runs ORDER BY run_id DESC LIMIT ${n}`;
+
+const versionsSql = (n: number) => `
   SELECT sv.run_id, sv.service, sv.spec, sv.version, sv.pipeline_version
   FROM service_versions sv
-  JOIN runs r USING (run_id)
+  WHERE sv.run_id IN (${recentCte(n)})
   ORDER BY sv.run_id, sv.service`;
 
-const SCENARIO_STATUS_SQL = `
-  SELECT sc.run_id, sc.scenario_id, sc.status FROM scenarios sc`;
+const scenarioStatusSql = (n: number) => `
+  SELECT sc.run_id, sc.scenario_id, sc.status
+  FROM scenarios sc
+  WHERE sc.run_id IN (${recentCte(n)})`;
 
-const RUN_META_SQL = `
-  SELECT run_id, status_token, failed_count, total_count, is_nightly FROM runs`;
+const metaSql = (n: number) => `
+  SELECT run_id, status_token, failed_count, total_count, is_nightly
+  FROM runs
+  ORDER BY run_id DESC LIMIT ${n}`;
 
-/** Load service versions + scenario outcomes + run metadata for the window. */
+/** Load service versions + scenario outcomes + run metadata for the most recent
+ *  N runs (columns bound; nightly scope applied client-side). */
 export async function loader({ request }: Route.LoaderArgs) {
-  await ensureWindow(windowIndexFromRequest(request));
-  const [versions, scenarios, meta] = await Promise.all([
-    query<VersionRow>(VERSIONS_SQL),
-    query<ScenarioStatusRow>(SCENARIO_STATUS_SQL),
-    query<RunMetaRow>(RUN_META_SQL),
+  await ensureData();
+  const recentRuns = recentRunsFromRequest(request);
+  const [versions, scenarios, meta, totals] = await Promise.all([
+    query<VersionRow>(versionsSql(recentRuns)),
+    query<ScenarioStatusRow>(scenarioStatusSql(recentRuns)),
+    query<RunMetaRow>(metaSql(recentRuns)),
+    query<{ total: number }>("SELECT count(*) AS total FROM runs"),
   ]);
-  return { versions, scenarios, meta };
+  return { versions, scenarios, meta, recentRuns, totalRuns: totals[0].total };
 }
 
 /** "07-18" — the month-day of a run_id, matching the scenarios grid's labels. */
@@ -146,6 +156,8 @@ export default function Services() {
     versions: versionRows,
     scenarios: scenarioRows,
     meta: metaRows,
+    recentRuns,
+    totalRuns,
   } = useLoaderData<typeof loader>();
   const { nightlyOnly } = useRunScope();
   const [showUnchanged, setShowUnchanged] = useState(false);
@@ -394,17 +406,29 @@ export default function Services() {
             that version is no longer a suspect.
           </p>
         </div>
-        {changedCount < lanes.length && (
-          <button
-            type="button"
-            onClick={() => setShowUnchanged((v) => !v)}
-            className="rounded-md border px-2.5 py-1.5 text-sm text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-          >
-            {showUnchanged
-              ? `Hide unchanged (${lanes.length - changedCount})`
-              : `Show unchanged (${lanes.length - changedCount})`}
-          </button>
-        )}
+        <div className="flex items-center gap-2">
+          {totalRuns > recentRuns && (
+            <Link
+              to={`?${RUNS_PARAM}=${totalRuns}`}
+              preventScrollReset
+              className="rounded-md border px-2.5 py-1.5 text-sm text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+              title={`Showing the ${recentRuns} most recent runs`}
+            >
+              Show all {totalRuns} runs
+            </Link>
+          )}
+          {changedCount < lanes.length && (
+            <button
+              type="button"
+              onClick={() => setShowUnchanged((v) => !v)}
+              className="rounded-md border px-2.5 py-1.5 text-sm text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+            >
+              {showUnchanged
+                ? `Hide unchanged (${lanes.length - changedCount})`
+                : `Show unchanged (${lanes.length - changedCount})`}
+            </button>
+          )}
+        </div>
       </div>
 
       {runIds.length === 0 || visibleLanes.length === 0 ? (

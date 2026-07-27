@@ -1,16 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  useNavigation,
-  useRouteLoaderData,
-  useSearchParams,
-} from "react-router";
+import { useRouteLoaderData } from "react-router";
 import { CalendarRange, ChevronDown } from "lucide-react";
 import { eachDayOfInterval, format } from "date-fns";
 import { useRunScope } from "~/contexts/RunScopeContext";
-import Spinner from "~/components/Spinner";
 import Sparkline from "~/components/Sparkline";
 import { cn } from "~/lib/utils";
-import { WINDOW_PARAM } from "~/lib/window";
 import type { ShellData } from "~/layout";
 
 /** Parse a "YYYY-MM-DD" string into a local-midnight Date via its y/m/d parts
@@ -27,7 +21,7 @@ function parseYMD(value: string | null | undefined): Date | null {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-/** "YYYY-MM-DD" for a local-midnight Date, matching the day keys in the loader. */
+/** "YYYY-MM-DD" for a local-midnight Date, matching the loader's day keys. */
 function toDayKey(date: Date): string {
   return format(date, "yyyy-MM-dd");
 }
@@ -47,22 +41,20 @@ function formatRange(oldest: Date | null, newest: Date | null): string {
 }
 
 /**
- * Shared date-range control (top-right on every page). The button shows the
- * current rolling-window preset (from `?w=`); clicking it opens a popover with
- * the loaded date range, a runs/day sparkline, and a "Load more" button that
- * widens the window by bumping `?w=` - the server loaders re-run for the wider
- * window. All data comes from the shell loader (see app/layout.tsx); the
- * nightly/all-runs scope is a client view preference (see RunScopeContext).
+ * Shared run-scope control (top-right on every page). The server holds ALL runs,
+ * so there's no window to pick any more - the only choice here is the
+ * nightly/all-runs view scope (a client preference, see RunScopeContext). The
+ * popover also shows the full loaded date range + a runs/day sparkline for
+ * context. All data comes from the shell loader (see app/layout.tsx).
+ *
+ * Dependency-free popover: a relatively-positioned wrapper, an absolutely-
+ * positioned panel below it, closed on click-outside or Escape.
  */
 export default function DateRangeControl() {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
   const shell = useRouteLoaderData("layout") as ShellData | undefined;
-  const [searchParams, setSearchParams] = useSearchParams();
-  const navigation = useNavigation();
-
-  // Global nightly/all-runs scope, shared across pages (see RunScopeContext).
   const { nightlyOnly, setNightlyOnly } = useRunScope();
 
   useEffect(() => {
@@ -81,11 +73,7 @@ export default function DateRangeControl() {
     };
   }, [open]);
 
-  const windowLabel = shell?.windowLabel ?? "…";
-  const nextWindowLabel = shell?.nextWindowLabel ?? null;
   const runCount = shell?.runCount ?? 0;
-  const windowIndex = shell?.windowIndex ?? 0;
-
   const oldest = parseYMD(shell?.range.oldest);
   const newest = parseYMD(shell?.range.newest);
   const rangeLabel = formatRange(oldest, newest);
@@ -100,21 +88,6 @@ export default function DateRangeControl() {
     return days.map((d) => countByDay.get(toDayKey(d)) ?? 0);
   }, [oldest, newest, shell?.daily]);
 
-  const canLoadMore = nextWindowLabel != null;
-  const loadingMore =
-    navigation.state !== "idle" &&
-    navigation.location?.search.includes(`${WINDOW_PARAM}=`) === true;
-
-  const loadMore = () => {
-    setSearchParams(
-      (prev) => {
-        prev.set(WINDOW_PARAM, String(windowIndex + 1));
-        return prev;
-      },
-      { preventScrollReset: true },
-    );
-  };
-
   return (
     <div ref={ref} className={cn("relative")}>
       <button
@@ -122,13 +95,13 @@ export default function DateRangeControl() {
         onClick={() => setOpen((o) => !o)}
         className={cn(
           "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground",
-          open && "border-primary/40 bg-accent"
+          open && "border-primary/40 bg-accent",
         )}
       >
         <CalendarRange className="size-4 opacity-70" />
-        <span className="font-medium">{windowLabel}</span>
-        <span className="text-muted-foreground/40">|</span>
-        <span className="font-medium">{nightlyOnly ? "Nightly runs" : "All runs"}</span>
+        <span className="font-medium">
+          {nightlyOnly ? "Nightly runs" : "All runs"}
+        </span>
         <ChevronDown className="size-3.5 opacity-60" />
       </button>
       {open && (
@@ -148,7 +121,7 @@ export default function DateRangeControl() {
                     "flex-1 rounded px-2 py-1 transition-colors",
                     nightlyOnly === opt.on
                       ? "bg-accent font-medium text-accent-foreground"
-                      : "text-muted-foreground hover:text-foreground"
+                      : "text-muted-foreground hover:text-foreground",
                   )}
                 >
                   {opt.label}
@@ -178,24 +151,6 @@ export default function DateRangeControl() {
             ) : (
               <div className="flex h-8 items-center text-xs text-muted-foreground">
                 Not enough data for a trend yet.
-              </div>
-            )}
-          </div>
-
-          <div className="border-t pt-2">
-            {canLoadMore ? (
-              <button
-                type="button"
-                onClick={loadMore}
-                disabled={loadingMore}
-                className="inline-flex w-full items-center justify-center gap-2 rounded-md border bg-card px-3 py-1.5 text-sm font-medium hover:bg-muted/50 disabled:opacity-60"
-              >
-                {loadingMore && <Spinner size={13} />}
-                {loadingMore ? "Loading…" : `Load ${nextWindowLabel}`}
-              </button>
-            ) : (
-              <div className="text-center text-xs text-muted-foreground">
-                All data loaded
               </div>
             )}
           </div>
