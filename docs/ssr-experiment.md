@@ -65,16 +65,20 @@ so the cache should be durable in GCS and/or warmed at startup.
   and its platform-matched optional dep (`@duckdb/node-bindings-*`) must be
   installed in the runtime image.
 
-### Phase 1 — Server data layer (no UI change)
-- Port `app/lib/e2e-views.ts` SQL + the STAGE 1/2 extraction logic out of
-  `E2eDataContext` into `server/data/*`, using native DuckDB.
-- Back it with an on-disk slim-Parquet cache (keyed by `run_id`, versioned by
-  `SCHEMA_VERSION`); optional GCS `cache/` mirror so Cloud Run instances share
-  warmth.
-- Server reads reports directly from the bucket — **signed URLs for data go
-  away**; keep signing only for the external Cluecumber HTML links.
-- Parity-test: same runs → same rows as the WASM path. The wasm-OOM fallback
-  disappears (native has real memory).
+### Phase 1 — Server data layer (no UI change) — ✅ DONE
+- Ported `app/lib/e2e-views.ts` SQL + the STAGE 1/2 extraction logic into
+  `server/data/*` on native DuckDB (see "Phase 1 results"). The SQL is imported
+  from `e2e-views.ts`, not copied — one source of truth.
+- Backed by an on-disk slim-Parquet cache keyed by `run_id` under a
+  `SCHEMA_VERSION` dir, with a size_bytes/source sidecar for re-upload detection.
+  (GCS `cache/` mirror still TODO — Phase 4.)
+- `GcsReportSource` reads the bucket directly (downloads to a temp file); no
+  signed URLs for data. Signing stays only for the external Cluecumber links.
+- The wasm-OOM fallback is gone (native has real memory) — the full
+  scenarios+steps materialization always runs.
+- **Not yet done:** the GCS path is implemented but untested here (no creds in
+  this env); parity is asserted structurally (see results), not diffed row-for-row
+  against a captured WASM run.
 
 ### Phase 2 — Turn on SSR
 - `react-router.config.ts` → `ssr: true`; wire `@react-router/express`
@@ -138,6 +142,26 @@ Ran `scripts/spike-native-duckdb.ts` (imports the real SQL builders from
 Net: both risks cleared; Phase 1 can proceed. (The `@duckdb/node-api` devDep and
 `scripts/spike-native-duckdb.ts` are the throwaway spike — keep until Phase 1
 promotes the engine to a real dependency, then remove the script.)
+
+## Phase 1 results
+
+`server/data/`: `engine.ts` (native DuckDB singleton + BigInt-safe row
+normalizer), `sources.ts` (LOCAL + GCS report sources), `slim-cache.ts`
+(on-disk slim Parquet, extract-on-miss, atomic rename + sidecar), `store.ts`
+(`refresh(since)` → materialize runs/scenarios/steps/test_ids/service_versions,
+`query<T>()`). `@duckdb/node-api` promoted to a runtime dependency.
+
+`scripts/phase1-smoke.ts` over the 60 local synthetic runs (offline):
+
+- **Cold** refresh (extract every run): 60 runs / ~688 ms (~11 ms/run) →
+  1801 scenarios, 68 765 steps, 3438 service-version rows.
+- **Warm** refresh (all slim Parquet cached): 60 runs / ~238 ms.
+- **Parity clean:** every run whose id encodes `failed-N-of-M` has computed
+  failed-scenario count == N (15 such runs, 0 mismatch); every run's scenarios
+  agree on the services block (`distinct_blocks = 1` throughout).
+
+Typecheck (`npm run typecheck`) passes. The Phase 0 spike script was removed —
+`phase1-smoke.ts` supersedes it.
 
 ## Guardrails
 

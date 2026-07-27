@@ -6,3 +6,5 @@ public/data
 .DS_Store
 .idea
 .vscode
+
+.cache
