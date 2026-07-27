@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import {
   isRouteErrorResponse,
   Links,
@@ -9,6 +10,39 @@ import {
 import type { Route } from "./+types/root";
 import { Toaster } from "sonner";
 import "./app.css";
+
+// The SPA era cached slim Parquet per-browser in this IndexedDB database; the
+// SSR version doesn't use IndexedDB at all (the cache is server-side now), so a
+// returning user's browser would otherwise keep this (potentially tens of MB)
+// orphaned forever. Delete it once per browser (see useLegacyCacheCleanup).
+const LEGACY_CACHE_DB = "e2e-explorer-report-cache";
+const LEGACY_CACHE_CLEARED_KEY = "e2e:legacyCacheCleared";
+
+/** Best-effort, once-per-browser teardown of the orphaned SPA-era IndexedDB
+ *  cache. Client-only (runs in an effect); a localStorage flag stops it from
+ *  re-attempting on every load. */
+function useLegacyCacheCleanup() {
+  useEffect(() => {
+    try {
+      if (typeof indexedDB === "undefined") return;
+      if (localStorage.getItem(LEGACY_CACHE_CLEARED_KEY) === "1") return;
+      const req = indexedDB.deleteDatabase(LEGACY_CACHE_DB);
+      // Mark done on terminal outcomes only. On "blocked" (another tab still
+      // holds it open) leave the flag unset so a later load retries.
+      const markDone = () => {
+        try {
+          localStorage.setItem(LEGACY_CACHE_CLEARED_KEY, "1");
+        } catch {
+          // localStorage unavailable — we'll just try again next load.
+        }
+      };
+      req.onsuccess = markDone;
+      req.onerror = markDone;
+    } catch {
+      // indexedDB/localStorage unavailable — nothing to clean up.
+    }
+  }, []);
+}
 
 export function Layout({ children }: { children: React.ReactNode }) {
   return (
@@ -36,6 +70,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
 }
 
 export default function App() {
+  useLegacyCacheCleanup();
   return <Outlet />;
 }
 
