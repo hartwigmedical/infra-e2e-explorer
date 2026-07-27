@@ -203,6 +203,37 @@ Typecheck (`npm run typecheck`) passes. The Phase 0 spike script was removed —
   fingerprinted asset with a 200 + `text/javascript`.
 - **Not validated here:** the Docker image build and Cloud Run deploy (Phase 5).
 
+## Phase 5 results (local; deploy + measurement on real hw still pending)
+
+Done headlessly:
+- **Prod entrypoint verified.** `node build/index.mjs` (the exact Docker CMD)
+  boots `Mode: production (SSR)`, warms window 0 (~140 ms), and serves every
+  route + the logs resource route (all 200). Note the build is two steps:
+  `react-router build` (client+server) **then** `npm run build:server` (the
+  esbuild shim `build/index.mjs`) — the first wipes `build/`, so run both (the
+  Dockerfile does).
+- **Browser hydration acceptance pass** (production build, all routes): clean
+  console + a handler-dependent interaction each — dashboard (date-range
+  popover, nightly↔all re-filter 2→4 runs), scenarios (metric toggle), services
+  (show/hide unchanged), run detail (expand scenario → steps/log controls).
+- **Caught + fixed a hydration mismatch (React #418):** `RunScopeContext` read
+  `localStorage` during render, so the client's first render (stored "all runs")
+  diverged from the server default (nightly) — masked, since React silently
+  re-rendered. Now defaults on both sides and adopts the stored value in an
+  effect. Also killed the `/favicon.ico` 404 with an inline icon. This is
+  exactly the class of bug `curl` can't see (see the Phase 5 note above).
+- **Bundle measurement (both production builds):** client JS **205 KB → 154 KB
+  gzip (~25% less)**; the SPA's largest chunk was duckdb-wasm (64 KB gzip), now
+  gone. The delta understates the real first-load win: the SPA additionally
+  fetched the multi-MB DuckDB **WASM binary** (CDN) and every run's report JSON
+  at runtime — all eliminated.
+
+Still blocked / pending (needs your environment):
+- **Docker image build** — the local Docker daemon isn't running, so the alpine
+  + musl-native-duckdb image is unbuilt/unvalidated.
+- **Cloud Run deploy + real A/B** (TTFB / LCP / warm-vs-cold on real hardware).
+- Cloud Run memory sizing for native DuckDB + the Parquet cache.
+
 ## Guardrails
 
 - All work on the `ssr-experiment` branch; `main`'s SPA stays live for A/B.

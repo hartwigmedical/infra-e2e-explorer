@@ -2,6 +2,7 @@ import {
   createContext,
   useContext,
   useEffect,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -38,9 +39,24 @@ function readStoredNightlyOnly(): boolean {
  *  route Outlet so it persists as the user moves between pages, and to
  *  localStorage so it also survives a refresh. */
 export function RunScopeProvider({ children }: { children: ReactNode }) {
-  const [nightlyOnly, setNightlyOnly] = useState(readStoredNightlyOnly);
+  // Start from the SSR default (nightly-only) on BOTH server and the first
+  // client render, then adopt the persisted value in an effect. Reading
+  // localStorage during render would make the first client render diverge from
+  // the server HTML → a hydration mismatch (React error #418). The stored value
+  // is applied right after mount, re-filtering in place.
+  const [nightlyOnly, setNightlyOnly] = useState(true);
+  // Skip persisting until we've read the stored value, so the initial default
+  // doesn't clobber a stored "all runs" before the effect below restores it.
+  const hydratedRef = useRef(false);
 
   useEffect(() => {
+    const stored = readStoredNightlyOnly();
+    hydratedRef.current = true;
+    if (stored !== true) setNightlyOnly(stored);
+  }, []);
+
+  useEffect(() => {
+    if (!hydratedRef.current) return;
     try {
       localStorage.setItem(NIGHTLY_ONLY_STORAGE_KEY, nightlyOnly ? "1" : "0");
     } catch {
