@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { Link } from "react-router";
 import {
   ArrowRight,
@@ -8,12 +8,10 @@ import {
   Plus,
   TriangleAlert,
 } from "lucide-react";
-import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
-import { useRunScope } from "~/contexts/RunScopeContext";
 import { cn } from "~/lib/utils";
 
 /** One (current ⟕ previous) service row from the deployment-diff query. */
-interface SvcRow {
+export interface SvcRow {
   service: string;
   cur_spec: string | null;
   cur_version: string | null;
@@ -94,26 +92,17 @@ export interface ServiceVersionsModel {
 }
 
 /**
- * Data + diff for the "what was deployed for this run" panel: the service image
- * versions the run executed against (parsed from the "Running services" log
- * block), plus a diff against the previous run so a failure can be lined up with
- * a deployment. Shared by the run-detail header button (summary) and the panel
- * body below it. `curCount === 0` means there's nothing to show.
+ * SQL for the "what was deployed for this run" diff: the service image versions
+ * the run executed against (parsed from the "Running services" log block) FULL
+ * OUTER JOINed against the previous run's, so a failure can be lined up with a
+ * deployment. `nightlyPrev` picks the baseline scope - the previous NIGHTLY vs
+ * the previous run of any kind - to match the run-detail's nightly/all toggle
+ * (RunScopeContext). The run-detail loader runs this for BOTH scopes and the
+ * component chooses; that keeps the nightly toggle a pure client preference.
  */
-export function useServiceVersions(runId: string): ServiceVersionsModel {
-  const { detailsReady } = useE2eData();
-  // Diff against the previous run in the SAME scope as the Services timeline
-  // (RunScopeContext) - so when nightly-only is on, this run's baseline is the
-  // previous NIGHTLY, not an intervening manual re-run. Otherwise the two views
-  // disagree: a nightly can read "no change" here (vs a same-day manual run that
-  // already picked up the deploy) while the Services page shows it changed vs the
-  // prior nightly.
-  const { nightlyOnly } = useRunScope();
-
+export function buildServiceDiffSql(runId: string, nightlyPrev: boolean): string {
   const runIdLit = sqlLit(runId);
-  const { rows, loading } = useE2eQuery<SvcRow>(
-    detailsReady && runId
-      ? `
+  return `
       WITH cur AS (
         SELECT service, spec, version, pipeline_version, n_scenarios, distinct_blocks
         FROM service_versions WHERE run_id = ${runIdLit}
@@ -121,7 +110,7 @@ export function useServiceVersions(runId: string): ServiceVersionsModel {
       prev_id AS (
         SELECT max(sv.run_id) AS pid
         FROM service_versions sv JOIN runs r USING (run_id)
-        WHERE sv.run_id < ${runIdLit}${nightlyOnly ? " AND r.is_nightly" : ""}
+        WHERE sv.run_id < ${runIdLit}${nightlyPrev ? " AND r.is_nightly" : ""}
       ),
       prev AS (
         SELECT sv.service, sv.spec, sv.version, sv.pipeline_version
@@ -136,55 +125,52 @@ export function useServiceVersions(runId: string): ServiceVersionsModel {
         (SELECT pid FROM prev_id) AS prev_run_id,
         cur.n_scenarios AS n_scenarios, cur.distinct_blocks AS distinct_blocks
       FROM cur FULL OUTER JOIN prev ON cur.service = prev.service
-      ORDER BY service`
-      : null,
-    [detailsReady, runId, nightlyOnly],
+      ORDER BY service`;
+}
+
+/**
+ * Build the deployment diff model from the rows returned by buildServiceDiffSql
+ * (a pure transform - the run-detail loader fetches the rows). `curCount === 0`
+ * means there's nothing to show.
+ */
+export function buildServiceVersionsModel(rows: SvcRow[]): ServiceVersionsModel {
+  const curRows = rows.filter((r) => r.in_cur);
+  const prevCount = rows.filter((r) => r.in_prev).length;
+  const prevRunId =
+    rows.find((r) => r.prev_run_id != null)?.prev_run_id ?? null;
+  // A baseline exists only when the previous run actually contributed version
+  // data - otherwise (no earlier run in the window, or its extraction failed)
+  // every service would spuriously read as "added", so we show a plain list.
+  const hasBaseline = prevRunId != null && prevCount > 0;
+  const distinctBlocks =
+    curRows.find((r) => r.distinct_blocks != null)?.distinct_blocks ?? null;
+  const nScenarios =
+    curRows.find((r) => r.n_scenarios != null)?.n_scenarios ?? null;
+
+  const withKind = rows.map((r) => ({ row: r, kind: changeKind(r) }));
+  const changes = hasBaseline ? withKind.filter((x) => x.kind !== "same") : [];
+  // Rank changes: changed first (most actionable), then added, then removed.
+  const rank: Record<ChangeKind, number> = {
+    changed: 0,
+    added: 1,
+    removed: 2,
+    same: 3,
+  };
+  changes.sort(
+    (a, b) =>
+      rank[a.kind] - rank[b.kind] || a.row.service.localeCompare(b.row.service),
   );
 
-  const model = useMemo(() => {
-    const curRows = rows.filter((r) => r.in_cur);
-    const prevCount = rows.filter((r) => r.in_prev).length;
-    const prevRunId =
-      rows.find((r) => r.prev_run_id != null)?.prev_run_id ?? null;
-    // A baseline exists only when the previous run actually contributed version
-    // data - otherwise (no earlier run in the window, or its extraction failed)
-    // every service would spuriously read as "added", so we show a plain list.
-    const hasBaseline = prevRunId != null && prevCount > 0;
-    const distinctBlocks =
-      curRows.find((r) => r.distinct_blocks != null)?.distinct_blocks ?? null;
-    const nScenarios =
-      curRows.find((r) => r.n_scenarios != null)?.n_scenarios ?? null;
-
-    const withKind = rows.map((r) => ({ row: r, kind: changeKind(r) }));
-    const changes = hasBaseline
-      ? withKind.filter((x) => x.kind !== "same")
-      : [];
-    // Rank changes: changed first (most actionable), then added, then removed.
-    const rank: Record<ChangeKind, number> = {
-      changed: 0,
-      added: 1,
-      removed: 2,
-      same: 3,
-    };
-    changes.sort(
-      (a, b) =>
-        rank[a.kind] - rank[b.kind] ||
-        a.row.service.localeCompare(b.row.service),
-    );
-
-    return {
-      loading,
-      curRows,
-      curCount: curRows.length,
-      prevRunId,
-      hasBaseline,
-      distinctBlocks,
-      nScenarios,
-      changes,
-    };
-  }, [rows, loading]);
-
-  return model;
+  return {
+    loading: false,
+    curRows,
+    curCount: curRows.length,
+    prevRunId,
+    hasBaseline,
+    distinctBlocks,
+    nScenarios,
+    changes,
+  };
 }
 
 /**

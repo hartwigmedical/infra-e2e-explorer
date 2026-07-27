@@ -7,7 +7,14 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { Link, useParams, useSearchParams } from "react-router";
+import {
+  Link,
+  useFetcher,
+  useLoaderData,
+  useParams,
+  useRouteLoaderData,
+  useSearchParams,
+} from "react-router";
 import {
   Boxes,
   Check,
@@ -23,9 +30,11 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import { toast } from "sonner";
-import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
+import type { Route } from "./+types/runs.$runId";
+import type { ShellData } from "~/layout";
 import { useRunScope } from "~/contexts/RunScopeContext";
-import { buildRunScenarioLogsSql } from "~/lib/e2e-views";
+import { ensureWindow, query } from "~/lib/data.server";
+import { windowIndexFromRequest, WINDOW_PARAM } from "~/lib/window";
 import StatusBadge from "~/components/StatusBadge";
 import StatusMark from "~/components/StatusMark";
 import RunGantt, {
@@ -33,8 +42,10 @@ import RunGantt, {
   formatElapsed,
 } from "~/components/RunGantt";
 import {
-  useServiceVersions,
+  buildServiceDiffSql,
+  buildServiceVersionsModel,
   ServiceVersionsBody,
+  type SvcRow,
 } from "~/components/ServiceVersions";
 import RunResultBar, { HatchSwatch } from "~/components/RunResultBar";
 import Spinner from "~/components/Spinner";
@@ -74,11 +85,77 @@ interface RunRow {
    *  below). The window `runs` is materialized from is always anchored at
    *  "now", so it always contains the actual newest run. */
   newest_run_id: string | null;
-  /** run_id of the most recent earlier run in scope for the header's
-   *  pass/fail-ratio comparison. Respects the global nightly/all-runs setting
-   *  (nightly-only → previous nightly; all runs → immediately preceding run).
-   *  Null when no such earlier run is in the loaded window. */
-  prev_run_id: string | null;
+  /** run_ids of the most recent earlier run for the header's pass/fail-ratio
+   *  comparison, in each scope: the immediately-preceding run of any kind, and
+   *  the previous nightly. The component picks by the nightly/all-runs toggle
+   *  (a client preference). Null when no such earlier run is in the window. */
+  prev_all_run_id: string | null;
+  prev_nightly_run_id: string | null;
+}
+
+interface ScenarioStatusRow {
+  feature_uri: string;
+  scenario_id: string;
+  status: string;
+}
+
+/** Load one run's detail (run row, scenarios, steps, previous-run scenario
+ *  statuses for both scopes, and the service-version diff for both scopes) for
+ *  the current window. The nightly/all-runs toggle picks between the two scopes
+ *  client-side, so both are fetched. Returns run:null when the run isn't in the
+ *  window (the component then offers to widen it). */
+export async function loader({ request, params }: Route.LoaderArgs) {
+  await ensureWindow(windowIndexFromRequest(request));
+  const runId = params.runId ?? "";
+  const runIdLit = sqlLit(runId);
+
+  const runRows = await query<RunRow>(
+    `SELECT run_id, run_time, updated, status_token, failed_count, total_count, is_nightly,
+            (SELECT max(run_id) FROM runs) AS newest_run_id,
+            (SELECT max(r2.run_id) FROM runs r2 WHERE r2.run_id < runs.run_id) AS prev_all_run_id,
+            (SELECT max(r2.run_id) FROM runs r2 WHERE r2.run_id < runs.run_id AND r2.is_nightly) AS prev_nightly_run_id
+       FROM runs WHERE run_id = ${runIdLit}`,
+  );
+  const run = runRows[0] ?? null;
+  if (!run) {
+    return {
+      run: null,
+      scenarios: [] as ScenarioRow[],
+      steps: [] as StepRow[],
+      prevAll: [] as ScenarioStatusRow[],
+      prevNightly: [] as ScenarioStatusRow[],
+      svcAll: [] as SvcRow[],
+      svcNightly: [] as SvcRow[],
+    };
+  }
+
+  const statusesSql = (prevId: string | null) =>
+    prevId
+      ? `SELECT feature_uri, scenario_id, status FROM scenarios WHERE run_id = ${sqlLit(prevId)}`
+      : null;
+
+  const [scenarios, steps, prevAll, prevNightly, svcAll, svcNightly] =
+    await Promise.all([
+      query<ScenarioRow>(
+        `SELECT feature_uri, feature_name, scenario_id, scenario_name, ordinal, tag_names, duration_s,
+                epoch_ms(started_at)::DOUBLE AS started_ms, status, test_id
+         FROM scenarios WHERE run_id = ${runIdLit}`,
+      ),
+      query<StepRow>(
+        `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status, duration_s, has_error, error_message, is_background, glue_location
+         FROM steps WHERE run_id = ${runIdLit} ORDER BY scenario_id, step_ordinal`,
+      ),
+      run.prev_all_run_id
+        ? query<ScenarioStatusRow>(statusesSql(run.prev_all_run_id)!)
+        : Promise.resolve([] as ScenarioStatusRow[]),
+      run.prev_nightly_run_id
+        ? query<ScenarioStatusRow>(statusesSql(run.prev_nightly_run_id)!)
+        : Promise.resolve([] as ScenarioStatusRow[]),
+      query<SvcRow>(buildServiceDiffSql(runId, false)),
+      query<SvcRow>(buildServiceDiffSql(runId, true)),
+    ]);
+
+  return { run, scenarios, steps, prevAll, prevNightly, svcAll, svcNightly };
 }
 
 interface ScenarioRow {
@@ -1022,24 +1099,18 @@ function ScenarioRow_({
 let hasCelebrated = false;
 
 export default function RunDetail() {
+  const { run, scenarios, steps, prevAll, prevNightly, svcAll, svcNightly } =
+    useLoaderData<typeof loader>();
   const { runId: rawRunId } = useParams();
-  const runId = rawRunId ? decodeURIComponent(rawRunId) : "";
-  const runIdLit = sqlLit(runId);
+  const requestedRunId = rawRunId ? decodeURIComponent(rawRunId) : "";
+  const runId = run?.run_id ?? requestedRunId;
 
-  const {
-    runsReady,
-    detailsReady,
-    status: dataStatus,
-    error: dataError,
-    query,
-    windowLabel,
-    nextWindowLabel,
-    hasMore,
-    loadingMore,
-    loadMore,
-  } = useE2eData();
-  // Global nightly/all-runs scope; governs which run counts as "previous" for
-  // the header ratio-bar comparison (see the prev_run_id subquery below).
+  // Window facts for the "run predates the window" prompt come from the shell
+  // loader (see app/layout.tsx).
+  const shell = useRouteLoaderData("layout") as ShellData | undefined;
+
+  // Global nightly/all-runs scope; picks which precomputed baseline (previous
+  // run / previous nightly) the header ratio-bar and service diff compare to.
   const { nightlyOnly } = useRunScope();
   // Which scenarios are expanded, keyed by `${feature_uri}::${scenario_id}`.
   // A Set (rather than a single key) so several can be open at once - this is
@@ -1068,53 +1139,43 @@ export default function RunDetail() {
     });
   }, []);
 
-  // Lazy per-run scenario logs (for the header's Log button): fetched once
-  // per run on first click, cached by scenario_id. `scenarioLogsRunIdRef`
-  // tracks which run the cache (if any) belongs to, so switching runs (or a
-  // failed fetch) triggers a fresh load rather than reusing stale data.
+  // Lazy per-run scenario logs (for the header's Log button): fetched on first
+  // open from the logs resource route (routes/runs.$runId.logs.tsx) via a
+  // fetcher, so the (large) decoded logs never bloat this page's SSR payload.
+  // Re-fetched when the run changes; `logsRunIdRef` tracks which run the current
+  // fetch belongs to.
+  const logsFetcher = useFetcher<{
+    logs: { scenario_id: string; log: string | null }[];
+  }>();
+  const logsRunIdRef = useRef<string | null>(null);
   const [scenarioLogs, setScenarioLogs] = useState<Map<
     string,
     string | null
   > | null>(null);
-  const [logsLoading, setLogsLoading] = useState(false);
-  const [logsError, setLogsError] = useState<Error | null>(null);
   // Which scenarios' log panels are open, by scenario_id. A Set so any number
   // can be open at once, independent of expand and of the `?scenario=`
   // selection - opening a log neither collapses nor selects anything.
   const [openLogScenarioIds, setOpenLogScenarioIds] = useState<Set<string>>(
     new Set(),
   );
-  const scenarioLogsRunIdRef = useRef<string | null>(null);
+  const logsLoading = logsFetcher.state !== "idle";
+  const logsError: Error | null = null;
 
-  // Reset the log cache/panels whenever the run changes.
+  // Reset the log panels/cache whenever the run changes.
   useEffect(() => {
-    scenarioLogsRunIdRef.current = null;
+    logsRunIdRef.current = null;
     setScenarioLogs(null);
-    setLogsLoading(false);
-    setLogsError(null);
     setOpenLogScenarioIds(new Set());
   }, [runId]);
 
-  async function loadScenarioLogsIfNeeded() {
-    if (scenarioLogsRunIdRef.current === runId) return; // already loaded/loading for this run
-    scenarioLogsRunIdRef.current = runId;
-    setLogsLoading(true);
-    setLogsError(null);
-    try {
-      // Logs live in the run's cached slim Parquet (decoded at extraction time),
-      // so this reads that ~100 KB file - never the raw report.
-      const rows = await query<{ scenario_id: string; log: string | null }>(
-        buildRunScenarioLogsSql(runId),
+  // Build the scenario_id -> log map once the fetcher settles.
+  useEffect(() => {
+    if (logsFetcher.state === "idle" && logsFetcher.data) {
+      setScenarioLogs(
+        new Map(logsFetcher.data.logs.map((r) => [r.scenario_id, r.log])),
       );
-      setScenarioLogs(new Map(rows.map((r) => [r.scenario_id, r.log])));
-    } catch (e) {
-      scenarioLogsRunIdRef.current = null; // allow retrying on a later click
-      setScenarioLogs(null);
-      setLogsError(e instanceof Error ? e : new Error(String(e)));
-    } finally {
-      setLogsLoading(false);
     }
-  }
+  }, [logsFetcher.state, logsFetcher.data]);
 
   function handleToggleLog(scenarioId: string) {
     const willOpen = !openLogScenarioIds.has(scenarioId);
@@ -1124,9 +1185,16 @@ export default function RunDetail() {
       else next.add(scenarioId);
       return next;
     });
-    // Logs are fetched once for the whole run (one query, all scenarios), so
-    // only kick the load when opening a panel - closing needs nothing.
-    if (willOpen) void loadScenarioLogsIfNeeded();
+    // Fetch once per run, on first open (one request covers all scenarios).
+    if (willOpen && logsRunIdRef.current !== runId) {
+      logsRunIdRef.current = runId;
+      const w = new URLSearchParams(
+        typeof window !== "undefined" ? window.location.search : "",
+      ).get(WINDOW_PARAM);
+      logsFetcher.load(
+        `/runs/${encodeURIComponent(runId)}/logs${w ? `?${WINDOW_PARAM}=${w}` : ""}`,
+      );
+    }
   }
 
   // Cross-navigation focus: `?scenario=<scenario_id>&step=<step_ordinal>`,
@@ -1322,63 +1390,26 @@ export default function RunDetail() {
     return () => document.removeEventListener("click", onClick, true);
   }, [focusScenarioId, focusStepParam, clearSelection]);
 
-  const {
-    rows: runRows,
-    loading: runLoading,
-    error: runError,
-  } = useE2eQuery<RunRow>(
-    runId
-      ? `SELECT run_id, run_time, updated, status_token, failed_count, total_count, is_nightly,
-                (SELECT max(run_id) FROM runs) AS newest_run_id,
-                (SELECT max(r2.run_id) FROM runs r2
-                   WHERE r2.run_id < runs.run_id ${nightlyOnly ? "AND r2.is_nightly" : ""}) AS prev_run_id
-         FROM runs WHERE run_id = ${runIdLit}`
-      : null,
-    [runId, nightlyOnly],
-  );
+  // All run data comes from the loader. `allSteps` is fetched whole and grouped
+  // client-side per scenario on expand.
+  const allSteps = steps;
 
-  const {
-    rows: scenarios,
-    loading: scenariosLoading,
-    error: scenariosError,
-  } = useE2eQuery<ScenarioRow>(
-    detailsReady && runId
-      ? `SELECT feature_uri, feature_name, scenario_id, scenario_name, ordinal, tag_names, duration_s,
-                epoch_ms(started_at)::DOUBLE AS started_ms, status, test_id
-         FROM scenarios WHERE run_id = ${runIdLit}`
-      : null,
-    [detailsReady, runId],
-  );
+  // Previous run's per-scenario statuses, picked by the nightly/all-runs scope
+  // (the loader precomputed both), for the header ratio bar's new-failure /
+  // newly-fixed cross-hatching.
+  const prevRunId = nightlyOnly
+    ? (run?.prev_nightly_run_id ?? null)
+    : (run?.prev_all_run_id ?? null);
+  const prevScenarios = nightlyOnly ? prevNightly : prevAll;
 
-  // Fetch all steps for the run once; group client-side per scenario on expand.
-  const { rows: allSteps, loading: stepsLoading } = useE2eQuery<StepRow>(
-    detailsReady && runId
-      ? `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status, duration_s, has_error, error_message, is_background, glue_location
-         FROM steps WHERE run_id = ${runIdLit} ORDER BY scenario_id, step_ordinal`
-      : null,
-    [detailsReady, runId],
-  );
-
-  // Previous run of the same kind (see RunRow.prev_run_id) — just the per-
-  // scenario statuses, to diff against this run for the header ratio bar's
-  // new-failure / newly-fixed cross-hatching.
-  const prevRunId = runRows[0]?.prev_run_id ?? null;
-  const { rows: prevScenarios } = useE2eQuery<{
-    feature_uri: string;
-    scenario_id: string;
-    status: string;
-  }>(
-    detailsReady && prevRunId
-      ? `SELECT feature_uri, scenario_id, status
-         FROM scenarios WHERE run_id = ${sqlLit(prevRunId)}`
-      : null,
-    [detailsReady, prevRunId],
-  );
-
-  // Deployed service versions + diff for this run, surfaced as an expandable
+  // Deployed service versions + diff for this run (loader ran the diff for both
+  // baseline scopes; pick by the nightly toggle), surfaced as an expandable
   // header panel (see the Services toggle below).
-  const svc = useServiceVersions(runId);
-  const hasServices = !svc.loading && svc.curCount > 0;
+  const svc = useMemo(
+    () => buildServiceVersionsModel(nightlyOnly ? svcNightly : svcAll),
+    [nightlyOnly, svcNightly, svcAll],
+  );
+  const hasServices = svc.curCount > 0;
 
   // Resolve the focused scenario from the run's own scenario list (not the
   // filtered view) so it can be exempted from the status/tag filters below, and
@@ -1600,9 +1631,6 @@ export default function RunDetail() {
     setRevealErrorsToken((t) => t + 1);
   }, [failedScenarioKeys]);
 
-  const run = runRows[0];
-  const combinedError = dataError ?? runError ?? scenariosError;
-
   // Fire a celebration when this run is BOTH the newest run loaded AND a
   // success - but only the first time per page load (see `hasCelebrated`), so
   // reopening a run detail or navigating run→run doesn't re-fire; a full page
@@ -1619,56 +1647,34 @@ export default function RunDetail() {
     toast.success("🎉 All green — the latest run passed!");
   }, [run, runId]);
 
-  if (dataStatus === "error" || runError || scenariosError) {
-    return (
-      <div className="mx-auto max-w-4xl space-y-4 p-6">
-        <p className="text-sm text-destructive">
-          Failed to load run{combinedError ? `: ${combinedError.message}` : "."}
-        </p>
-      </div>
-    );
-  }
-
-  // Show "Loading" (not "not found") whenever the run row can't be known yet:
-  // the runs table isn't ready, or the lookup is still in flight. Guarding on
-  // `!run` too means an already-loaded run isn't blanked during a soft reload.
-  if ((!runsReady || runLoading) && !run) {
-    return (
-      <div className="mx-auto flex max-w-4xl items-center gap-2 p-6 text-sm text-muted-foreground">
-        <Spinner /> Loading run…
-      </div>
-    );
-  }
-
   if (!run) {
-    // A run can be absent simply because it predates the loaded window (the
-    // runs table is materialized for a rolling date range - see E2eDataContext).
-    // Offer to widen the window before concluding it doesn't exist; only once
-    // everything is loaded (`!canLoadMore`) is it truly "not found".
-    const canLoadMore = hasMore && nextWindowLabel != null;
+    // Absent simply because it predates the loaded window (the tables are
+    // materialized for the current `?w=` range). Offer to widen the window
+    // before concluding it doesn't exist; only at the widest preset is it
+    // truly "not found".
+    const nextLabel = shell?.nextWindowLabel ?? null;
+    const nextWindow = (shell?.windowIndex ?? 0) + 1;
     return (
       <div className="mx-auto max-w-4xl space-y-4 p-6">
         <div className="rounded-lg border bg-card p-6">
-          {canLoadMore ? (
+          {nextLabel ? (
             <>
               <p className="text-sm text-muted-foreground">
-                Run <span className="font-mono">{runId}</span> isn't in the
-                loaded data. It may be older than the current{" "}
-                <span className="font-medium">{windowLabel}</span> window.
+                Run <span className="font-mono">{requestedRunId}</span> isn't in
+                the loaded data. It may be older than the current{" "}
+                <span className="font-medium">{shell?.windowLabel}</span> window.
               </p>
-              <button
-                type="button"
-                onClick={loadMore}
-                disabled={loadingMore}
-                className="mt-3 inline-flex items-center justify-center gap-2 rounded-md border bg-card px-3 py-1.5 text-sm font-medium hover:bg-muted/50 disabled:opacity-60"
+              <Link
+                to={`?${WINDOW_PARAM}=${nextWindow}`}
+                preventScrollReset
+                className="mt-3 inline-flex items-center justify-center gap-2 rounded-md border bg-card px-3 py-1.5 text-sm font-medium hover:bg-muted/50"
               >
-                {loadingMore && <Spinner size={13} />}
-                {loadingMore ? "Loading…" : `Load ${nextWindowLabel}`}
-              </button>
+                Load {nextLabel}
+              </Link>
             </>
           ) : (
             <p className="text-sm text-muted-foreground">
-              Run <span className="font-mono">{runId}</span> not found.
+              Run <span className="font-mono">{requestedRunId}</span> not found.
             </p>
           )}
         </div>
@@ -1688,12 +1694,8 @@ export default function RunDetail() {
             </h1>
             <p className="mt-1 text-sm text-muted-foreground">
               {formatDate(run.run_id)} at {formatTime(run.run_time)}
-              {detailsReady && (
-                <>
-                  {" · "}
-                  {scenarios.length} scenario{scenarios.length === 1 ? "" : "s"}
-                </>
-              )}
+              {" · "}
+              {scenarios.length} scenario{scenarios.length === 1 ? "" : "s"}
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -1708,11 +1710,7 @@ export default function RunDetail() {
         </div>
 
         <div className="mt-4">
-          {!detailsReady ? (
-            <span className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Spinner size={13} /> Loading scenario details…
-            </span>
-          ) : (
+          {
             <div className="space-y-3">
               <RunResultBar
                 passed={scenarioCounts.passed}
@@ -1874,10 +1872,10 @@ export default function RunDetail() {
                 )}
               </div>
             </div>
-          )}
+          }
         </div>
 
-        {detailsReady && headerPanel === "timeline" && scenarios.length > 1 && (
+        {headerPanel === "timeline" && scenarios.length > 1 && (
           <div className="mt-4 border-t pt-4">
             <RunGantt
               scenarios={scenarios}
@@ -1887,7 +1885,7 @@ export default function RunDetail() {
           </div>
         )}
 
-        {detailsReady && headerPanel === "services" && hasServices && (
+        {headerPanel === "services" && hasServices && (
           <div className="mt-4 border-t pt-4">
             <ServiceVersionsBody model={svc} runId={runId} />
           </div>
@@ -1954,15 +1952,7 @@ export default function RunDetail() {
         </div>
       </div>
 
-      {!detailsReady ? (
-        <div className="flex items-center gap-2 rounded-lg border bg-card p-6 text-sm text-muted-foreground">
-          <Spinner /> Loading run details…
-        </div>
-      ) : scenariosLoading && scenarios.length === 0 ? (
-        <div className="flex items-center gap-2 rounded-lg border bg-card p-6 text-sm text-muted-foreground">
-          <Spinner /> Loading scenarios…
-        </div>
-      ) : featureGroups.length === 0 ? (
+      {featureGroups.length === 0 ? (
         <div className="rounded-lg border bg-card p-6 text-sm text-muted-foreground">
           {selectedStatuses.length > 0 ||
           selectedChanges.length > 0 ||
@@ -1995,7 +1985,7 @@ export default function RunDetail() {
                       isOpen={openScenarios.has(key)}
                       onToggle={() => toggleScenario(key)}
                       steps={stepsByScenario.get(key) ?? []}
-                      stepsLoading={stepsLoading && openScenarios.has(key)}
+                      stepsLoading={false}
                       isFocused={isFocused}
                       focusStepOrdinal={focusStepOrdinal}
                       revealErrorsToken={revealErrorsToken}
