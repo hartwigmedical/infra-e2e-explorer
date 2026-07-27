@@ -1,30 +1,45 @@
 import { Link, Outlet, useLocation } from "react-router";
+import type { Route } from "./+types/layout";
 import { DuckDBProvider } from "~/contexts/DuckDBContext";
-import { E2eDataProvider, useE2eData } from "~/contexts/E2eDataContext";
+import { E2eDataProvider } from "~/contexts/E2eDataContext";
 import { RunScopeProvider } from "~/contexts/RunScopeContext";
-import Spinner from "~/components/Spinner";
 import DateRangeControl from "~/components/DateRangeControl";
 import { cn } from "~/lib/utils";
+import { ensureWindow, query } from "~/lib/data.server";
+import {
+  windowIndexFromRequest,
+  windowLabel as labelForWindow,
+  nextWindowLabel as nextLabelForWindow,
+} from "~/lib/window";
 
-function GlobalStatus() {
-  const { status, runCount } = useE2eData();
+/**
+ * Shell loader: resolves the current window (from `?w=`) server-side and returns
+ * the facts the header needs (label, range, daily density, run count). Runs for
+ * every route, so the header always has data without a client round-trip. The
+ * nightly/all-runs scope stays a client view preference (see RunScopeContext).
+ */
+export async function loader({ request }: Route.LoaderArgs) {
+  const windowIndex = windowIndexFromRequest(request);
+  const state = await ensureWindow(windowIndex);
 
-  if (status === "ready") return null;
-
-  const label =
-    status === "error"
-      ? "Failed to load e2e data"
-      : status === "runs-ready"
-        ? "Loading scenario details…"
-        : `Loading${runCount ? ` ${runCount} runs` : ""}…`;
-
-  return (
-    <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-      {status !== "error" && <Spinner size={13} />}
-      {label}
-    </span>
+  const [range] = await query<{ oldest: string | null; newest: string | null }>(
+    "SELECT min(run_id) AS oldest, max(run_id) AS newest FROM runs",
   );
+  const daily = await query<{ day: string; n: number }>(
+    "SELECT substr(run_id,1,10) AS day, count(*) AS n FROM runs GROUP BY 1 ORDER BY 1",
+  );
+
+  return {
+    windowIndex,
+    windowLabel: labelForWindow(windowIndex),
+    nextWindowLabel: nextLabelForWindow(windowIndex),
+    runCount: state.runCount,
+    range: range ?? { oldest: null, newest: null },
+    daily,
+  };
 }
+
+export type ShellData = Awaited<ReturnType<typeof loader>>;
 
 function NavLinks() {
   const { pathname } = useLocation();
@@ -69,6 +84,10 @@ function NavLinks() {
 }
 
 export default function Layout() {
+  // DuckDB/E2eData providers stay mounted for routes not yet migrated to loaders
+  // (services/scenarios/runs). They read the window from `?w=` too, so those
+  // routes stay in sync with the server-rendered header. Removed once every
+  // route is a loader.
   return (
     <DuckDBProvider>
       <E2eDataProvider>
@@ -80,7 +99,6 @@ export default function Layout() {
                 <NavLinks />
               </div>
               <div className="flex items-center gap-4">
-                <GlobalStatus />
                 <DateRangeControl />
               </div>
             </header>

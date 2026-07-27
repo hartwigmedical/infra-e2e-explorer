@@ -1,10 +1,11 @@
 import { useState } from "react";
-import { Link } from "react-router";
+import { Link, useLoaderData } from "react-router";
 import { EyeOff, X } from "lucide-react";
-import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
+import type { Route } from "./+types/index";
 import { useRunScope } from "~/contexts/RunScopeContext";
+import { ensureWindow, query } from "~/lib/data.server";
+import { windowIndexFromRequest } from "~/lib/window";
 import StatusBadge from "~/components/StatusBadge";
-import Spinner from "~/components/Spinner";
 import Sparkline from "~/components/Sparkline";
 import CluecumberLink from "~/components/CluecumberLink";
 import { statusKindFromRunToken } from "~/lib/status";
@@ -42,6 +43,17 @@ const SCENARIO_COUNTS_SQL = `
   FROM scenarios
   GROUP BY run_id
 `;
+
+/** Load the window's runs + per-run scenario counts server-side, so the table
+ *  and trend arrive as real HTML (no client DuckDB, no waterfall). */
+export async function loader({ request }: Route.LoaderArgs) {
+  await ensureWindow(windowIndexFromRequest(request));
+  const [runs, counts] = await Promise.all([
+    query<RunRow>(RUNS_SQL),
+    query<ScenarioCountRow>(SCENARIO_COUNTS_SQL),
+  ]);
+  return { runs, counts };
+}
 
 // run_id is always "YYYY-MM-DD-HHMM-<suffix>" - the date is more robust to
 // pull from the id itself than from the run_date TIMESTAMP column (which
@@ -159,19 +171,10 @@ function ScenarioCounts({
 }
 
 export default function Index() {
-  const { status, error, runsReady, detailsReady } = useE2eData();
+  const { runs, counts } = useLoaderData<typeof loader>();
   const { nightlyOnly, setNightlyOnly } = useRunScope();
-  const {
-    rows: runs,
-    loading: runsLoading,
-    error: runsError,
-  } = useE2eQuery<RunRow>(RUNS_SQL, []);
-  const { rows: scenarioCounts } = useE2eQuery<ScenarioCountRow>(
-    detailsReady ? SCENARIO_COUNTS_SQL : null,
-    [detailsReady],
-  );
 
-  const countsByRun = new Map(scenarioCounts.map((r) => [r.run_id, r]));
+  const countsByRun = new Map(counts.map((r) => [r.run_id, r]));
 
   // The nightly/all-runs filter (global, from the date-range control) governs
   // which runs the table, count, and trend reflect. When nightly-only, every
@@ -207,31 +210,6 @@ export default function Index() {
   const latestPassRate =
     passRates.length > 0 ? passRates[passRates.length - 1] : null;
 
-  const combinedError = error ?? runsError;
-  if (status === "error" || runsError) {
-    return (
-      <div className="mx-auto max-w-5xl p-6">
-        <p className="text-sm text-destructive">
-          Failed to load e2e data
-          {combinedError ? `: ${combinedError.message}` : "."}
-        </p>
-      </div>
-    );
-  }
-
-  // Unified initial-loading state: show a single "Loading runs…" until the runs
-  // ROWS are actually on screen — not merely until runCount is known — otherwise
-  // the empty table + load-more button + per-column spinners flash first. This is
-  // distinct from load-more, where rows are already present so we never hit it.
-  const settledEmpty = runsReady && !runsLoading && runs.length === 0;
-  if (runs.length === 0 && !settledEmpty) {
-    return (
-      <div className="mx-auto flex max-w-5xl items-center gap-2 p-6 text-sm text-muted-foreground">
-        <Spinner /> Loading runs…
-      </div>
-    );
-  }
-
   return (
     <div className="mx-auto max-w-5xl space-y-4 p-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -243,9 +221,7 @@ export default function Index() {
         </div>
         <div className="flex items-center gap-3 rounded-lg border bg-card px-4 py-2">
           <span className="text-xs text-muted-foreground">Pass rate</span>
-          {!detailsReady ? (
-            <Spinner size={13} />
-          ) : passRates.length >= 2 ? (
+          {passRates.length >= 2 ? (
             <>
               <Sparkline
                 values={passRates.map((v) => v * 100)}
@@ -310,7 +286,7 @@ export default function Index() {
                 </td>
               </tr>
             )}
-            {displayRuns.length === 0 && !runsLoading && (
+            {displayRuns.length === 0 && (
               <tr>
                 <td
                   colSpan={showType ? 5 : 4}
@@ -366,14 +342,10 @@ export default function Index() {
                       Scenarios view for this run × status (run detail is still
                       reachable via the Run/Type/Status cells). */}
                   <td className="px-3 py-2 group-hover:bg-muted/40">
-                    {detailsReady ? (
-                      <ScenarioCounts
-                        counts={countsByRun.get(run.run_id)}
-                        runId={run.run_id}
-                      />
-                    ) : (
-                      <Spinner size={13} />
-                    )}
+                    <ScenarioCounts
+                      counts={countsByRun.get(run.run_id)}
+                      runId={run.run_id}
+                    />
                   </td>
                   <td className="px-3 py-2">
                     <CluecumberLink runId={run.run_id} />

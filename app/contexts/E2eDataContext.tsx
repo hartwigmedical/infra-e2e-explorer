@@ -7,8 +7,10 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { useSearchParams } from "react-router";
 import type { AsyncDuckDB } from "@duckdb/duckdb-wasm";
 import { format, subDays } from "date-fns";
+import { WINDOW_PARAM, clampWindowIndex } from "~/lib/window";
 import { useDuckDBContext } from "~/contexts/DuckDBContext";
 import {
   SCHEMA_VERSION,
@@ -77,40 +79,6 @@ export const WINDOW_STEPS: { label: string; days: number | null }[] = [
   { label: "All time", days: null },
 ];
 export const DEFAULT_WINDOW_INDEX = 0;
-
-/** localStorage key for the user's selected window preset, so the chosen data
- *  range survives a refresh. localStorage works on the plain-HTTP prod host
- *  (unlike OPFS/navigator.storage), and a stale value is harmless - it just
- *  picks the window to load. */
-const WINDOW_INDEX_STORAGE_KEY = "e2e:windowIndex";
-
-/** localStorage mirror of the slim-cache SCHEMA_VERSION last seen by this
- *  client. When it differs from the current SCHEMA_VERSION the slim cache has
- *  been (or is about to be) cleared - see report-cache.ts - so the next load is
- *  a COLD one that must re-extract every run in the window from raw JSON. We
- *  use it to reset the window to the default on such a launch, so a previously
- *  widened window ("All time") doesn't force a huge cold re-extraction. */
-const CACHE_SCHEMA_STORAGE_KEY = "e2e:cacheSchemaVersion";
-
-/** The persisted window-preset index, clamped to a valid preset. Falls back to
- *  DEFAULT_WINDOW_INDEX when it's absent/invalid, when localStorage is
- *  unavailable, or on a COLD launch (SCHEMA_VERSION changed since last seen -
- *  the cache is empty, so keep the re-extraction small). */
-function readStoredWindowIndex(): number {
-  try {
-    if (localStorage.getItem(CACHE_SCHEMA_STORAGE_KEY) !== SCHEMA_VERSION) {
-      return DEFAULT_WINDOW_INDEX;
-    }
-    const raw = localStorage.getItem(WINDOW_INDEX_STORAGE_KEY);
-    if (raw == null) return DEFAULT_WINDOW_INDEX;
-    const i = Number(raw);
-    return Number.isInteger(i) && i >= 0 && i < WINDOW_STEPS.length
-      ? i
-      : DEFAULT_WINDOW_INDEX;
-  } catch {
-    return DEFAULT_WINDOW_INDEX;
-  }
-}
 
 /** `since` cutoff (YYYY-MM-DD) for a given window preset. "all time" (days=null)
  *  uses a far-past date so the server's `since` path still returns everything. */
@@ -246,8 +214,14 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
   const [dataSource, setDataSource] = useState<E2eDataSource | null>(null);
   const [runCount, setRunCount] = useState(0);
   const [totalRuns, setTotalRuns] = useState(0);
-  // Restored from localStorage so the selected data range survives a refresh.
-  const [windowIndex, setWindowIndex] = useState(readStoredWindowIndex);
+  // Window preset comes from the URL (?w=) - the single source of truth shared
+  // with the server-rendered shell (see app/lib/window.ts). This bridges the
+  // still-client routes to the same window the SSR header shows; migrated routes
+  // read it in their loaders instead.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const windowIndex = clampWindowIndex(
+    searchParams.get(WINDOW_PARAM) ?? DEFAULT_WINDOW_INDEX,
+  );
   const [loadingMore, setLoadingMore] = useState(false);
   // Bumped whenever the tables are rebuilt in place (soft load-more) so mounted
   // useE2eQuery consumers re-run without runsReady/detailsReady flipping (which
@@ -262,28 +236,6 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
   // `reload()` calls so retrying doesn't silently shrink what `loadMore` had
   // grown it to. Used to compute the `since` cutoff in both API and LOCAL mode.
   const windowIndexRef = useRef(windowIndex);
-
-  // Persist the selected window preset (see readStoredWindowIndex). Fires on the
-  // initial restore (a harmless no-op write) and on every loadMore widening.
-  useEffect(() => {
-    try {
-      localStorage.setItem(WINDOW_INDEX_STORAGE_KEY, String(windowIndex));
-    } catch {
-      // localStorage unavailable/full - the range just won't persist.
-    }
-  }, [windowIndex]);
-
-  // Record the current slim-cache schema version, so the NEXT launch can tell a
-  // cold launch (schema changed → cache cleared) apart and reset the window
-  // then. On a cold launch this stamp runs after readStoredWindowIndex has
-  // already fallen back to the default.
-  useEffect(() => {
-    try {
-      localStorage.setItem(CACHE_SCHEMA_STORAGE_KEY, SCHEMA_VERSION);
-    } catch {
-      // localStorage unavailable - cold-launch detection just won't fire.
-    }
-  }, []);
 
   const runInit = useCallback(
     async (
@@ -304,7 +256,6 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
         setDetailsReady(false);
         setStepsFallback(false);
         setError(null);
-        setWindowIndex(windowIndexRef.current);
       }
 
       const since = sinceCutoff(windowIndexRef.current);
@@ -556,7 +507,6 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
           setDataSource(nextDataSource);
           setRunCount(nextRunCount);
           setTotalRuns(nextTotal);
-          setWindowIndex(windowIndexRef.current);
           setDataVersion((v) => v + 1);
         } else {
           setDetailsReady(true);
@@ -583,35 +533,48 @@ export function E2eDataProvider({ children }: { children: ReactNode }) {
   );
 
   useEffect(() => {
-    if (!db || startedRef.current) return;
-    startedRef.current = true;
-    dbRef.current = db;
-    void runInit(db);
-  }, [db, runInit]);
+    if (!db) return;
+    if (!startedRef.current) {
+      // First mount: full init for the URL's window.
+      startedRef.current = true;
+      dbRef.current = db;
+      void runInit(db, windowIndex);
+    } else if (windowIndexRef.current !== windowIndex) {
+      // URL window changed (e.g. "Load more" from the SSR header): soft
+      // re-materialize for the new window without blanking the current view.
+      setLoadingMore(true);
+      void runInit(db, windowIndex, { soft: true }).finally(() =>
+        setLoadingMore(false),
+      );
+    }
+  }, [db, windowIndex, runInit]);
 
   const reload = useCallback(() => {
-    if (dbRef.current) void runInit(dbRef.current);
-  }, [runInit]);
+    if (dbRef.current) void runInit(dbRef.current, windowIndex);
+  }, [runInit, windowIndex]);
 
   const hasMore = runCount < totalRuns;
 
-  // Widen the rolling window to the next preset and re-run the full init
-  // sequence against the recomputed `since` cutoff. Works the same way in both
-  // API and LOCAL mode (see runInit above). A full re-materialize is simple and
-  // correct; see the module doc comment for why that's an acceptable tradeoff
-  // here. No-op once every available run is loaded or the widest preset is hit.
+  // Widen the rolling window by bumping the URL (?w=). The change flows back
+  // through the window-index effect below, which soft-re-materializes for the
+  // wider window. No-op once every available run is loaded or the widest preset
+  // is hit. (loadMore/loadingMore are legacy - the SSR header drives the window
+  // now; kept on the context value only for the not-yet-migrated routes.)
   const loadMore = useCallback(() => {
-    if (!dbRef.current || !hasMore) return;
+    if (!hasMore) return;
     const nextIndex = Math.min(
       windowIndexRef.current + 1,
       WINDOW_STEPS.length - 1,
     );
     if (nextIndex === windowIndexRef.current) return;
-    setLoadingMore(true);
-    void runInit(dbRef.current, nextIndex, { soft: true }).finally(() =>
-      setLoadingMore(false),
+    setSearchParams(
+      (prev) => {
+        prev.set(WINDOW_PARAM, String(nextIndex));
+        return prev;
+      },
+      { preventScrollReset: true },
     );
-  }, [runInit, hasMore]);
+  }, [hasMore, setSearchParams]);
 
   const query = useCallback(<T = any,>(sql: string): Promise<T[]> => {
     if (!dbRef.current) return Promise.reject(new Error("DuckDB not ready"));

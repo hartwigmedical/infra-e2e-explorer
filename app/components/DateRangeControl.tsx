@@ -1,27 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useNavigation,
+  useRouteLoaderData,
+  useSearchParams,
+} from "react-router";
 import { CalendarRange, ChevronDown } from "lucide-react";
 import { eachDayOfInterval, format } from "date-fns";
-import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
 import { useRunScope } from "~/contexts/RunScopeContext";
 import Spinner from "~/components/Spinner";
 import Sparkline from "~/components/Sparkline";
 import { cn } from "~/lib/utils";
-
-interface OldestNewestRow {
-  oldest: string | null;
-  newest: string | null;
-}
-
-interface DailyCountRow {
-  day: string;
-  n: number;
-}
-
-const RANGE_SQL =
-  "SELECT min(run_id) AS oldest, max(run_id) AS newest FROM runs";
-
-const DAILY_COUNTS_SQL =
-  "SELECT substr(run_id,1,10) AS day, count(*) AS n FROM runs GROUP BY 1 ORDER BY 1";
+import { WINDOW_PARAM } from "~/lib/window";
+import type { ShellData } from "~/layout";
 
 /** Parse a "YYYY-MM-DD" string into a local-midnight Date via its y/m/d parts
  *  (NOT `new Date(str)`, which parses as UTC midnight) - so that formatting
@@ -37,8 +27,7 @@ function parseYMD(value: string | null | undefined): Date | null {
   return Number.isNaN(date.getTime()) ? null : date;
 }
 
-/** "YYYY-MM-DD" for a local-midnight Date, matching the keys produced by
- *  DAILY_COUNTS_SQL's `substr(run_id,1,10)`. */
+/** "YYYY-MM-DD" for a local-midnight Date, matching the day keys in the loader. */
 function toDayKey(date: Date): string {
   return format(date, "yyyy-MM-dd");
 }
@@ -58,29 +47,23 @@ function formatRange(oldest: Date | null, newest: Date | null): string {
 }
 
 /**
- * Shared date-range control, shown top-right on both the dashboard and the
- * Scenarios page. The button shows the current rolling-window preset label
- * (e.g. "Last 7 days" - see WINDOW_STEPS in E2eDataContext); clicking it
- * opens a popover with the actual loaded date range, a runs/day sparkline,
- * and a "Load more" button that widens the window (soft refresh - see
- * useE2eData().loadMore).
- *
- * Dependency-free popover, same pattern as TagFilter: a relatively-positioned
- * wrapper, an absolutely-positioned panel below it, closed on click-outside
- * or Escape.
+ * Shared date-range control (top-right on every page). The button shows the
+ * current rolling-window preset (from `?w=`); clicking it opens a popover with
+ * the loaded date range, a runs/day sparkline, and a "Load more" button that
+ * widens the window by bumping `?w=` - the server loaders re-run for the wider
+ * window. All data comes from the shell loader (see app/layout.tsx); the
+ * nightly/all-runs scope is a client view preference (see RunScopeContext).
  */
 export default function DateRangeControl() {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
-  const { windowLabel, nextWindowLabel, hasMore, loadingMore, loadMore, runCount } =
-    useE2eData();
+  const shell = useRouteLoaderData("layout") as ShellData | undefined;
+  const [searchParams, setSearchParams] = useSearchParams();
+  const navigation = useNavigation();
 
   // Global nightly/all-runs scope, shared across pages (see RunScopeContext).
   const { nightlyOnly, setNightlyOnly } = useRunScope();
-
-  const { rows: rangeRows } = useE2eQuery<OldestNewestRow>(RANGE_SQL, []);
-  const { rows: dailyRows } = useE2eQuery<DailyCountRow>(DAILY_COUNTS_SQL, []);
 
   useEffect(() => {
     if (!open) return;
@@ -98,21 +81,39 @@ export default function DateRangeControl() {
     };
   }, [open]);
 
-  const oldest = parseYMD(rangeRows[0]?.oldest);
-  const newest = parseYMD(rangeRows[0]?.newest);
+  const windowLabel = shell?.windowLabel ?? "…";
+  const nextWindowLabel = shell?.nextWindowLabel ?? null;
+  const runCount = shell?.runCount ?? 0;
+  const windowIndex = shell?.windowIndex ?? 0;
+
+  const oldest = parseYMD(shell?.range.oldest);
+  const newest = parseYMD(shell?.range.newest);
   const rangeLabel = formatRange(oldest, newest);
 
-  // Gap-fill: enumerate every calendar day from oldest -> newest loaded day
-  // and map to that day's run count (0 where there's no run), so the
-  // sparkline reflects true daily density instead of silently skipping gaps.
+  // Gap-fill: enumerate every calendar day from oldest -> newest and map to that
+  // day's run count (0 where there's no run), so the sparkline reflects true
+  // daily density instead of silently skipping gaps.
   const dailyValues = useMemo(() => {
     if (!oldest || !newest) return [];
-    const countByDay = new Map(dailyRows.map((r) => [r.day, r.n]));
+    const countByDay = new Map((shell?.daily ?? []).map((r) => [r.day, r.n]));
     const days = eachDayOfInterval({ start: oldest, end: newest });
     return days.map((d) => countByDay.get(toDayKey(d)) ?? 0);
-  }, [oldest, newest, dailyRows]);
+  }, [oldest, newest, shell?.daily]);
 
-  const canLoadMore = hasMore && nextWindowLabel != null;
+  const canLoadMore = nextWindowLabel != null;
+  const loadingMore =
+    navigation.state !== "idle" &&
+    navigation.location?.search.includes(`${WINDOW_PARAM}=`) === true;
+
+  const loadMore = () => {
+    setSearchParams(
+      (prev) => {
+        prev.set(WINDOW_PARAM, String(windowIndex + 1));
+        return prev;
+      },
+      { preventScrollReset: true },
+    );
+  };
 
   return (
     <div ref={ref} className={cn("relative")}>

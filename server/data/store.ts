@@ -50,6 +50,11 @@ export class E2eStore {
     runCount: 0,
   });
   private current: WindowState | null = null;
+  /** When `current` was last materialized (epoch ms); 0 = never. */
+  private materializedAt = 0;
+  /** How long a materialized window is reused before a rebuild picks up new
+   *  runs. Short, like the server's run-list cache - the bucket is append-only. */
+  private readonly windowTtlMs = 60_000;
 
   constructor(
     private source: ReportSource = createReportSource(),
@@ -75,6 +80,27 @@ export class E2eStore {
     this.refreshChain = this.refreshChain
       .catch(() => ({ since: "", runCount: 0 }) as WindowState)
       .then(() => this.doRefresh(since));
+    return this.refreshChain;
+  }
+
+  /**
+   * Ensure `since`'s window is materialized, reusing it when it's the current
+   * window and still fresh (within windowTtlMs). Concurrent loaders in one SSR
+   * request (layout + route) both call this; because the check runs inside the
+   * serialized chain, only the first rebuilds and the rest are no-ops.
+   */
+  ensureWindow(since: string): Promise<WindowState> {
+    this.refreshChain = this.refreshChain
+      .catch(() => ({ since: "", runCount: 0 }) as WindowState)
+      .then(() => {
+        if (
+          this.current?.since === since &&
+          Date.now() - this.materializedAt < this.windowTtlMs
+        ) {
+          return this.current;
+        }
+        return this.doRefresh(since);
+      });
     return this.refreshChain;
   }
 
@@ -146,6 +172,7 @@ export class E2eStore {
     );
 
     this.current = { since, runCount: runs.length };
+    this.materializedAt = Date.now();
     return this.current;
   }
 
