@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router";
+import { Link, useLoaderData, useSearchParams } from "react-router";
 import { Boxes, TriangleAlert } from "lucide-react";
-import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
+import type { Route } from "./+types/services";
 import { useRunScope } from "~/contexts/RunScopeContext";
-import Spinner from "~/components/Spinner";
+import { ensureWindow, query } from "~/lib/data.server";
+import { windowIndexFromRequest } from "~/lib/window";
 import StatusMark from "~/components/StatusMark";
 import { statusKindFromRunToken } from "~/lib/status";
 import { makeIsSuspectDeploy } from "~/lib/deployments";
@@ -26,12 +27,13 @@ interface ScenarioStatusRow {
   status: string;
 }
 
-/** Per-run header metadata (outcome + folder-name counts). */
+/** Per-run header metadata (outcome + folder-name counts + nightly flag). */
 interface RunMetaRow {
   run_id: string;
   status_token: string;
   failed_count: number | null;
   total_count: number | null;
+  is_nightly: boolean;
 }
 
 // Layout constants. The left service-name column and the right deploys-summary
@@ -49,33 +51,31 @@ const STATUS_H = 28;
 const HEADER_H = DATE_H + STATUS_H;
 const LANE_H = 40;
 
-/** All (run, service) versions in scope. Nightly filter governs which runs
- *  become columns (matches the rest of the app's run scope). */
-function buildVersionsSql(nightlyOnly: boolean): string {
-  return `
-    SELECT sv.run_id, sv.service, sv.spec, sv.version, sv.pipeline_version
-    FROM service_versions sv
-    JOIN runs r USING (run_id)
-    ${nightlyOnly ? "WHERE r.is_nightly" : ""}
-    ORDER BY sv.run_id, sv.service`;
-}
+// All (run, service) versions, scenario outcomes, and run metadata for the
+// window. The nightly/all-runs scope is applied CLIENT-SIDE (it's a view
+// preference, see RunScopeContext) by filtering which runs become columns -
+// matching the dashboard. So the loader fetches every run in the window.
+const VERSIONS_SQL = `
+  SELECT sv.run_id, sv.service, sv.spec, sv.version, sv.pipeline_version
+  FROM service_versions sv
+  JOIN runs r USING (run_id)
+  ORDER BY sv.run_id, sv.service`;
 
-/** Every (run, scenario) outcome in scope. Failure counts, new-failure
- *  detection and the "did it resolve later" check are all derived from this
- *  client-side (see the lane build), so one query feeds all three. */
-function buildScenarioStatusSql(nightlyOnly: boolean): string {
-  return `
-    SELECT sc.run_id, sc.scenario_id, sc.status
-    FROM scenarios sc
-    JOIN runs r USING (run_id)
-    ${nightlyOnly ? "WHERE r.is_nightly" : ""}`;
-}
+const SCENARIO_STATUS_SQL = `
+  SELECT sc.run_id, sc.scenario_id, sc.status FROM scenarios sc`;
 
-function buildRunMetaSql(nightlyOnly: boolean): string {
-  return `
-    SELECT run_id, status_token, failed_count, total_count
-    FROM runs
-    ${nightlyOnly ? "WHERE is_nightly" : ""}`;
+const RUN_META_SQL = `
+  SELECT run_id, status_token, failed_count, total_count, is_nightly FROM runs`;
+
+/** Load service versions + scenario outcomes + run metadata for the window. */
+export async function loader({ request }: Route.LoaderArgs) {
+  await ensureWindow(windowIndexFromRequest(request));
+  const [versions, scenarios, meta] = await Promise.all([
+    query<VersionRow>(VERSIONS_SQL),
+    query<ScenarioStatusRow>(SCENARIO_STATUS_SQL),
+    query<RunMetaRow>(RUN_META_SQL),
+  ]);
+  return { versions, scenarios, meta };
 }
 
 /** "07-18" — the month-day of a run_id, matching the scenarios grid's labels. */
@@ -142,7 +142,11 @@ interface ServiceLane {
 }
 
 export default function Services() {
-  const { status, error, detailsReady, windowLabel } = useE2eData();
+  const {
+    versions: versionRows,
+    scenarios: scenarioRows,
+    meta: metaRows,
+  } = useLoaderData<typeof loader>();
   const { nightlyOnly } = useRunScope();
   const [showUnchanged, setShowUnchanged] = useState(false);
   // `?run=` deep-link (from the run-detail Services panel's timeline button):
@@ -163,37 +167,21 @@ export default function Services() {
     );
   }, [setSearchParams]);
 
-  const versionsSql = useMemo(
-    () => buildVersionsSql(nightlyOnly),
-    [nightlyOnly],
-  );
-  const scenariosSql = useMemo(
-    () => buildScenarioStatusSql(nightlyOnly),
-    [nightlyOnly],
-  );
-  const metaSql = useMemo(() => buildRunMetaSql(nightlyOnly), [nightlyOnly]);
-
-  const { rows: versionRows, loading: versionsLoading } =
-    useE2eQuery<VersionRow>(detailsReady ? versionsSql : null, [
-      detailsReady,
-      versionsSql,
-    ]);
-  const { rows: scenarioRows } = useE2eQuery<ScenarioStatusRow>(
-    detailsReady ? scenariosSql : null,
-    [detailsReady, scenariosSql],
-  );
-  const { rows: metaRows } = useE2eQuery<RunMetaRow>(
-    detailsReady ? metaSql : null,
-    [detailsReady, metaSql],
+  // Nightly/all-runs scope applied client-side: which runs become columns.
+  const nightlySet = useMemo(
+    () => new Set(metaRows.filter((m) => m.is_nightly).map((m) => m.run_id)),
+    [metaRows],
   );
 
-  // Run columns: every run that has version data, oldest → newest (run_id sorts
-  // lexicographically == chronologically).
+  // Run columns: every run that has version data (filtered to nightly when the
+  // scope says so), oldest → newest (run_id sorts lexicographically == chrono).
   const runIds = useMemo(() => {
     const set = new Set<string>();
-    for (const r of versionRows) set.add(r.run_id);
+    for (const r of versionRows) {
+      if (!nightlyOnly || nightlySet.has(r.run_id)) set.add(r.run_id);
+    }
     return Array.from(set).sort();
-  }, [versionRows]);
+  }, [versionRows, nightlyOnly, nightlySet]);
   const runIndex = useMemo(() => {
     const m = new Map<string, number>();
     runIds.forEach((id, i) => m.set(id, i));
@@ -391,16 +379,6 @@ export default function Services() {
   const trackWidth = runIds.length * COL_W;
   const bodyHeight = HEADER_H + visibleLanes.length * LANE_H;
 
-  if (status === "error") {
-    return (
-      <div className="mx-auto max-w-6xl p-6">
-        <p className="text-sm text-destructive">
-          Failed to load service data{error ? `: ${error.message}` : "."}
-        </p>
-      </div>
-    );
-  }
-
   return (
     <div className="mx-auto max-w-6xl space-y-4 p-6">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -429,11 +407,7 @@ export default function Services() {
         )}
       </div>
 
-      {!detailsReady || (versionsLoading && versionRows.length === 0) ? (
-        <div className="flex items-center gap-2 rounded-lg border bg-card p-6 text-sm text-muted-foreground">
-          <Spinner size={13} /> Loading services…
-        </div>
-      ) : runIds.length === 0 || visibleLanes.length === 0 ? (
+      {runIds.length === 0 || visibleLanes.length === 0 ? (
         <div className="rounded-lg border bg-card p-6 text-sm text-muted-foreground">
           No service-version data in the loaded range.
         </div>
