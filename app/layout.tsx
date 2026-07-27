@@ -1,7 +1,5 @@
 import { Link, Outlet, useLocation } from "react-router";
 import type { Route } from "./+types/layout";
-import { DuckDBProvider } from "~/contexts/DuckDBContext";
-import { E2eDataProvider } from "~/contexts/E2eDataContext";
 import { RunScopeProvider } from "~/contexts/RunScopeContext";
 import DateRangeControl from "~/components/DateRangeControl";
 import { cn } from "~/lib/utils";
@@ -84,30 +82,24 @@ function NavLinks() {
 }
 
 export default function Layout() {
-  // DuckDB/E2eData providers stay mounted for routes not yet migrated to loaders
-  // (services/scenarios/runs). They read the window from `?w=` too, so those
-  // routes stay in sync with the server-rendered header. Removed once every
-  // route is a loader.
+  // All data now comes from server loaders. The only client context left is the
+  // nightly/all-runs view preference (a client-side filter over loader data).
   return (
-    <DuckDBProvider>
-      <E2eDataProvider>
-        <RunScopeProvider>
-          <div className="min-h-screen bg-background text-foreground">
-            <header className="flex h-(--header-height) items-center justify-between border-b px-4">
-              <div className="flex items-center gap-6">
-                <span className="font-semibold">E2E Explorer</span>
-                <NavLinks />
-              </div>
-              <div className="flex items-center gap-4">
-                <DateRangeControl />
-              </div>
-            </header>
-            <main className="p-4">
-              <Outlet />
-            </main>
+    <RunScopeProvider>
+      <div className="min-h-screen bg-background text-foreground">
+        <header className="flex h-(--header-height) items-center justify-between border-b px-4">
+          <div className="flex items-center gap-6">
+            <span className="font-semibold">E2E Explorer</span>
+            <NavLinks />
           </div>
-        </RunScopeProvider>
-      </E2eDataProvider>
-    </DuckDBProvider>
+          <div className="flex items-center gap-4">
+            <DateRangeControl />
+          </div>
+        </header>
+        <main className="p-4">
+          <Outlet />
+        </main>
+      </div>
+    </RunScopeProvider>
   );
 }

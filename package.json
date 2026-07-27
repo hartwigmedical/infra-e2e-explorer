@@ -14,7 +14,6 @@
     "sync-data": "node scripts/sync-reports.mjs"
   },
   "dependencies": {
-    "@duckdb/duckdb-wasm": "1.33.1-dev57.0",
     "@duckdb/node-api": "^1.5.4-r.1",
     "@google-cloud/storage": "^7.19.0",
     "@react-router/express": "^8.1.0",

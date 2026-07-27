@@ -94,18 +94,23 @@ so the cache should be durable in GCS and/or warmed at startup.
   data server-side. So a fetched page currently server-renders the layout/shell,
   not the data.
 
-### Phase 3 — Convert routes to loaders (index → services → scenarios → runs.$runId)
-- Move each `useE2eQuery` into the route loader. Classify every query:
-  *must be server SQL* (cross-run analytics) vs *cheap client filter/sort* (do in
-  JS on loader data — no engine client-side). Keeps interactions snappy instead
-  of turning every filter into a round-trip.
-- URL-param-driven window/tag filters so loaders re-run server-side and links are
-  shareable.
-- **Render semantic HTML** (real `<table>`/`<th>`/`<time>`/headings) so the pages
-  are cleanly ingestible.
-- Once all four are migrated, delete `E2eDataProvider`, `DuckDBContext`,
-  `useDuckDB`, `report-cache`, `duckdb-query`, and drop `@duckdb/duckdb-wasm` — a
-  large bundle win.
+### Phase 3 — Convert routes to loaders — ✅ DONE
+- All four routes converted to loaders over the Phase 1 store (3a shell+index,
+  3b services, 3c scenarios, 3d runs.$runId). The rolling window is a `?w=` URL
+  param read by every loader and the shell; `nightlyOnly` stays a client-side
+  filter over loader data. Cross-run analytics run as server SQL; per-view
+  filtering/sorting stays client-side JS on loader rows.
+- Per-run scenario logs stay lazy via a JSON **resource route**
+  (`routes/runs.$runId.logs.tsx`) + `useFetcher`, so they don't bloat run-detail
+  SSR.
+- Client DuckDB stack deleted: `E2eDataContext`, `DuckDBContext`, `useDuckDB`,
+  `report-cache`, `duckdb-query`, `e2e-data`; `@duckdb/duckdb-wasm` dropped.
+  Only `RunScopeContext` (the nightly view preference) remains client-side.
+- **Bundle win:** the duckdb-wasm client chunk (~264 kB) is gone entirely.
+- **Not yet done:** the render is data-complete but not audited for fully
+  semantic markup on every view (Phase 3 addendum) — tables are real `<table>`s
+  but a pass for `<th scope>`/`<time>` etc. is still open. JSON resource routes
+  beyond logs (Phase 3.5) remain deferred.
 
 ### Phase 3.5 — JSON resource routes (deferred)
 - Only if semantic HTML proves insufficient for ingestion. Loaders already return
