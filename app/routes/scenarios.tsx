@@ -6,7 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { Link, useSearchParams } from "react-router";
+import { Link, useLoaderData, useSearchParams } from "react-router";
 import {
   ArrowRight,
   ChevronRight,
@@ -15,9 +15,10 @@ import {
   Triangle,
   X,
 } from "lucide-react";
-import { useE2eData, useE2eQuery } from "~/contexts/E2eDataContext";
+import type { Route } from "./+types/scenarios";
 import { useRunScope } from "~/contexts/RunScopeContext";
-import Spinner from "~/components/Spinner";
+import { ensureWindow, query } from "~/lib/data.server";
+import { windowIndexFromRequest } from "~/lib/window";
 import StatusMark from "~/components/StatusMark";
 import TagFilter from "~/components/TagFilter";
 import {
@@ -228,6 +229,7 @@ interface StepHistoryRow {
   error_message: string | null;
   /** True for steps folded in from the feature's Background (see v_scenarios). */
   is_background: boolean;
+  is_nightly: boolean;
 }
 
 interface SelectedScenario {
@@ -251,7 +253,8 @@ interface ScenarioIdentityRow {
   tag_names: string[] | null;
 }
 
-/** One (scenario, run) cell of the matrix, straight from the join. */
+/** One (scenario, run) cell of the matrix, straight from the join. `is_nightly`
+ *  lets the nightly/all-runs scope be applied client-side (see the loader). */
 interface MatrixCellRow {
   feature_uri: string;
   feature_name: string;
@@ -261,6 +264,14 @@ interface MatrixCellRow {
   run_id: string;
   status: string;
   duration_s: number | null;
+  is_nightly: boolean;
+}
+
+/** (run, service, spec) row feeding the stability view's per-run deploy flags. */
+interface VersionScopeRow {
+  run_id: string;
+  service: string;
+  spec: string | null;
 }
 
 interface MatrixCell {
@@ -352,59 +363,43 @@ function formatDurShort(s: number): string {
 }
 
 /**
- * Every (scenario, run) cell in scope. Nightly filter is applied here (it
- * governs both which runs become columns and which cells exist); search/tag/
- * failed filters are applied client-side to rows so the column set stays
- * stable as you type.
+ * Every (scenario, run) cell in the window. The nightly/all-runs scope is
+ * applied CLIENT-SIDE (it governs both which runs become columns and which
+ * cells count), like search/tag/failed filters, so the loader fetches every run
+ * and carries `is_nightly` per cell.
  */
-function buildMatrixSql(nightlyOnly: boolean): string {
-  return `
+const MATRIX_SQL = `
     SELECT s.feature_uri, s.feature_name, s.scenario_id, s.scenario_name, s.tag_names,
-           s.run_id, s.status, s.duration_s
+           s.run_id, s.status, s.duration_s, r.is_nightly
     FROM scenarios s
     JOIN runs r USING (run_id)
-    ${nightlyOnly ? "WHERE r.is_nightly" : ""}
     ORDER BY s.feature_name, s.scenario_name, s.run_id
   `;
-}
 
-/** (run, service, spec) in scope — feeds the run-level deploy flags the
+/** (run, service, spec) in the window — feeds the run-level deploy flags the
  *  stability view uses to tell flaky changes from deploy-caused ones. */
-function buildServiceVersionsScopeSql(nightlyOnly: boolean): string {
-  return `
+const SERVICE_VERSIONS_SCOPE_SQL = `
     SELECT sv.run_id, sv.service, sv.spec
     FROM service_versions sv
     JOIN runs r USING (run_id)
-    ${nightlyOnly ? "WHERE r.is_nightly" : ""}
   `;
-}
 
-function buildHistorySql(
-  featureUri: string,
-  scenarioId: string,
-  nightlyOnly: boolean,
-): string {
+function buildHistorySql(featureUri: string, scenarioId: string): string {
   return `
     SELECT s.run_id, s.status, s.duration_s, r.is_nightly
     FROM scenarios s
     JOIN runs r USING (run_id)
     WHERE s.feature_uri = ${sqlLit(featureUri)} AND s.scenario_id = ${sqlLit(scenarioId)}
-    ${nightlyOnly ? "AND r.is_nightly" : ""}
     ORDER BY s.run_id
   `;
 }
 
-function buildStepHistorySql(
-  featureUri: string,
-  scenarioId: string,
-  nightlyOnly: boolean,
-): string {
+function buildStepHistorySql(featureUri: string, scenarioId: string): string {
   return `
-    SELECT st.run_id, st.step_ordinal, st.step_label, st.status, st.duration_s, st.has_error, st.error_message, st.is_background
+    SELECT st.run_id, st.step_ordinal, st.step_label, st.status, st.duration_s, st.has_error, st.error_message, st.is_background, r.is_nightly
     FROM steps st
     JOIN runs r USING (run_id)
     WHERE st.feature_uri = ${sqlLit(featureUri)} AND st.scenario_id = ${sqlLit(scenarioId)}
-    ${nightlyOnly ? "AND r.is_nightly" : ""}
     ORDER BY st.run_id, st.step_ordinal
   `;
 }
@@ -425,6 +420,44 @@ function buildScenarioIdentitySql(
     WHERE feature_uri = ${sqlLit(featureUri)} AND scenario_id = ${sqlLit(scenarioId)}
     LIMIT 1
   `;
+}
+
+/**
+ * Load matrix + (optionally) a selected scenario's history server-side. Mirrors
+ * the SPA's conditional loading, keyed on the URL (feature/scenario/metric are
+ * all URL params): the matrix cells load for the matrix view and for the detail
+ * view's stability metric; a selected scenario also loads its identity/history/
+ * step-history. The nightly scope is applied client-side, so everything is
+ * fetched for the whole window.
+ */
+export async function loader({ request }: Route.LoaderArgs) {
+  await ensureWindow(windowIndexFromRequest(request));
+  const url = new URL(request.url);
+  const feature = safeDecodeURIComponent(url.searchParams.get("feature"));
+  const scenario = safeDecodeURIComponent(url.searchParams.get("scenario"));
+  const wantsSelection = feature !== null && scenario !== null;
+  const needsStability = url.searchParams.get("metric") === "stability";
+
+  const matrix =
+    !wantsSelection || needsStability
+      ? await query<MatrixCellRow>(MATRIX_SQL)
+      : null;
+  const versions = needsStability
+    ? await query<VersionScopeRow>(SERVICE_VERSIONS_SCOPE_SQL)
+    : null;
+
+  let identity: ScenarioIdentityRow[] | null = null;
+  let history: HistoryRow[] | null = null;
+  let steps: StepHistoryRow[] | null = null;
+  if (wantsSelection) {
+    [identity, history, steps] = await Promise.all([
+      query<ScenarioIdentityRow>(buildScenarioIdentitySql(feature, scenario)),
+      query<HistoryRow>(buildHistorySql(feature, scenario)),
+      query<StepHistoryRow>(buildStepHistorySql(feature, scenario)),
+    ]);
+  }
+
+  return { matrix, versions, identity, history, steps };
 }
 
 function formatRunDateTime(runId: string): string {
@@ -1559,6 +1592,8 @@ function ScenarioDetailPanel({
   metric,
   setMetric,
   runFlags,
+  historyRows,
+  stepRows,
 }: {
   selected: SelectedScenario;
   nightlyOnly: boolean;
@@ -1567,32 +1602,11 @@ function ScenarioDetailPanel({
   setMetric: (m: Metric) => void;
   /** Per-run deploy flags (by run_id) for the step grid's stability view. */
   runFlags: Map<string, RunDeployFlags>;
+  /** This scenario's per-run history + step history, already nightly-filtered
+   *  by the parent (see the Scenarios component). */
+  historyRows: HistoryRow[];
+  stepRows: StepHistoryRow[];
 }) {
-  const { detailsReady } = useE2eData();
-
-  const { rows: historyRows, loading: historyLoading } =
-    useE2eQuery<HistoryRow>(
-      detailsReady
-        ? buildHistorySql(
-            selected.feature_uri,
-            selected.scenario_id,
-            nightlyOnly,
-          )
-        : null,
-      [detailsReady, selected.feature_uri, selected.scenario_id, nightlyOnly],
-    );
-
-  const { rows: stepRows, loading: stepsLoading } = useE2eQuery<StepHistoryRow>(
-    detailsReady
-      ? buildStepHistorySql(
-          selected.feature_uri,
-          selected.scenario_id,
-          nightlyOnly,
-        )
-      : null,
-    [detailsReady, selected.feature_uri, selected.scenario_id, nightlyOnly],
-  );
-
   const runIds = useMemo(() => historyRows.map((r) => r.run_id), [historyRows]);
 
   const passRate = useMemo(() => {
@@ -1678,13 +1692,7 @@ function ScenarioDetailPanel({
         </div>
         {trendOpen && trendStats && (
           <div className="mt-4 border-t pt-4">
-            {historyLoading && historyRows.length === 0 ? (
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <Spinner size={13} /> Loading trend…
-              </div>
-            ) : (
-              <DurationTrend rows={historyRows} />
-            )}
+            <DurationTrend rows={historyRows} />
           </div>
         )}
       </div>
@@ -1714,27 +1722,27 @@ function ScenarioDetailPanel({
             ))}
           </div>
         </div>
-        {stepsLoading && stepRows.length === 0 ? (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Spinner size={13} /> Loading step history…
-          </div>
-        ) : (
-          <StepGrid
-            runIds={runIds}
-            stepRows={stepRows}
-            scenarioHistory={historyRows}
-            scenarioId={selected.scenario_id}
-            metric={metric}
-            runFlags={runFlags}
-          />
-        )}
+        <StepGrid
+          runIds={runIds}
+          stepRows={stepRows}
+          scenarioHistory={historyRows}
+          scenarioId={selected.scenario_id}
+          metric={metric}
+          runFlags={runFlags}
+        />
       </div>
     </div>
   );
 }
 
 export default function Scenarios() {
-  const { status, error, detailsReady } = useE2eData();
+  const {
+    matrix: rawMatrix,
+    versions: rawVersions,
+    identity,
+    history: rawHistory,
+    steps: rawSteps,
+  } = useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
 
   // Filters + metric live in the URL (alongside the ?feature=&scenario=
@@ -1835,45 +1843,31 @@ export default function Scenarios() {
   const wantsSelection =
     decodedFeatureUri !== null && decodedScenarioId !== null;
 
-  // The matrix cells feed the matrix view, and — under the stability metric —
-  // the scope-wide per-run deploy flags the step grid also needs, so they're
-  // still loaded in the detail view when stability is active.
-  const needsScopeStability = metric === "stability";
-  const matrixSql = useMemo(() => buildMatrixSql(nightlyOnly), [nightlyOnly]);
-  const {
-    rows: matrixRows,
-    loading: matrixLoading,
-    error: matrixError,
-  } = useE2eQuery<MatrixCellRow>(
-    detailsReady && (!wantsSelection || needsScopeStability) ? matrixSql : null,
-    [detailsReady, matrixSql, wantsSelection, needsScopeStability],
+  // Nightly/all-runs scope applied client-side (the loader fetches the whole
+  // window; see MATRIX_SQL). Matrix cells feed the matrix view AND — under the
+  // stability metric — the scope-wide deploy flags the step grid needs, so the
+  // loader carries them in the detail view too when stability is active.
+  const matrixRows = useMemo(
+    () => (rawMatrix ?? []).filter((r) => !nightlyOnly || r.is_nightly),
+    [rawMatrix, nightlyOnly],
+  );
+  const versionRows = rawVersions ?? [];
+
+  // Selected scenario's per-run history + step history, nightly-filtered here so
+  // the detail panel stays presentational.
+  const historyRows = useMemo(
+    () => (rawHistory ?? []).filter((r) => !nightlyOnly || r.is_nightly),
+    [rawHistory, nightlyOnly],
+  );
+  const stepRows = useMemo(
+    () => (rawSteps ?? []).filter((r) => !nightlyOnly || r.is_nightly),
+    [rawSteps, nightlyOnly],
   );
 
-  // Service versions in scope — loaded only when the stability metric needs
-  // them (to derive per-run deploy flags), in both the matrix and detail views.
-  const versionsSql = useMemo(
-    () =>
-      needsScopeStability ? buildServiceVersionsScopeSql(nightlyOnly) : null,
-    [needsScopeStability, nightlyOnly],
-  );
-  const { rows: versionRows } = useE2eQuery<{
-    run_id: string;
-    service: string;
-    spec: string | null;
-  }>(detailsReady ? versionsSql : null, [detailsReady, versionsSql]);
-
-  // Resolved independently of the matrix's nightly/search/tag filters (no join
-  // against `runs`), so a deep-linked scenario stays selected even when those
-  // filters would hide it from the matrix.
-  const identitySql = useMemo(() => {
-    if (!decodedFeatureUri || !decodedScenarioId) return null;
-    return buildScenarioIdentitySql(decodedFeatureUri, decodedScenarioId);
-  }, [decodedFeatureUri, decodedScenarioId]);
-  const { rows: identityRows, loading: identityLoading } =
-    useE2eQuery<ScenarioIdentityRow>(detailsReady ? identitySql : null, [
-      detailsReady,
-      identitySql,
-    ]);
+  // Identity is resolved by the loader independently of nightly/search/tag
+  // filters, so a deep-linked scenario stays selected even when those filters
+  // would hide it from the matrix.
+  const identityRows = identity ?? [];
 
   const selected = useMemo<SelectedScenario | null>(() => {
     const row = identityRows[0];
@@ -1889,9 +1883,6 @@ export default function Scenarios() {
     () => toTagArray(identityRows[0]?.tag_names),
     [identityRows],
   );
-
-  const resolvingSelection =
-    wantsSelection && !selected && (!detailsReady || identityLoading);
 
   // Run columns: every run in scope, oldest -> newest. Derived from the full
   // (unfiltered) matrix so the column set stays put while row filters change.
@@ -2113,19 +2104,6 @@ export default function Scenarios() {
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [wantsSelection, clearSelection]);
 
-  if (status === "error" || matrixError) {
-    return (
-      <div className="mx-auto max-w-6xl space-y-4 p-6">
-        <p className="text-sm text-destructive">
-          Failed to load scenario data
-          {(error ?? matrixError)
-            ? `: ${(error ?? matrixError)!.message}`
-            : "."}
-        </p>
-      </div>
-    );
-  }
-
   return (
     <div className="mx-auto max-w-6xl space-y-4 p-6">
       {selected ? (
@@ -2144,11 +2122,9 @@ export default function Scenarios() {
             metric={metric}
             setMetric={setMetric}
             runFlags={runFlagsByRunId}
+            historyRows={historyRows}
+            stepRows={stepRows}
           />
-        </div>
-      ) : resolvingSelection ? (
-        <div className="flex h-64 items-center justify-center gap-2 rounded-lg border bg-card text-sm text-muted-foreground">
-          <Spinner size={13} /> Loading scenario…
         </div>
       ) : wantsSelection ? (
         <div className="flex h-64 items-center justify-center rounded-lg border bg-card text-sm text-muted-foreground">
@@ -2217,15 +2193,7 @@ export default function Scenarios() {
             />
           </div>
 
-          {!detailsReady ? (
-            <div className="flex items-center gap-2 rounded-lg border bg-card p-6 text-sm text-muted-foreground">
-              <Spinner size={13} /> Loading scenario details…
-            </div>
-          ) : matrixLoading && matrixRows.length === 0 ? (
-            <div className="flex items-center gap-2 rounded-lg border bg-card p-6 text-sm text-muted-foreground">
-              <Spinner size={13} /> Loading scenarios…
-            </div>
-          ) : groups.length === 0 ? (
+          {groups.length === 0 ? (
             <div className="rounded-lg border bg-card p-6 text-sm text-muted-foreground">
               No scenarios match the current filters.
             </div>
