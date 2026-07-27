@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 /**
- * Bundle the Express server (server/index.ts) into a single self-contained ESM
- * file at build/index.mjs, so the production Docker image doesn't have to ship
- * node_modules for it.
+ * Bundle the Express server (server/index.ts) into a single ESM entry at
+ * build/index.mjs. Under SSR this is a thin shim: it wires Express to the React
+ * Router request handler and loads the SEPARATE server build produced by
+ * `react-router build` (build/server/index.js) at runtime.
  *
- * express and cors are inlined; @google-cloud/storage is kept EXTERNAL (it does
- * dynamic requires / ships asset files that don't bundle reliably, and its
- * code paths - bucket listing, V4 signing - can't be fully exercised without
- * GCS credentials, so we don't want a latent bundling bug surfacing only in
- * prod). Dockerfile.server installs just that one dep into the runtime image.
+ * `packages: "external"` keeps every node_modules dependency out of the bundle:
+ * with SSR the runtime image already needs the app's deps (react, react-dom,
+ * react-router, …) present for the RR server build, and both this shim and that
+ * build must resolve to the SAME react-router copy - so bundling would be wrong,
+ * not just wasteful. Native/asset-heavy deps (@duckdb/node-api,
+ * @google-cloud/storage) and dev-only vite stay external for the same reason.
+ * The runtime image therefore ships a production node_modules (see
+ * Dockerfile.server - updated in Phase 5).
  *
- * Output goes to build/index.mjs (a SIBLING of build/client) on purpose: the
- * server resolves the static client via `path.resolve(import.meta.dirname,
- * "../build/client")`, and from /app/build that resolves back to
- * /app/build/client. See Dockerfile.server.
+ * Output goes to build/index.mjs (a SIBLING of build/client and build/server):
+ * the server resolves both via `path.resolve(import.meta.dirname, "../build/…")`.
  */
 import { build } from "esbuild";
 
@@ -24,7 +26,7 @@ await build({
   format: "esm",
   target: "node24",
   outfile: "build/index.mjs",
-  external: ["@google-cloud/storage"],
+  packages: "external",
   // Bundled CJS deps (express/cors) may hit a runtime `require`; define one in
   // the ESM output so those calls resolve instead of throwing.
   banner: {

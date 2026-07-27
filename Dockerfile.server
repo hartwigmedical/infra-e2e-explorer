@@ -1,6 +1,15 @@
-# Multi-stage: build the SPA client + bundle the Express server, then run a slim
-# non-root runtime that carries only the server bundle, its one external dep
-# (@google-cloud/storage), and the static client. See README "Docker".
+# Multi-stage: build the client + the React Router server build + the Express
+# SSR shim, then run a non-root runtime carrying a PRODUCTION node_modules, the
+# build output, and the shim. See README "Docker".
+#
+# NOTE (SSR experiment, Phase 2): under SSR the runtime must ship the app's
+# production deps (react, react-dom, react-router, @react-router/*, native
+# @duckdb/node-api, @google-cloud/storage, …) — the shim (build/index.mjs) and
+# the RR server build (build/server) both resolve react-router from node_modules
+# at runtime, so bundling is no longer possible. Alpine is kept because DuckDB
+# ships musl bindings (@duckdb/node-bindings-linux-*-musl), which npm resolves
+# for this platform automatically. This Dockerfile is NOT yet built/validated in
+# CI — that's Phase 5 (base-image + Cloud Run memory sizing).
 
 # ---------- Builder ----------
 FROM node:24-alpine AS builder
@@ -12,19 +21,14 @@ RUN npm ci
 
 COPY . .
 
-# Client SPA -> build/client, then bundle the server -> build/index.mjs
-# (esbuild inlines express/cors; @google-cloud/storage stays external).
+# build/client + build/server (react-router build), then build/index.mjs (the
+# Express SSR shim; packages kept external — see scripts/build-server.mjs).
 RUN npm run build && npm run build:server
 
-# Minimal production install for the runtime: only the deps kept external to the
-# server bundle (@google-cloud/storage + its transitive deps), pinned to the
-# version this build resolved. Everything else the app depends on is either
-# compiled into build/client or inlined into build/index.mjs, so it never
-# reaches the runtime image (that's the ~250 MB the old single-install runtime
-# carried needlessly - almost all of it client-only libs like duckdb-wasm).
-RUN mkdir /runtime-deps && cd /runtime-deps \
- && node -e "const v=require('/app/node_modules/@google-cloud/storage/package.json').version; require('fs').writeFileSync('package.json', JSON.stringify({name:'e2e-explorer-runtime',private:true,dependencies:{'@google-cloud/storage':v}}))" \
- && npm install --omit=dev --no-audit --no-fund --no-package-lock
+# Prune to production deps in place, so the runtime carries only what SSR needs
+# at runtime (keeps the platform-matched native duckdb binary that npm ci
+# already resolved for this image's OS/arch/libc).
+RUN npm prune --omit=dev
 
 # ---------- Runtime ----------
 FROM node:24-alpine
@@ -32,17 +36,14 @@ FROM node:24-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 
-# Only the external runtime deps, the server bundle, and the static client.
-COPY --from=builder /runtime-deps/node_modules ./node_modules
-COPY --from=builder /app/build/index.mjs ./build/index.mjs
-COPY --from=builder /app/build/client ./build/client
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./package.json
+COPY --from=builder /app/build ./build
 
 # Drop root: the node:alpine image ships an unprivileged `node` user (uid 1000).
-# The app never writes into the image, so root-owned (world-readable) files are
-# fine to run as this user.
 USER node
 
-# Signed URLs are produced via Application Default Credentials (workload
+# Reports are read from the bucket via Application Default Credentials (workload
 # identity in Cloud Run / GKE) — no key file or hardcoded service account.
 EXPOSE 3001
 

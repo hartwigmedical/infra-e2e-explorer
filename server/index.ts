@@ -1,8 +1,9 @@
 import express from "express";
 import cors from "cors";
 import path from "node:path";
-import { existsSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { Storage } from "@google-cloud/storage";
+import { createRequestHandler } from "@react-router/express";
 
 // ---------- config ----------
 
@@ -326,18 +327,56 @@ app.get("/config.js", (_req, res) => {
   );
 });
 
-// Serve the built client in production (single deployable). In dev, Vite serves
-// the client and proxies /api to this server instead, so this is a no-op then.
-const clientDir = path.resolve(import.meta.dirname, "../build/client");
-if (existsSync(clientDir)) {
-  app.use(express.static(clientDir));
-  app.get("*path", (_req, res) => {
-    res.sendFile(path.join(clientDir, "index.html"));
+// ---------- React Router SSR ----------
+// The routes above (/api/*, /config.js) are registered first, so they win over
+// the SSR catch-all below regardless of environment.
+const isProd = process.env.NODE_ENV === "production";
+
+if (isProd) {
+  // Built client: fingerprinted /assets are immutable; the rest gets a short
+  // cache. The SSR handler renders every non-asset request.
+  const clientDir = path.resolve(import.meta.dirname, "../build/client");
+  app.use(
+    "/assets",
+    express.static(path.join(clientDir, "assets"), {
+      immutable: true,
+      maxAge: "1y",
+    }),
+  );
+  app.use(express.static(clientDir, { maxAge: "1h" }));
+
+  // The server build from `react-router build`, a sibling of this file's build
+  // dir (build/index.mjs -> ../build/server/index.js; and from the unbundled
+  // server/index.ts under `npm start`, ../build/server/index.js too). A variable
+  // specifier keeps esbuild from trying to bundle it (it's produced separately).
+  const serverBuildPath = path.resolve(
+    import.meta.dirname,
+    "../build/server/index.js",
+  );
+  const build = await import(pathToFileURL(serverBuildPath).href);
+  app.all("*path", createRequestHandler({ build, mode: "production" }));
+} else {
+  // Dev: Vite in middleware mode owns client assets + HMR; the SSR handler pulls
+  // the server build from Vite's module graph fresh on each request.
+  const vite = await import("vite");
+  const viteServer = await vite.createServer({
+    server: { middlewareMode: true },
+    appType: "custom",
   });
+  app.use(viteServer.middlewares);
+  app.all(
+    "*path",
+    createRequestHandler({
+      build: () =>
+        viteServer.ssrLoadModule("virtual:react-router/server-build") as any,
+      mode: "development",
+    }),
+  );
 }
 
 app.listen(PORT, () => {
   console.log(`e2e-explorer server listening on http://localhost:${PORT}`);
+  console.log(`Mode: ${isProd ? "production (SSR)" : "development (SSR + Vite)"}`);
   console.log(`Bucket: gs://${BUCKET_NAME}`);
   console.log(`Cluecumber reports: ${CLUECUMBER_BASE_URL}`);
 });

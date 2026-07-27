@@ -11,12 +11,8 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./"),
     },
   },
-  server: {
-    proxy: {
-      "/api": "http://127.0.0.1:3001",
-      "/config.js": "http://127.0.0.1:3001",
-    },
-  },
+  // No dev proxy needed: Express is now the single dev entry (SSR), running Vite
+  // in middleware mode and serving /api + /config.js directly. See server/index.ts.
   optimizeDeps: { exclude: ["@duckdb/duckdb-wasm"] },
   worker: { format: "es" },
 });

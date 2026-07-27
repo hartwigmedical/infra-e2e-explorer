@@ -80,13 +80,19 @@ so the cache should be durable in GCS and/or warmed at startup.
   this env); parity is asserted structurally (see results), not diffed row-for-row
   against a captured WASM run.
 
-### Phase 2 — Turn on SSR
-- `react-router.config.ts` → `ssr: true`; wire `@react-router/express`
-  `createRequestHandler` into `server/index.ts`, replacing the static-only
-  catch-all.
-- Rework dev tooling: the `run-p dev:client dev:server` split changes (Express
-  becomes the entry with the RR Vite middleware). Touches `package.json` +
+### Phase 2 — Turn on SSR — ✅ DONE (dev + local prod; Docker deferred)
+- `react-router.config.ts` → `ssr: true`; `@react-router/express`
+  `createRequestHandler` wired into `server/index.ts` (Vite middleware in dev,
+  the `build/server` build in prod), replacing the static-only catch-all.
+- Dev tooling reworked: single `tsx watch server/index.ts` process (Express owns
+  Vite middleware + `/api` + `/config.js`); the dev proxy is gone from
   `vite.config.ts`.
+- `scripts/build-server.mjs` switched to `packages: "external"` (the shim no
+  longer inlines deps); `Dockerfile.server` rewritten to ship a production
+  `node_modules` — **not yet built in CI (Phase 5).**
+- The app still hydrates for data (routes have no loaders yet) — Phase 3 moves
+  data server-side. So a fetched page currently server-renders the layout/shell,
+  not the data.
 
 ### Phase 3 — Convert routes to loaders (index → services → scenarios → runs.$runId)
 - Move each `useE2eQuery` into the route loader. Classify every query:
@@ -162,6 +168,19 @@ normalizer), `sources.ts` (LOCAL + GCS report sources), `slim-cache.ts`
 
 Typecheck (`npm run typecheck`) passes. The Phase 0 spike script was removed —
 `phase1-smoke.ts` supersedes it.
+
+## Phase 2 results
+
+- `npm run typecheck` passes.
+- `npm run build` emits both `build/client` and `build/server/index.js`;
+  `npm run build:server` emits the 7.8 kb `build/index.mjs` shim.
+- **Dev SSR** (`npm run dev`): `/`, `/scenarios`, `/services`, `/runs/:id` all
+  return 200 with server-rendered layout markup ("E2E Explorer", nav) in the raw
+  HTML and no render errors in the log.
+- **Local prod SSR** (`npm start`): boots `Mode: production (SSR)`, serves
+  server-rendered HTML referencing `/assets/entry.client-*.js`, and serves that
+  fingerprinted asset with a 200 + `text/javascript`.
+- **Not validated here:** the Docker image build and Cloud Run deploy (Phase 5).
 
 ## Guardrails
 
