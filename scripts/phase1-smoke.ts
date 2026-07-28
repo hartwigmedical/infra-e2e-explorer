@@ -90,7 +90,7 @@ async function main() {
   assert(svc[0].services > 0, "service_versions extracted");
   assert(svc[0].bad_blocks === 0, "every run's scenarios agree on the services block");
 
-  // ---- WARM: rebuild again with all slim Parquet already on disk ----
+  // ---- WARM: rebuild again with every run's Parquet already on disk ----
   const t1 = performance.now();
   const warm = await store.ensure(true);
   const warmMs = Math.round(performance.now() - t1);

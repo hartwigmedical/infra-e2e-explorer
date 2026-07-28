@@ -1,15 +1,14 @@
 /**
- * Native DuckDB engine for the server-side data layer (SSR experiment, Phase 1).
+ * Native DuckDB engine for the server-side data layer.
  *
- * Replaces the browser's DuckDB-WASM (app/hooks/useDuckDB.ts). The whole app
- * shares ONE in-process instance/connection: DuckDB handles concurrent reads,
- * and the analytical tables (see store.ts) are materialized once per window
- * rather than per request, so a single long-lived connection is what we want.
+ * The whole app shares ONE in-process instance/connection: DuckDB handles
+ * concurrent reads, and the analytical tables (see store.ts) are materialized
+ * once for the whole dataset rather than per request, so a single long-lived
+ * connection is what we want.
  *
- * Unlike the WASM path there's no virtual filesystem to register buffers into -
- * native DuckDB reads real files, so slim Parquet lives on disk (see
- * slim-cache.ts) and reports are handed over as local file paths (see
- * sources.ts). No httpfs is loaded: everything read is a local file.
+ * Everything DuckDB reads is a real local file: the extracted per-run Parquet
+ * lives on disk (see cache.ts) and raw reports are handed over as local file
+ * paths (see sources.ts). No httpfs is loaded.
  */
 
 import { DuckDBInstance, type DuckDBConnection } from "@duckdb/node-api";
@@ -77,8 +76,8 @@ export function normalizeValue(v: unknown): unknown {
 }
 
 /**
- * Run a read query and return normalized, JSON-serializable row objects - the
- * server-side analogue of the client's `query<T>()` (E2eDataContext).
+ * Run a read query and return normalized, JSON-serializable row objects (what
+ * route loaders hand straight to JSON.stringify during SSR).
  */
 export async function query<T = Record<string, unknown>>(
   sql: string,

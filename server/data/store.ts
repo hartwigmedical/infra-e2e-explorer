@@ -2,14 +2,14 @@
  * E2e data store for the server-side data layer.
  *
  * Holds the FULL dataset (no window): it lists every run, ensures each run's
- * slim Parquet (slim-cache.ts), and materializes the lightweight analytical
+ * extracted Parquet (cache.ts), and materializes the lightweight analytical
  * tables the app queries broadly - runs / scenarios / test_ids /
- * service_versions - over the slim data. Route loaders run plain SQL against
+ * service_versions - over the extracted data. Route loaders run plain SQL against
  * those via `query()`.
  *
  * `steps` is deliberately NOT materialized: it's ~90% of the rows and is only
  * needed one-run (run detail) or one-scenario (step history) at a time, so it's
- * left as the `v_steps` VIEW over the slim Parquet and read on demand. That
+ * left as the `v_steps` VIEW over the cached Parquet and read on demand. That
  * keeps the resident footprint small (~0.1 MB/run) as the append-only bucket
  * grows.
  *
@@ -113,7 +113,7 @@ export class E2eStore {
     // run-detail steps and scenario step-history - we never materialize it.
     await duckRun(buildScenariosStepsViewsSql());
 
-    // test_ids: one cheap pass over the slim data.
+    // test_ids: one cheap pass over the extracted data.
     await duckRun(
       `CREATE OR REPLACE TABLE test_ids AS ${buildTestIdsSelectSql()};`,
     );

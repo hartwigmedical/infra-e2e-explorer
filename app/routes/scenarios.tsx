@@ -398,7 +398,7 @@ function buildHistorySql(featureUri: string, scenarioId: string): string {
   `;
 }
 
-// Steps come from the v_steps VIEW (read from the slim Parquet on demand), not a
+// Steps come from the v_steps VIEW (read from the cached Parquet on demand), not a
 // materialized table - see server/data/store.ts.
 function buildStepHistorySql(featureUri: string, scenarioId: string): string {
   return `

@@ -139,7 +139,7 @@ export async function loader({ params }: Route.LoaderArgs) {
          FROM scenarios WHERE run_id = ${runIdLit}`,
       ),
       query<StepRow>(
-        // Steps come from the v_steps VIEW (slim Parquet, read on demand), not a
+        // Steps come from the v_steps VIEW (cached Parquet, read on demand), not a
         // materialized table - see server/data/store.ts.
         `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status, duration_s, has_error, error_message, is_background, glue_location
          FROM v_steps WHERE run_id = ${runIdLit} ORDER BY scenario_id, step_ordinal`,
@@ -1518,7 +1518,7 @@ export default function RunDetail() {
         if (!matches) return false;
       }
       // Union semantics: keep the scenario if it has ANY of the selected tags.
-      // tag_names comes back from duckdb-wasm as a list-like value, not a plain
+      // tag_names comes back from DuckDB as a list-like value, not a plain
       // Array (see the Array.from(...) usage in ScenarioRow_ below) - wrap it
       // before calling Array.prototype methods on it.
       if (

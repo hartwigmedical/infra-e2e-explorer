@@ -1,46 +1,49 @@
 /**
  * SQL for exposing the nested Cucumber JSON e2e reports as clean, flat,
- * queryable tables/views in DuckDB.
+ * queryable tables/views in DuckDB. Every statement the server-side data layer
+ * runs is built here, so this file is the single source of truth for the schema
+ * and the analysis. See server/data/store.ts for the orchestration.
  *
- * Loading strategy (see app/contexts/E2eDataContext.tsx for the orchestration):
+ * Loading strategy:
  *
- *   1. v_runs is built straight from the run list (runs.json / the /api/runs
- *      response) - no report parsing.
+ *   1. The `runs` table is built from the run list alone (buildRunsTableSql, an
+ *      in-memory VALUES list) - no report parsing.
  *   2. Each run's raw cucumber.json is parsed EXACTLY ONCE into a compact
- *      "slim" Parquet (buildSlimSelectSql): the feature/scenario/step structure
- *      with the embeddings' multi-MB base64 `data` blobs stripped (they're 90%+
- *      of a report's bytes). We keep the tiny embedding `name`/`mime_type` (for
+ *      Parquet (buildSlimSelectSql): the feature/scenario/step structure with
+ *      the embeddings' multi-MB base64 `data` blobs stripped (they're 90%+ of a
+ *      report's bytes). We keep the tiny embedding `name`/`mime_type` (for
  *      test_id extraction) AND the decoded text/plain scenario `log` (see
- *      SLIM_ELEMENTS_TYPE). That slim Parquet is cached in IndexedDB keyed by
- *      run_id (see app/lib/report-cache.ts), so a repeat session / loadMore
- *      skips the fetch+parse entirely.
- *   3. v_features reads the slim Parquet files (buildFeaturesViewSql), and
+ *      SLIM_ELEMENTS_TYPE). That Parquet is cached on disk, one file per run,
+ *      keyed by run_id (see server/data/cache.ts), so it survives restarts and
+ *      is shared by every request.
+ *   3. v_features reads those Parquet files (buildFeaturesViewSql), and
  *      v_scenarios / v_steps / test_ids / service_versions all run over
- *      v_features - i.e. over the cheap slim data, never the raw JSON again.
- *      E2eDataContext materialises those into the `scenarios` / `steps` /
- *      `test_ids` / `service_versions` tables the app actually queries.
+ *      v_features - i.e. over the cheap extracted data, never the raw JSON
+ *      again. The store materialises `scenarios` / `test_ids` /
+ *      `service_versions` as tables; v_steps stays a VIEW and is queried on
+ *      demand (steps are ~90% of the rows and only ever needed for one run or
+ *      one scenario at a time).
  *
- * Because the log is now IN the slim Parquet, nothing re-reads the raw JSON
- * once a run is cached: the run-detail Log button reads it from the run's slim
- * file (buildRunScenarioLogsSql) and the deployment panel derives service
+ * Because the log lives in the cached Parquet, nothing re-reads the raw JSON
+ * once a run is cached: the run-detail Log button reads it from v_features
+ * (see app/routes/runs.$runId.logs.tsx) and the deployment panel derives service
  * versions from it (buildServiceVersionsSelectSql).
  *
- * Why slim Parquet as the cache layer (rather than the final scenarios/steps
+ * Why cache the extracted structure (rather than the final scenarios/steps
  * tables): the expensive step is parsing the huge raw JSON; the analysis SQL
- * over the slim structure is cheap. Caching the slim structure means changing
- * status/background/test_id/service-version logic (or adding a column derived
- * from fields we already capture) needs NO cache invalidation - only changing
- * the *set of raw fields we extract* does, which auto-bumps SCHEMA_VERSION below.
+ * over the extracted structure is cheap. So changing status/background/test_id/
+ * service-version logic (or adding a column derived from fields we already
+ * capture) needs NO cache invalidation - only changing the *extraction* does,
+ * which is what CACHE_VERSION below is for.
  *
- * v_features uses an EXPLICIT `columns` schema for read_json rather than
- * auto-detection: auto-detection OOMs the wasm heap across dozens of files, and
- * explicit typing also sidesteps schema drift between report eras. Extracting
- * one file at a time (see E2eDataContext) bounds peak parse memory to a single
- * report, even though the read now materialises that file's base64 `data`
- * transiently to decode the log (buildSlimSelectSql drops it before storing).
+ * read_json uses an EXPLICIT `columns` schema rather than auto-detection:
+ * explicit typing sidesteps schema drift between report eras (and bounds parse
+ * memory). Extraction runs one report at a time, so peak parse memory stays
+ * bounded to a single report even though the read materialises that file's
+ * base64 `data` transiently to decode the log (buildSlimSelectSql drops it
+ * before storing).
  *
- * Validated against real report files (public/data) via the DuckDB CLI before
- * being wired into the browser.
+ * Validated against real report files (public/data) via the DuckDB CLI.
  */
 
 function sqlStringLiteral(value: string): string {
@@ -66,11 +69,11 @@ function sqlArrayLiteral(values: string[]): string {
 //    same source shape but WITHOUT the derived `log` and WITH the after
 //    embeddings' base64 `data`, which buildSlimSelectSql decodes into `log` and
 //    then drops. So those blobs are read transiently (one report at a time, so
-//    parse memory stays bounded) but never land in the slim Parquet.
+//    parse memory stays bounded) but never land in the cached Parquet.
 //
 // Storing the decoded log is what lets the run-detail Log button and the
-// service-versions extraction read from the cached slim Parquet - so nothing
-// re-fetches the raw JSON once a run is cached (see buildRunScenarioLogsSql and
+// service-versions extraction read from the cached Parquet - so nothing
+// re-fetches the raw JSON once a run is cached (see the logs resource route and
 // buildServiceVersionsSelectSql).
 const SLIM_ELEMENTS_TYPE = `STRUCT(
     id VARCHAR,
@@ -130,8 +133,8 @@ const SLIM_FEATURES_COLUMNS = `{'uri': 'VARCHAR', 'name': 'VARCHAR', 'keyword': 
 // Rebuild each raw element (SLIM_ELEMENTS_READ_TYPE) into the stored shape
 // (SLIM_ELEMENTS_TYPE): copy the blob-free fields as-is, rebuild `after` to keep
 // only the embeddings' mime_type/name (dropping `data`), and add the decoded
-// text/plain log as `log`. The decode mirrors buildRunScenarioLogsSql:
-// list_filter to the text/plain embedding BEFORE from_base64, so the zip blob is
+// text/plain log as `log`. list_filter narrows to the text/plain embedding
+// BEFORE from_base64, so the zip blob is
 // never decoded, and NULL-safe (no `after`/no text/plain embedding -> NULL log).
 const SLIM_ELEMENTS_REBUILD = `list_transform(elements, e -> struct_pack(
     id := e.id,
@@ -219,9 +222,9 @@ FROM (VALUES
 }
 
 /**
- * Build the SELECT that extracts ONE run's slim feature structure from its raw
- * cucumber.json, tagging every row with the known run_id. E2eDataContext wraps
- * this in `COPY (...) TO '<run>.parquet' (FORMAT parquet)` - one file at a time,
+ * Build the SELECT that extracts ONE run's feature structure from its raw
+ * cucumber.json, tagging every row with the known run_id. The cache wraps this
+ * in `COPY (...) TO '<run_id>.parquet' (FORMAT parquet)` - one file at a time,
  * so read_json's parse memory is bounded to a single report even though it must
  * parse past that file's base64 `data` blobs. SLIM_ELEMENTS_REBUILD decodes the
  * text/plain log into `log` and drops every `data`, so those blobs are read
@@ -231,7 +234,7 @@ FROM (VALUES
  *   /data/.../cucumber.json path (LOCAL) or a signed storage.googleapis.com URL
  *   (API mode).
  * @param runId - the run this report belongs to; injected as a literal column
- *   so the slim Parquet is self-describing regardless of the source URL.
+ *   so the cached Parquet is self-describing regardless of the source path.
  */
 export function buildSlimSelectSql(reportUrl: string, runId: string): string {
   const reportUrlArray = sqlArrayLiteral([reportUrl]);
@@ -244,9 +247,9 @@ FROM read_json(${reportUrlArray}, format = 'array',
 }
 
 /**
- * A zero-row SELECT with the exact slim-Parquet schema. E2eDataContext writes
- * this to a placeholder Parquet when a window has no runs at all, so v_features
- * (and the tables built over it) still exist with the right columns instead of
+ * A zero-row SELECT with the exact cached-Parquet schema. Used as v_features
+ * itself when there are no cached files at all (see buildEmptyFeaturesViewSql),
+ * so the derived views/tables still exist with the right columns instead of
  * read_parquet erroring on an empty file list.
  */
 export function buildEmptySlimSelectSql(): string {
@@ -392,7 +395,7 @@ CREATE OR REPLACE VIEW v_steps AS ${buildStepsSelectSql("v_scenarios")};`;
 /**
  * Build the (run_id, scenario_id, test_id) SELECT, pulling the "Log of test
  * <id>" id out of each scenario's after-hook text/plain log embedding NAME.
- * Reads from v_features (the slim Parquet) - which already dropped the base64
+ * Reads from v_features (the cached Parquet) - which already dropped the base64
  * `data` - so this is a single cheap pass over all runs, no batching needed
  * (unlike the old raw-JSON extraction, which had to batch to bound parse memory).
  *
@@ -438,11 +441,12 @@ WHERE e.type = 'scenario'`;
 // per service so the app can show "what was deployed for this run" and diff it
 // against the previous run - linking failures to deployments.
 //
-// This is ANALYSIS over the slim Parquet's stored `log` (like buildTestIdsSelectSql
-// over the embedding name), NOT a separate read of the raw report: E2eDataContext
-// materialises it into the `service_versions` table once per session. So it needs
-// no cache of its own, and editing the block regex/parse below needs no cache
-// invalidation - it just re-runs over the cached slim. Only the version block is
+// This is ANALYSIS over the cached Parquet's stored `log` (like
+// buildTestIdsSelectSql over the embedding name), NOT a separate read of the raw
+// report: the store materialises it into the `service_versions` table on each
+// rebuild. So it needs no cache of its own, and editing the block regex/parse
+// below needs no CACHE_VERSION bump - it just re-runs over the cached data. Only
+// the version block is
 // read; the rest of each log (which also carries synthetic patient/hospital ids)
 // is ignored.
 //
@@ -454,7 +458,7 @@ WHERE e.type = 'scenario'`;
 /**
  * Build the (run_id, service, spec, image, version, pipeline_version,
  * n_scenarios, distinct_blocks) SELECT over v_features's stored logs - one row
- * per (run, service). E2eDataContext wraps it in `CREATE OR REPLACE TABLE
+ * per (run, service). The store wraps it in `CREATE OR REPLACE TABLE
  * service_versions AS ...`.
  *
  * Pipeline: take each scenario's stored `log` -> regexp the "Running services:"

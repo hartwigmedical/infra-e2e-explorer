@@ -6,7 +6,7 @@ import { ensureData, query } from "~/lib/data.server";
  * the run-detail "Log" button fetches this on demand via useFetcher, so the
  * (potentially large) decoded logs never bloat the run-detail SSR payload.
  *
- * Logs live in the slim Parquet (decoded at extraction time), exposed as
+ * Logs live in the cached Parquet (decoded at extraction time), exposed as
  * v_features by the store; this reads them for the one run.
  */
 export async function loader({ params }: Route.LoaderArgs) {

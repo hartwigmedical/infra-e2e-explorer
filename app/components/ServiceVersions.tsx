@@ -19,11 +19,11 @@ export interface SvcRow {
   prev_spec: string | null;
   prev_version: string | null;
   prev_pv: string | null;
-  /** Booleans arrive from duckdb-wasm as JS booleans. */
+  /** Booleans arrive from DuckDB as JS booleans. */
   in_cur: boolean;
   in_prev: boolean;
-  /** run_id of the run we diff against (max run_id < this run in the loaded
-   *  window), or null when there's no earlier run loaded. Repeated per row. */
+  /** run_id of the run we diff against (the greatest run_id < this run, in the
+   *  chosen nightly/all scope), or null when there is no earlier run. */
   prev_run_id: string | null;
   /** Per-run meta, repeated on every current row (null on removed-only rows). */
   n_scenarios: number | null;
@@ -139,7 +139,7 @@ export function buildServiceVersionsModel(rows: SvcRow[]): ServiceVersionsModel 
   const prevRunId =
     rows.find((r) => r.prev_run_id != null)?.prev_run_id ?? null;
   // A baseline exists only when the previous run actually contributed version
-  // data - otherwise (no earlier run in the window, or its extraction failed)
+  // data - otherwise (no earlier run at all, or its extraction failed)
   // every service would spuriously read as "added", so we show a plain list.
   const hasBaseline = prevRunId != null && prevCount > 0;
   const distinctBlocks =
@@ -196,7 +196,7 @@ export function ServiceVersionsBody({
       <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1.5 border-b bg-muted/30 px-4 py-2 text-xs text-muted-foreground">
         <div>
           {!hasBaseline ? (
-            "No earlier run loaded to compare against"
+            "No earlier run to compare against"
           ) : changes.length === 0 ? (
             <span className="inline-flex items-center gap-1">
               No changes since

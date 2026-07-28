@@ -433,7 +433,7 @@ export default function Services() {
 
       {runIds.length === 0 || visibleLanes.length === 0 ? (
         <div className="rounded-lg border bg-card p-6 text-sm text-muted-foreground">
-          No service-version data in the loaded range.
+          No service-version data for these runs.
         </div>
       ) : (
         <>

@@ -1,10 +1,10 @@
 #!/usr/bin/env tsx
 /**
  * Measure the memory + disk footprint of holding the FULL dataset in the
- * server-side store, to inform dropping the window (SSR experiment follow-up).
+ * server-side store (the numbers behind the steps-on-demand decision).
  *
  * Materializes every local run (no window), then reports DuckDB memory, process
- * RSS, table row counts, and the on-disk slim-cache size — and extrapolates
+ * RSS, table row counts, and the on-disk cache size — and extrapolates
  * per-run so we can project to a large bucket.
  *
  * Run: npx tsx scripts/measure-footprint.ts
