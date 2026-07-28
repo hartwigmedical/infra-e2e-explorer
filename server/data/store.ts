@@ -19,23 +19,18 @@
  * re-runs it periodically to pick up new runs (see warm.ts).
  */
 
-import { writeFile, mkdir } from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import {
-  buildRunsViewSql,
+  buildRunsTableSql,
   buildFeaturesViewSql,
-  buildEmptySlimSelectSql,
+  buildEmptyFeaturesViewSql,
   buildScenariosStepsViewsSql,
   buildTestIdsSelectSql,
   buildServiceVersionsSelectSql,
 } from "../../app/lib/e2e-views.ts";
 import { query as duckQuery, run as duckRun } from "./engine.ts";
-import { SlimCache } from "./slim-cache.ts";
+import { ReportCache } from "./cache.ts";
 import { createReportSource, type ReportSource } from "./sources.ts";
 import { startWarming } from "./warm.ts";
-
-const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
 /** `since` that includes every run (run ids start with a 4-digit year). */
 const ALL_SINCE = "0000-01-01";
@@ -46,8 +41,7 @@ export interface StoreState {
 }
 
 export class E2eStore {
-  private cache: SlimCache;
-  private workDir: string;
+  private cache: ReportCache;
   /** Serializes rebuilds so overlapping SSR requests don't race. */
   private chain: Promise<StoreState> = Promise.resolve({ runCount: 0 });
   private current: StoreState | null = null;
@@ -57,14 +51,8 @@ export class E2eStore {
    *  Short, like the old run-list cache - the bucket is append-only. */
   private readonly refreshTtlMs = 60_000;
 
-  constructor(
-    private source: ReportSource = createReportSource(),
-    workDir = process.env.E2E_CACHE_DIR
-      ? path.join(process.env.E2E_CACHE_DIR, "work")
-      : path.join(REPO_ROOT, ".cache", "work"),
-  ) {
-    this.cache = new SlimCache(this.source);
-    this.workDir = workDir;
+  constructor(private source: ReportSource = createReportSource()) {
+    this.cache = new ReportCache(this.source);
   }
 
   /** The materialized dataset, if any. */
@@ -96,41 +84,31 @@ export class E2eStore {
   }
 
   private async rebuild(): Promise<StoreState> {
-    await mkdir(this.workDir, { recursive: true });
-
     const runs = await this.source.listRuns(ALL_SINCE);
 
-    // v_runs: reuse the run-list SQL (date/status/nightly parsing) by writing
-    // the run list to a JSON file read_json can consume.
-    const runsJsonPath = path.join(this.workDir, "runs.json");
-    await writeFile(
-      runsJsonPath,
-      JSON.stringify(
+    // runs table built in-memory from the run list (VALUES) - no runs.json file.
+    await duckRun(
+      `CREATE OR REPLACE TABLE runs AS ${buildRunsTableSql(
         runs.map((r) => ({
           run_id: r.run_id,
           source: r.source,
           updated: r.updated,
           size_bytes: r.size_bytes,
         })),
-      ),
+      )};`,
     );
-    await duckRun(buildRunsViewSql(runsJsonPath));
-    await duckRun(`CREATE OR REPLACE TABLE runs AS SELECT * FROM v_runs;`);
 
-    // Slim Parquet for every run (cached; only new runs pay to extract).
-    const slimPaths = await this.cache.ensureMany(runs);
+    // Cached Parquet for every run (cached; only new runs pay to extract).
+    const files = await this.cache.ensureMany(runs);
 
-    // v_features over all slim files. With none, write a typed zero-row
-    // placeholder so the views/tables still exist with the right schema.
-    let featureFiles = slimPaths;
-    if (featureFiles.length === 0) {
-      const placeholder = path.join(this.workDir, "slim_empty.parquet");
-      await duckRun(
-        `COPY (${buildEmptySlimSelectSql()}) TO '${placeholder}' (FORMAT parquet);`,
-      );
-      featureFiles = [placeholder];
-    }
-    await duckRun(buildFeaturesViewSql(featureFiles));
+    // v_features over all cached files, or a typed zero-row view when there are
+    // none - so the derived views/tables always exist with the right schema (no
+    // placeholder file needed).
+    await duckRun(
+      files.length > 0
+        ? buildFeaturesViewSql(files)
+        : buildEmptyFeaturesViewSql(),
+    );
     // Creates the v_scenarios + v_steps VIEWS. v_steps is queried on demand for
     // run-detail steps and scenario step-history - we never materialize it.
     await duckRun(buildScenariosStepsViewsSql());

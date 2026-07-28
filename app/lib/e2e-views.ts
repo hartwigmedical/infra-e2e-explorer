@@ -161,43 +161,49 @@ const SLIM_ELEMENTS_REBUILD = `list_transform(elements, e -> struct_pack(
   .trim();
 
 /**
- * FNV-1a 32-bit hash -> 8 hex chars. Small, stable, dependency-free; used only
- * to fingerprint the extraction schema for cache versioning, not for security.
+ * Cache version. BUMP THIS whenever you change the EXTRACTION logic - i.e. what
+ * or how we store in the per-run Parquet (SLIM_FEATURES_COLUMNS,
+ * SLIM_ELEMENTS_READ_TYPE, SLIM_ELEMENTS_REBUILD, SLIM_ELEMENTS_TYPE, or
+ * buildSlimSelectSql). Cached files live under a `<CACHE_VERSION>/` directory
+ * (see server/data/cache.ts), so bumping this makes every run re-extract into a
+ * fresh dir and the old one is simply never read again.
+ *
+ * You do NOT need to bump for changes to the ANALYSIS SQL that runs OVER the
+ * cached data (status/background/test-id/service-version logic, the
+ * scenarios/steps derivation) - that re-runs against the cache every rebuild.
  */
-function fnv1a(input: string): string {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < input.length; i++) {
-    h ^= input.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(16).padStart(8, "0");
+export const CACHE_VERSION = "1";
+
+/** One entry of the run list, used to build the `runs` table in memory. */
+export interface RunListEntry {
+  run_id: string;
+  source: string;
+  updated: string | null;
+  size_bytes: number | null;
 }
 
-// Bump to force-invalidate every cached slim report regardless of schema (e.g.
-// after a change to the slim SELECT/analysis that the schema hash below can't
-// see). Normally you never touch this: editing SLIM_FEATURES_COLUMNS already
-// changes the hash and clears the cache automatically.
-const CACHE_SALT = "1";
-
 /**
- * Identifies the shape of the cached slim Parquet. The report cache clears
- * itself whenever this changes (see report-cache.ts), so any edit to the set of
- * raw fields we extract auto-invalidates stale caches - clients self-heal on
- * their next load (one slow load, then fast again). Derived from the extraction
- * schema so it can't be forgotten; CACHE_SALT is the manual escape hatch.
+ * Build a SELECT that produces the `runs` table (with the derived
+ * date/time/status/nightly columns) directly from an in-memory VALUES list - no
+ * runs.json round-trip. Native DuckDB has no virtual FS, so this replaces the
+ * old read_json(file) path. An empty list yields a correctly-typed zero-row
+ * result (a single NULL row filtered out) so the table always has the right
+ * schema.
  */
-export const SCHEMA_VERSION = `v${CACHE_SALT}-${fnv1a(SLIM_FEATURES_COLUMNS)}`;
-
-/**
- * Build the CREATE OR REPLACE VIEW for v_runs from the run list. `runsJsonUrl`
- * is either an absolute URL to runs.json (LOCAL mode) or the name of a file
- * registered into duckdb-wasm's virtual filesystem via registerFileText (API
- * mode) - read_json doesn't care which. No report parsing happens here.
- */
-export function buildRunsViewSql(runsJsonUrl: string): string {
-  const runsJsonLiteral = sqlStringLiteral(runsJsonUrl);
+export function buildRunsTableSql(runs: RunListEntry[]): string {
+  const rows =
+    runs.length > 0
+      ? runs
+          .map(
+            (r) =>
+              `(${sqlStringLiteral(r.run_id)}, ${sqlStringLiteral(r.source)}, ` +
+              `${r.updated == null ? "NULL" : sqlStringLiteral(r.updated)}, ` +
+              `${r.size_bytes == null ? "NULL" : r.size_bytes})`,
+          )
+          .join(",\n    ")
+      : "(CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), CAST(NULL AS BIGINT))";
+  const emptyFilter = runs.length > 0 ? "" : "\nWHERE false";
   return `
-CREATE OR REPLACE VIEW v_runs AS
 SELECT
   run_id, source, updated, size_bytes,
   strptime(regexp_extract(run_id, '^(\\d{4}-\\d{2}-\\d{2})', 1), '%Y-%m-%d')      AS run_date,
@@ -207,7 +213,9 @@ SELECT
   try_cast(regexp_extract(run_id, 'failed-(\\d+)-of-\\d+', 1) AS INTEGER)          AS failed_count,
   try_cast(regexp_extract(run_id, '-of-(\\d+)', 1) AS INTEGER)                    AS total_count,
   (regexp_extract(run_id, '^\\d{4}-\\d{2}-\\d{2}-(\\d{4})', 1) IN ('0000','0100','0200')) AS is_nightly
-FROM read_json(${runsJsonLiteral});`;
+FROM (VALUES
+    ${rows}
+) AS t(run_id, source, updated, size_bytes)${emptyFilter}`;
 }
 
 /**
@@ -253,41 +261,48 @@ SELECT
 WHERE false`;
 }
 
-/**
- * Build CREATE OR REPLACE VIEW v_features over the given slim-Parquet files
- * (names registered in duckdb-wasm's virtual filesystem). One row per
- * (run, feature); run_id is stored in the Parquet by buildSlimSelectSql.
- */
-export function buildFeaturesViewSql(parquetNames: string[]): string {
-  const parquetArray = sqlArrayLiteral(parquetNames);
-  return `
-CREATE OR REPLACE VIEW v_features AS
-SELECT run_id, feature_uri, feature_name, feature_keyword, feature_tags, elements
-FROM read_parquet(${parquetArray});`;
+/** `read_parquet([...])` over a list of on-disk Parquet paths. */
+export function readParquetSql(parquetPaths: string[]): string {
+  return `read_parquet(${sqlArrayLiteral(parquetPaths)})`;
 }
 
 /**
- * Build the CREATE OR REPLACE VIEW statements for v_scenarios and v_steps. Both
- * read from v_features (the slim Parquet), so they never touch the raw JSON.
+ * Build CREATE OR REPLACE VIEW v_features over the given per-run slim-Parquet
+ * files. One row per (run, feature); run_id is stored in the Parquet by
+ * buildSlimSelectSql.
+ */
+export function buildFeaturesViewSql(parquetPaths: string[]): string {
+  return `
+CREATE OR REPLACE VIEW v_features AS
+SELECT run_id, feature_uri, feature_name, feature_keyword, feature_tags, elements
+FROM ${readParquetSql(parquetPaths)};`;
+}
+
+/** v_features with no files at all: a typed zero-row view (no placeholder file
+ *  needed), so the derived views/tables still exist with the right schema. */
+export function buildEmptyFeaturesViewSql(): string {
+  return `CREATE OR REPLACE VIEW v_features AS ${buildEmptySlimSelectSql()};`;
+}
+
+/**
+ * The v_scenarios SELECT, parameterized by the features source relation (a view
+ * name like `v_features`, or an inline `read_parquet([...])` for one run). One
+ * row per (run, scenario).
  *
- * v_scenarios: one row per (run, scenario). A feature's Background runs as a
- * SEPARATE 'background' element emitted immediately before each scenario; we
- * fold its steps into that scenario - tagged is_background = true and (via their
- * lower line numbers, which sort first in v_steps) ordered ahead of the
- * scenario's own steps - so duration_s, status, and the step list all account
- * for setup. Crucially a failed background step therefore correctly makes the
- * scenario 'failed' (its own steps report as 'skipped' when the background fails).
+ * A feature's Background runs as a SEPARATE 'background' element emitted
+ * immediately before each scenario; we fold its steps into that scenario -
+ * tagged is_background = true and (via their lower line numbers, which sort
+ * first in v_steps) ordered ahead of the scenario's own steps - so duration_s,
+ * status, and the step list all account for setup. A failed background step
+ * therefore correctly makes the scenario 'failed'.
  *
  * Pairing is by ARRAY ADJACENCY, not line: every emitted background element
- * carries the SAME line (the Background's single definition line) and a NULL id,
- * so a line/lead-based match collapses them into one tie and folds the
- * background into only one scenario per feature. Instead we zip each element
- * with its 1-based position in the elements array (elem_idx) and join each
- * scenario to the element at elem_idx - 1 when that is a background.
+ * carries the SAME line and a NULL id, so we zip each element with its 1-based
+ * position (elem_idx) and join each scenario to the element at elem_idx - 1 when
+ * that is a background.
  */
-export function buildScenariosStepsViewsSql(): string {
+export function buildScenariosSelectSql(featuresRelation: string): string {
   return `
-CREATE OR REPLACE VIEW v_scenarios AS
 WITH elems AS (
   SELECT run_id, feature_uri, feature_name, elem_idx,
          e.type AS elem_type, e.id AS elem_id, e.name AS elem_name, e.line AS elem_line,
@@ -297,7 +312,7 @@ WITH elems AS (
     SELECT f.run_id, f.feature_uri, f.feature_name,
            unnest(f.elements) AS e,
            unnest(range(1, len(f.elements) + 1)) AS elem_idx
-    FROM v_features f
+    FROM ${featuresRelation} f
   )
 ),
 bg AS (
@@ -346,9 +361,13 @@ SELECT run_id, feature_uri, feature_name, scenario_id, scenario_name, ordinal, s
     ELSE 'passed'
   END AS status,
   steps
-FROM combined;
+FROM combined`;
+}
 
-CREATE OR REPLACE VIEW v_steps AS
+/** The v_steps SELECT (flatten scenario steps), parameterized by the scenarios
+ *  source relation (a view name, or an inline scenarios subquery for one run). */
+export function buildStepsSelectSql(scenariosRelation: string): string {
+  return `
 SELECT sc.run_id, sc.feature_uri, sc.scenario_id, sc.scenario_name,
   trim(s.keyword) || ' ' || s.name AS step_label, s.name AS step_name, trim(s.keyword) AS step_keyword,
   row_number() OVER (PARTITION BY sc.run_id, sc.scenario_id ORDER BY s.line) AS step_ordinal,
@@ -358,7 +377,16 @@ SELECT sc.run_id, sc.feature_uri, sc.scenario_id, sc.scenario_name,
   (s.result.error_message IS NOT NULL) AS has_error,
   left(s.result.error_message, 2000) AS error_message,
   s.match.location AS glue_location
-FROM v_scenarios sc, UNNEST(sc.steps) AS t(s);`;
+FROM ${scenariosRelation} sc, UNNEST(sc.steps) AS t(s)`;
+}
+
+/** Global v_scenarios + v_steps views over v_features (all runs). Run detail and
+ *  cross-run step history both read v_steps with a `WHERE run_id`/feature filter
+ *  and trust DuckDB to skip non-matching per-run files via Parquet stats. */
+export function buildScenariosStepsViewsSql(): string {
+  return `
+CREATE OR REPLACE VIEW v_scenarios AS ${buildScenariosSelectSql("v_features")};
+CREATE OR REPLACE VIEW v_steps AS ${buildStepsSelectSql("v_scenarios")};`;
 }
 
 /**
@@ -391,32 +419,6 @@ SELECT f.run_id,
 FROM v_features f,
      UNNEST(f.elements) AS t(e)
 WHERE e.type = 'scenario'`;
-}
-
-/**
- * Virtual-filesystem name of a run's slim Parquet. E2eDataContext registers each
- * run's slim buffer under this name; the log query below targets the same name,
- * so the two can't drift.
- */
-export function slimParquetName(runId: string): string {
-  return `slim_${runId}.parquet`;
-}
-
-/**
- * Build a SELECT of (scenario_id, log) for a SINGLE run, read from its slim
- * Parquet - the decoded text/plain log now lives there (see SLIM_ELEMENTS_TYPE),
- * so the run-detail "Log" button never re-fetches the raw report. Scoped to the
- * one run's file (not v_features across the whole window) so opening a log reads
- * only that ~100 KB Parquet. NULL-safe: a scenario with no text/plain log stored
- * a NULL `log` at extraction time.
- */
-export function buildRunScenarioLogsSql(runId: string): string {
-  const parquetArray = sqlArrayLiteral([slimParquetName(runId)]);
-  return `
-SELECT e.id AS scenario_id, e.log AS log
-FROM read_parquet(${parquetArray}) f,
-     UNNEST(f.elements) AS t(e)
-WHERE e."type" = 'scenario'`;
 }
 
 // ---------------------------------------------------------------------------

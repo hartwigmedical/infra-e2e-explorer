@@ -1,68 +1,69 @@
 /**
- * On-disk slim-Parquet cache for the server-side data layer (SSR experiment,
- * Phase 1). The server-side analogue of app/lib/report-cache.ts (IndexedDB), but
- * SHARED across all users instead of per-browser.
+ * On-disk per-run Parquet cache for the server-side data layer. Shared across
+ * all users (in prod it lives on a gcsfuse-mounted GCS bucket).
  *
- * Each run's raw cucumber.json is parsed to a compact slim Parquet EXACTLY ONCE
+ * Each run's raw cucumber.json is parsed to a compact Parquet EXACTLY ONCE
  * (buildSlimSelectSql - see app/lib/e2e-views.ts), then reused forever: a run
  * folder is immutable, so a cached file whose recorded size_bytes/source still
- * match the manifest is trusted as-is. Files live under a SCHEMA_VERSION dir, so
- * an extraction-schema change (which bumps SCHEMA_VERSION) lands in a fresh dir
- * and old files are simply never read again.
+ * match the manifest is trusted as-is. Files live under a CACHE_VERSION dir, so
+ * bumping CACHE_VERSION (on any extraction change) lands everything in a fresh
+ * dir and the old one is simply never read again:
  *
- *   <cacheRoot>/<SCHEMA_VERSION>/slim_<run_id>.parquet   (the slim data)
- *   <cacheRoot>/<SCHEMA_VERSION>/slim_<run_id>.json      (validation sidecar)
+ *   <cacheRoot>/<CACHE_VERSION>/<run_id>.parquet   (the data)
+ *   <cacheRoot>/<CACHE_VERSION>/<run_id>.json      (validation sidecar)
  *
- * Extraction goes through native DuckDB: COPY (buildSlimSelectSql(rawPath,id)) TO
- * '<file>'. read_json reads the raw report path from the ReportSource (a local
- * public/data file, or a temp file the GCS source downloaded); the multi-MB
- * base64 blobs are decoded transiently for the log and dropped before the write.
+ * One file per run means run-scoped queries (`WHERE run_id = X`) let DuckDB skip
+ * non-matching files via Parquet stats. Extraction goes through native DuckDB:
+ * COPY (buildSlimSelectSql(rawPath,id)) TO '<file>'. The raw report path comes
+ * from the ReportSource (a local public/data file, or a temp file the GCS source
+ * downloaded); the multi-MB base64 blobs are decoded transiently for the log and
+ * dropped before the write.
  */
 
 import { mkdir, readFile, writeFile, rename, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { SCHEMA_VERSION, buildSlimSelectSql } from "../../app/lib/e2e-views.ts";
+import { CACHE_VERSION, buildSlimSelectSql } from "../../app/lib/e2e-views.ts";
 import { withConnection } from "./engine.ts";
 import type { ReportSource, RunInfo } from "./sources.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
-/** Sidecar recording what a cached slim file was extracted from, so a re-upload
- *  (changed size_bytes/source) forces a re-extract - matching the SPA cache. */
-interface SlimSidecar {
+/** Sidecar recording what a cached file was extracted from, so a re-upload
+ *  (changed size_bytes/source) forces a re-extract. */
+interface CacheSidecar {
   run_id: string;
   size_bytes: number | null;
   source: string;
   extractedAt: number;
 }
 
-export class SlimCache {
+export class ReportCache {
   private dir: string;
 
   constructor(
     private source: ReportSource,
-    cacheRoot = process.env.E2E_CACHE_DIR ||
-      path.join(REPO_ROOT, ".cache", "slim"),
+    cacheRoot = process.env.E2E_CACHE_DIR || path.join(REPO_ROOT, ".cache"),
   ) {
-    this.dir = path.join(cacheRoot, SCHEMA_VERSION);
+    this.dir = path.join(cacheRoot, CACHE_VERSION);
   }
 
-  private parquetPath(runId: string): string {
-    return path.join(this.dir, `slim_${runId}.parquet`);
+  /** Path to a run's cached Parquet (whether or not it exists yet). */
+  fileFor(runId: string): string {
+    return path.join(this.dir, `${runId}.parquet`);
   }
   private sidecarPath(runId: string): string {
-    return path.join(this.dir, `slim_${runId}.json`);
+    return path.join(this.dir, `${runId}.json`);
   }
 
-  /** True when a valid cached slim file exists for this exact run version. */
+  /** True when a valid cached file exists for this exact run version. */
   private async isFresh(run: RunInfo): Promise<boolean> {
-    const parquet = this.parquetPath(run.run_id);
+    const parquet = this.fileFor(run.run_id);
     const sidecar = this.sidecarPath(run.run_id);
     if (!existsSync(parquet) || !existsSync(sidecar)) return false;
     try {
-      const meta = JSON.parse(await readFile(sidecar, "utf8")) as SlimSidecar;
+      const meta = JSON.parse(await readFile(sidecar, "utf8")) as CacheSidecar;
       return meta.size_bytes === run.size_bytes && meta.source === run.source;
     } catch {
       return false;
@@ -70,13 +71,13 @@ export class SlimCache {
   }
 
   /**
-   * Path to the run's slim Parquet, extracting on a miss. Isolated per run - a
+   * Path to the run's cached Parquet, extracting on a miss. Isolated per run - a
    * failed extraction throws for THAT run only (the store skips it), never
-   * corrupts the cache: we COPY to a temp file and atomically rename on success.
+   * corrupts the cache: we COPY to a temp file and rename on success.
    */
-  async ensureSlim(run: RunInfo): Promise<string> {
+  async ensure(run: RunInfo): Promise<string> {
     await mkdir(this.dir, { recursive: true });
-    const parquet = this.parquetPath(run.run_id);
+    const parquet = this.fileFor(run.run_id);
     if (await this.isFresh(run)) return parquet;
 
     const opened = await this.source.openReport(run);
@@ -89,7 +90,7 @@ export class SlimCache {
         conn.run(`COPY (${select}) TO '${tmp}' (FORMAT parquet);`),
       );
       await rename(tmp, parquet);
-      const sidecar: SlimSidecar = {
+      const sidecar: CacheSidecar = {
         run_id: run.run_id,
         size_bytes: run.size_bytes,
         source: run.source,
@@ -104,9 +105,9 @@ export class SlimCache {
   }
 
   /**
-   * Ensure slim Parquet for every run, returning the paths that succeeded (a
-   * per-run failure is logged and omitted, never fatal - mirrors the SPA's
-   * per-run isolation). Bounded concurrency keeps peak parse memory in check.
+   * Ensure a cached Parquet for every run, returning the paths that succeeded (a
+   * per-run failure is logged and omitted, never fatal). Bounded concurrency
+   * keeps peak parse memory in check.
    */
   async ensureMany(runs: RunInfo[], concurrency = 6): Promise<string[]> {
     const paths: string[] = [];
@@ -115,10 +116,10 @@ export class SlimCache {
       while (next < runs.length) {
         const run = runs[next++];
         try {
-          paths.push(await this.ensureSlim(run));
+          paths.push(await this.ensure(run));
         } catch (err) {
           console.warn(
-            `[slim-cache] extraction failed for ${run.run_id} (run omitted):`,
+            `[cache] extraction failed for ${run.run_id} (run omitted):`,
             (err as Error)?.message ?? err,
           );
         }
@@ -130,7 +131,7 @@ export class SlimCache {
     return paths;
   }
 
-  /** The SCHEMA_VERSION-scoped cache directory (for globbing in the store). */
+  /** The CACHE_VERSION-scoped cache directory. */
   get directory(): string {
     return this.dir;
   }

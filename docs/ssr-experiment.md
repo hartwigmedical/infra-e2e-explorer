@@ -268,6 +268,33 @@ all render with clean consoles and working interactions.
 Still open: the recent-N default is fixed at 60 (could be smarter); the GCS
 `cache/` mirror for warm Cloud Run cold starts remains deferred.
 
+### Cache/glue cleanup (for the gcsfuse-mounted cache)
+
+The cache will live on a **gcsfuse-mounted GCS bucket** (shared + durable across
+Cloud Run instances); the app just uses a filesystem path, so it stays
+gcsfuse-agnostic. To make that clean:
+
+- **No work dir, no per-rebuild file writes.** The two synthetic files the store
+  used to write each rebuild are gone: the `runs` table is now built in-memory
+  from a `VALUES` list (`buildRunsTableSql`), and the empty-dataset case uses a
+  typed `… WHERE false` view (`buildEmptyFeaturesViewSql`) instead of a
+  placeholder Parquet. `E2E_CACHE_DIR` holds **only** the per-run Parquet — no
+  write churn through FUSE.
+- **One file per run, no "slim" naming:** `<cacheRoot>/<CACHE_VERSION>/<run_id>.parquet`
+  (+ `.json` sidecar). `server/data/cache.ts` (was `slim-cache.ts`).
+- **Invalidation = a hand-bumped `CACHE_VERSION`** constant (replaced the schema
+  hash). Bump it on any *extraction* change; files land in a fresh
+  `<CACHE_VERSION>/` dir and the old one is orphaned (clean up via a GCS
+  lifecycle rule). No bump needed for analysis-SQL changes.
+- **Run-scoped step reads trust DuckDB.** Run detail queries `v_steps WHERE
+  run_id = X` over the per-run files and relies on Parquet stats to skip
+  non-matching files (each file is one run → min=max run_id). Measured ~60–80 ms
+  warm at 60 files locally. If gcsfuse file-open chatter makes this too slow at
+  higher file counts, add single-file reads or hive partitioning then — the
+  scenarios/steps derivation is already factored (`buildScenariosSelectSql` /
+  `buildStepsSelectSql` take a source relation) so scoping it to one file is a
+  small follow-up.
+
 ## Guardrails
 
 - All work on the `ssr-experiment` branch; `main`'s SPA stays live for A/B.
