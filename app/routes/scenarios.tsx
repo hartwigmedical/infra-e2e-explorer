@@ -18,7 +18,7 @@ import {
 import type { Route } from "./+types/scenarios";
 import { useRunScope } from "~/contexts/RunScopeContext";
 import { ensureData, query } from "~/lib/data.server";
-import { recentRunsFromRequest, RUNS_PARAM } from "~/lib/view";
+import { recentRunsFromRequest, RUNS_PARAM, showAllRunCount } from "~/lib/view";
 import StatusMark from "~/components/StatusMark";
 import TagFilter from "~/components/TagFilter";
 import {
@@ -1757,6 +1757,16 @@ export default function Scenarios() {
   } = useLoaderData<typeof loader>();
   const [searchParams, setSearchParams] = useSearchParams();
 
+  // "Show all" keeps every other param (filters, metric, selection, ?run=): the
+  // old `?runs=N` template dropped them, silently resetting the page. Capped at
+  // what `?runs=` will actually honour (see showAllRunCount).
+  const showAllRuns = showAllRunCount(totalRuns);
+  const showAllTo = useMemo(() => {
+    const next = new URLSearchParams(searchParams);
+    next.set(RUNS_PARAM, String(showAllRuns));
+    return `?${next}`;
+  }, [searchParams, showAllRuns]);
+
   // Filters + metric live in the URL (alongside the ?feature=&scenario=
   // selection) so they survive deep links and Back navigation. Each is derived
   // from the params; `patchFilters` (their only writer) uses replace so
@@ -2225,16 +2235,16 @@ export default function Scenarios() {
               <p className="text-xs text-muted-foreground">
                 {filteredScenarios.length} scenario(s) · {runIds.length} run(s),
                 oldest → newest.
-                {totalRuns > recentRuns && (
+                {showAllRuns > recentRuns && (
                   <>
                     {" "}
                     Showing the {recentRuns} most recent;{" "}
                     <Link
-                      to={`?${RUNS_PARAM}=${totalRuns}`}
+                      to={showAllTo}
                       preventScrollReset
                       className="underline decoration-dotted underline-offset-2 hover:text-foreground"
                     >
-                      show all {totalRuns}
+                      show all {showAllRuns}
                     </Link>
                     .
                   </>

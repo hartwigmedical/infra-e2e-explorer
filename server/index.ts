@@ -19,7 +19,8 @@ const PORT = Number(process.env.PORT) || 3001;
 
 // Host serving the Cluecumber HTML reports. Differs per environment, so it's a
 // runtime var (not build-time) — one built client bundle is shared across
-// deployments, so the value must be injected at serve time via /config.js.
+// deployments. The app reads it through the shell loader (app/layout.tsx), which
+// runs on the server; this is only for the startup banner below.
 const CLUECUMBER_BASE_URL =
   process.env.CLUECUMBER_BASE_URL || "http://e2e-test-reports.pilot-1";
 
@@ -31,16 +32,6 @@ const app = express();
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
-});
-
-// Runtime config for the client. Served as a classic (render-blocking) script so
-// window.__APP_CONFIG__ is set before the app bundle runs — see app/lib/format.ts.
-app.get("/config.js", (_req, res) => {
-  res.type("application/javascript").send(
-    `window.__APP_CONFIG__=${JSON.stringify({
-      cluecumberBaseUrl: CLUECUMBER_BASE_URL,
-    })};`,
-  );
 });
 
 // ---------- React Router SSR ----------

@@ -26,9 +26,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CACHE_VERSION, buildSlimSelectSql } from "../../app/lib/e2e-views.ts";
 import { withConnection } from "./engine.ts";
+import { mapWithConcurrency } from "./concurrency.ts";
 import type { ReportSource, RunInfo } from "./sources.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+
+/** Concurrent sidecar reads when checking what's already cached (partition).
+ *  Higher than the extraction limit - these are tiny reads, not parses. */
+const FRESHNESS_CONCURRENCY = 32;
+
+/** Disambiguates concurrent extractions within this process (see ensure). */
+let nextTmpSeq = 0;
 
 /** Sidecar recording what a cached file was extracted from, so a re-upload
  *  (changed size_bytes/source) forces a re-extract. */
@@ -41,12 +49,44 @@ interface CacheSidecar {
 
 export class ReportCache {
   private dir: string;
+  /** Memoized writability probe (see ensureWritable). */
+  private writable: Promise<void> | null = null;
 
   constructor(
     private source: ReportSource,
     cacheRoot = process.env.E2E_CACHE_DIR || path.join(REPO_ROOT, ".cache"),
   ) {
     this.dir = path.join(cacheRoot, CACHE_VERSION);
+  }
+
+  /**
+   * Create the cache dir and prove we can write in it, once per process.
+   *
+   * Checked up front and FATAL by design: without a writable cache every
+   * extraction fails, and since per-run failures are (correctly) non-fatal the
+   * app would otherwise boot "successfully" and serve a run list with zero
+   * scenarios everywhere. `mkdir -p` alone isn't enough of a check - it succeeds
+   * on an existing dir we have no write permission on (e.g. a root-owned
+   * /app/.cache in the container while the process runs as `node`).
+   */
+  ensureWritable(): Promise<void> {
+    if (!this.writable) {
+      this.writable = (async () => {
+        const probe = path.join(this.dir, ".writable");
+        try {
+          await mkdir(this.dir, { recursive: true });
+          await writeFile(probe, "");
+          await rm(probe, { force: true });
+        } catch (err) {
+          // Not memoized on failure: a mount that appears late should recover.
+          this.writable = null;
+          throw new Error(
+            `cache dir is not writable: ${this.dir} - set E2E_CACHE_DIR to a writable path (${(err as Error)?.message ?? err})`,
+          );
+        }
+      })();
+    }
+    return this.writable;
   }
 
   /** Path to a run's cached Parquet (whether or not it exists yet). */
@@ -76,12 +116,17 @@ export class ReportCache {
    * corrupts the cache: we COPY to a temp file and rename on success.
    */
   async ensure(run: RunInfo): Promise<string> {
-    await mkdir(this.dir, { recursive: true });
+    await this.ensureWritable();
     const parquet = this.fileFor(run.run_id);
     if (await this.isFresh(run)) return parquet;
 
     const opened = await this.source.openReport(run);
-    const tmp = `${parquet}.tmp`;
+    // Unique per process AND per call: the cache is shared (a gcsfuse mount
+    // across instances), where a fixed `.tmp` name lets two extractions of the
+    // same run write the same bytes-in-progress, and `rename` is copy+delete
+    // rather than atomic. The sidecar is still written only AFTER the rename, so
+    // a half-copied file is never considered fresh - it just gets re-extracted.
+    const tmp = `${parquet}.${process.pid}-${nextTmpSeq++}.tmp`;
     try {
       const select = buildSlimSelectSql(opened.path, run.run_id);
       // Single-quote-safe: run ids and our own paths contain no single quotes.
@@ -105,30 +150,44 @@ export class ReportCache {
   }
 
   /**
+   * Split runs into the ones already cached (their Parquet paths) and the ones
+   * needing extraction. Reads only the sidecars, so it's cheap enough for the
+   * request path - what lets the store materialize over what's cached NOW and
+   * leave extraction to the background (see store.ts).
+   */
+  async partition(
+    runs: RunInfo[],
+  ): Promise<{ cached: string[]; missing: RunInfo[] }> {
+    const fresh = await mapWithConcurrency(runs, FRESHNESS_CONCURRENCY, (run) =>
+      this.isFresh(run),
+    );
+    const cached: string[] = [];
+    const missing: RunInfo[] = [];
+    runs.forEach((run, i) => {
+      if (fresh[i]) cached.push(this.fileFor(run.run_id));
+      else missing.push(run);
+    });
+    return { cached, missing };
+  }
+
+  /**
    * Ensure a cached Parquet for every run, returning the paths that succeeded (a
    * per-run failure is logged and omitted, never fatal). Bounded concurrency
    * keeps peak parse memory in check.
    */
   async ensureMany(runs: RunInfo[], concurrency = 6): Promise<string[]> {
-    const paths: string[] = [];
-    let next = 0;
-    const worker = async () => {
-      while (next < runs.length) {
-        const run = runs[next++];
-        try {
-          paths.push(await this.ensure(run));
-        } catch (err) {
-          console.warn(
-            `[cache] extraction failed for ${run.run_id} (run omitted):`,
-            (err as Error)?.message ?? err,
-          );
-        }
+    const paths = await mapWithConcurrency(runs, concurrency, async (run) => {
+      try {
+        return await this.ensure(run);
+      } catch (err) {
+        console.warn(
+          `[cache] extraction failed for ${run.run_id} (run omitted):`,
+          (err as Error)?.message ?? err,
+        );
+        return null;
       }
-    };
-    await Promise.all(
-      Array.from({ length: Math.min(concurrency, runs.length) }, worker),
-    );
-    return paths;
+    });
+    return paths.filter((p): p is string => p !== null);
   }
 
   /** The CACHE_VERSION-scoped cache directory. */

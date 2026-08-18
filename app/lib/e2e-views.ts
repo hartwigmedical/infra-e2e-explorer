@@ -402,8 +402,12 @@ CREATE OR REPLACE VIEW v_steps AS ${buildStepsSelectSql("v_scenarios")};`;
  * nullif('') because regexp_extract returns '' (not NULL) when the embedding
  * name doesn't match, so a scenario whose log name didn't parse becomes NULL
  * (no Test ID shown) rather than an empty-valued row.
+ *
+ * Parameterized by the features relation (like buildScenariosSelectSql) so a
+ * single out-of-window run can be read straight from its own Parquet - see
+ * E2eStore.outOfWindowRun.
  */
-export function buildTestIdsSelectSql(): string {
+export function buildTestIdsSelectSql(featuresRelation = "v_features"): string {
   return `
 SELECT f.run_id,
        e.id AS scenario_id,
@@ -419,7 +423,7 @@ SELECT f.run_id,
            'Log of test ([0-9]+)', 1
          ), ''
        ) AS test_id
-FROM v_features f,
+FROM ${featuresRelation} f,
      UNNEST(f.elements) AS t(e)
 WHERE e.type = 'scenario'`;
 }
@@ -457,9 +461,10 @@ WHERE e.type = 'scenario'`;
 
 /**
  * Build the (run_id, service, spec, image, version, pipeline_version,
- * n_scenarios, distinct_blocks) SELECT over v_features's stored logs - one row
- * per (run, service). The store wraps it in `CREATE OR REPLACE TABLE
- * service_versions AS ...`.
+ * n_scenarios, distinct_blocks) SELECT over the features relation's stored logs -
+ * one row per (run, service). The store wraps it in `CREATE OR REPLACE TABLE
+ * service_versions AS ...`; passing an inline `read_parquet([...])` instead reads
+ * one out-of-window run directly (see E2eStore.outOfWindowRun).
  *
  * Pipeline: take each scenario's stored `log` -> regexp the "Running services:"
  * block (anchored between the header and the next timestamped line) -> per run,
@@ -469,11 +474,13 @@ WHERE e.type = 'scenario'`;
  * columns are typed by the expressions, so an empty v_features still yields a
  * correctly typed empty table (no placeholder needed).
  */
-export function buildServiceVersionsSelectSql(): string {
+export function buildServiceVersionsSelectSql(
+  featuresRelation = "v_features",
+): string {
   return `
 WITH scen AS (
   SELECT f.run_id, e.log AS log
-  FROM v_features f,
+  FROM ${featuresRelation} f,
        UNNEST(f.elements) AS t(e)
   WHERE e."type" = 'scenario'
 ),

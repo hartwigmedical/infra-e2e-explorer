@@ -34,7 +34,9 @@ async function main() {
 
   // ---- COLD: nothing cached, every run is extracted from raw JSON ----
   const t0 = performance.now();
-  const cold = await store.ensure(true);
+  // ensureComplete, not ensure: this measures/asserts over the FULL dataset, so
+  // it has to wait for extraction (loaders deliberately don't - see store.ts).
+  const cold = await store.ensureComplete(true);
   const coldMs = Math.round(performance.now() - t0);
   console.log(
     `COLD build: ${cold.runCount} runs in ${coldMs}ms (${Math.round(coldMs / Math.max(cold.runCount, 1))}ms/run)`,
@@ -92,7 +94,7 @@ async function main() {
 
   // ---- WARM: rebuild again with every run's Parquet already on disk ----
   const t1 = performance.now();
-  const warm = await store.ensure(true);
+  const warm = await store.ensureComplete(true);
   const warmMs = Math.round(performance.now() - t1);
   console.log(
     `WARM build: ${warm.runCount} runs in ${warmMs}ms (cache hit; ${coldMs}ms -> ${warmMs}ms)`,

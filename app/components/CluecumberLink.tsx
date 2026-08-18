@@ -1,5 +1,7 @@
 import { ExternalLink } from "lucide-react";
+import { useRouteLoaderData } from "react-router";
 import { cn } from "~/lib/utils";
+import type { ShellData } from "~/layout";
 import { cluecumberRunUrl } from "~/lib/format";
 
 export interface CluecumberLinkProps {
@@ -18,9 +20,12 @@ export interface CluecumberLinkProps {
  * (dashboard rows) and icon+label (run detail header).
  */
 export default function CluecumberLink({ runId, label, className }: CluecumberLinkProps) {
+  // From the shell loader, so the href is identical on the server and after
+  // hydration (see cluecumberRunUrl).
+  const shell = useRouteLoaderData("layout") as ShellData | undefined;
   return (
     <a
-      href={cluecumberRunUrl(runId)}
+      href={cluecumberRunUrl(runId, shell?.cluecumberBaseUrl)}
       target="_blank"
       rel="noreferrer"
       title="Open Cluecumber report"

@@ -53,9 +53,6 @@ export function Layout({ children }: { children: React.ReactNode }) {
         {/* Empty inline icon so the browser doesn't request (and 404 on)
             /favicon.ico. Swap for a real icon later if desired. */}
         <link rel="icon" href="data:," />
-        {/* Runtime config from the server; classic (non-module) script so
-            window.__APP_CONFIG__ is set before the app bundle runs. */}
-        <script src="/config.js" />
         <Meta />
         <Links />
       </head>

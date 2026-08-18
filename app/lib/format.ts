@@ -108,29 +108,24 @@ export function scenarioHistoryPath(featureUri: string, scenarioId: string): str
 }
 
 /**
- * Fallback Cluecumber report host, used when the server hasn't supplied a
- * runtime value (e.g. `local`/static mode, or dev without the API proxy).
- * The per-deployment value comes from the server's CLUECUMBER_BASE_URL env
- * var via /config.js (see server/index.ts) — it MUST be runtime, not
- * build-time, because both deployments share one built client bundle.
+ * Fallback Cluecumber report host, used when the server hasn't supplied a value.
+ * The per-deployment value comes from the server's CLUECUMBER_BASE_URL env var —
+ * it MUST be runtime, not build-time, because every deployment shares one built
+ * client bundle. It reaches the client through the SHELL LOADER (app/layout.tsx),
+ * not a `window` global: under SSR there is no `window` while rendering, so
+ * reading one here produced markup with this default in every href and then a
+ * hydration mismatch wherever the deployment had set something else.
  */
-const DEFAULT_CLUECUMBER_BASE_URL = "http://e2e-test-reports.pilot-1";
-
-declare global {
-  interface Window {
-    __APP_CONFIG__?: { cluecumberBaseUrl?: string };
-  }
-}
+export const DEFAULT_CLUECUMBER_BASE_URL = "http://e2e-test-reports.pilot-1";
 
 /**
  * URL for a run's Cluecumber HTML report (run-level only - see CluecumberLink
  * for why we don't deep-link to a specific feature/scenario page).
  */
-export function cluecumberRunUrl(runId: string): string {
-  const base =
-    (typeof window !== "undefined" &&
-      window.__APP_CONFIG__?.cluecumberBaseUrl) ||
-    DEFAULT_CLUECUMBER_BASE_URL;
+export function cluecumberRunUrl(
+  runId: string,
+  baseUrl: string = DEFAULT_CLUECUMBER_BASE_URL,
+): string {
   // Tolerate the env var being set with or without a trailing slash.
-  return `${base.replace(/\/+$/, "")}/${encodeURIComponent(runId)}/`;
+  return `${baseUrl.replace(/\/+$/, "")}/${encodeURIComponent(runId)}/`;
 }

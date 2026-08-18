@@ -27,12 +27,19 @@ const WARM_ENABLED = process.env.E2E_WARM !== "0";
 
 let started = false;
 
-/** Materialize the full dataset (isolated + logged; `force` bypasses the TTL). */
+/** Materialize the full dataset (isolated + logged; `force` bypasses the TTL).
+ *  Uses the WAITING variant: doing the extraction here, off the request path, is
+ *  the entire point of warming - loaders only ever materialize what's cached. */
 async function warmOnce(store: E2eStore): Promise<void> {
   try {
     const t0 = Date.now();
-    const state = await store.ensure(true);
-    console.log(`[warm] ${state.runCount} runs ready in ${Date.now() - t0}ms`);
+    const state = await store.ensureComplete(true);
+    console.log(
+      `[warm] ${state.cachedRunCount}/${state.runCount} runs ready in ${Date.now() - t0}ms` +
+        (state.pendingRunCount > 0
+          ? ` (${state.pendingRunCount} not extracted)`
+          : ""),
+    );
   } catch (err) {
     console.warn(`[warm] failed:`, (err as Error)?.message ?? err);
   }

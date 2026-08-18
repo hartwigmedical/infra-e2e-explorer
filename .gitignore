@@ -8,3 +8,7 @@ public/data
 .vscode
 
 .cache
+
+# DuckDB spills here (its temp_directory defaults to the process CWD) when a
+# query exceeds memory - can reach tens of GB, so never let it near a commit.
+/.tmp

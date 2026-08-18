@@ -22,6 +22,7 @@ import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { mapWithConcurrency } from "./concurrency.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -44,6 +45,9 @@ export interface ReportSource {
   kind: "local" | "gcs";
   /** Runs whose date (run_id[:10]) is >= `since`, newest-first. */
   listRuns(since: string): Promise<RunInfo[]>;
+  /** One run by id, regardless of the store's window - null when it doesn't
+   *  exist. Backs on-demand loading of a run older than the window. */
+  resolveRun(runId: string): Promise<RunInfo | null>;
   /** A local file path to the run's raw cucumber.json (+ cleanup). */
   openReport(run: RunInfo): Promise<OpenedReport>;
 }
@@ -62,20 +66,29 @@ interface LocalManifestEntry {
   size_bytes: number;
 }
 
+/** How long a read of the local manifest is reused. Short, because `npm run
+ *  sync-data` rewrites it while the dev server is running - caching it for the
+ *  process lifetime meant new runs never showed up without a restart. */
+const MANIFEST_TTL_MS = 5_000;
+
 export class LocalReportSource implements ReportSource {
   readonly kind = "local" as const;
   private dataDir: string;
   private manifest: Map<string, LocalManifestEntry> | null = null;
+  private manifestReadAt = 0;
 
   constructor(dataDir = path.join(REPO_ROOT, "public", "data")) {
     this.dataDir = dataDir;
   }
 
   private async loadManifest(): Promise<Map<string, LocalManifestEntry>> {
-    if (this.manifest) return this.manifest;
+    if (this.manifest && Date.now() - this.manifestReadAt < MANIFEST_TTL_MS) {
+      return this.manifest;
+    }
     const raw = await readFile(path.join(this.dataDir, "runs.json"), "utf8");
     const entries = JSON.parse(raw) as LocalManifestEntry[];
     this.manifest = new Map(entries.map((e) => [e.run_id, e]));
+    this.manifestReadAt = Date.now();
     return this.manifest;
   }
 
@@ -90,6 +103,17 @@ export class LocalReportSource implements ReportSource {
         size_bytes: e.size_bytes,
         updated: e.updated,
       }));
+  }
+
+  async resolveRun(runId: string): Promise<RunInfo | null> {
+    const entry = (await this.loadManifest()).get(runId);
+    if (!entry) return null;
+    return {
+      run_id: entry.run_id,
+      source: entry.source,
+      size_bytes: entry.size_bytes,
+      updated: entry.updated,
+    };
   }
 
   async openReport(run: RunInfo): Promise<OpenedReport> {
@@ -109,6 +133,9 @@ export class LocalReportSource implements ReportSource {
 // ---------------------------------------------------------------------------
 
 const CANDIDATE_SOURCES = ["cucumber-parallel.json", "cucumber.json"];
+
+/** Concurrent per-run metadata lookups during a listing. */
+const META_CONCURRENCY = 8;
 
 export class GcsReportSource implements ReportSource {
   readonly kind = "gcs" as const;
@@ -159,7 +186,7 @@ export class GcsReportSource implements ReportSource {
   /** Resolve which candidate report object exists + its size/updated, memoized
    *  per run (see metaCache). Reports are named differently across report
    *  "eras", so we try the current name first. */
-  private async resolveMeta(runId: string): Promise<RunInfo | null> {
+  async resolveRun(runId: string): Promise<RunInfo | null> {
     const cached = this.metaCache.get(runId);
     if (cached) return cached;
 
@@ -175,9 +202,19 @@ export class GcsReportSource implements ReportSource {
         this.metaCache.set(runId, info);
         return info;
       } catch (err) {
-        if ((err as { code?: number })?.code !== 404) throw err;
+        // 404: this candidate doesn't exist in this run folder — try the next.
+        if ((err as { code?: number })?.code === 404) continue;
+        // Anything else (429/5xx/socket error) is transient and about ONE run:
+        // dropping the run from this listing costs a dashboard row for a cycle,
+        // whereas rethrowing would fail listRuns -> rebuild -> every loader, so
+        // one flaky HEAD would 500 the whole app. Not memoized, so the next
+        // rebuild re-checks it.
+        console.warn(
+          `[gcs] metadata lookup failed for ${runId}/${source} (run omitted this cycle):`,
+          (err as Error)?.message ?? err,
+        );
+        return null;
       }
-      // else: this candidate doesn't exist in this run folder — try the next.
     }
     // Not cached: a folder with no report yet may get one later (an in-flight
     // run), so we re-check it on the next listing rather than remembering null.
@@ -188,7 +225,12 @@ export class GcsReportSource implements ReportSource {
     const runIds = (await this.listRunIdPrefixes(since)).filter(
       (id) => id.slice(0, 10) >= since,
     );
-    const metas = await Promise.all(runIds.map((id) => this.resolveMeta(id)));
+    // Bounded: `runIds` is every run folder in the bucket and each uncached one
+    // costs up to 2 HEADs, so a cold process must not fan all of them out at
+    // once (metaCache is per-process, so every restart pays this).
+    const metas = await mapWithConcurrency(runIds, META_CONCURRENCY, (id) =>
+      this.resolveRun(id),
+    );
     return metas.filter((m): m is RunInfo => m !== null);
   }
 

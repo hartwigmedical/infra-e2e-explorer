@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import {
+  data,
   Link,
   useFetcher,
   useLoaderData,
@@ -31,7 +32,14 @@ import {
 import { toast } from "sonner";
 import type { Route } from "./+types/runs.$runId";
 import { useRunScope } from "~/contexts/RunScopeContext";
-import { ensureData, query } from "~/lib/data.server";
+import { ensureData, loadOutOfWindowRun, query } from "~/lib/data.server";
+import {
+  buildRunsTableSql,
+  buildScenariosSelectSql,
+  buildServiceVersionsSelectSql,
+  buildStepsSelectSql,
+  buildTestIdsSelectSql,
+} from "~/lib/e2e-views";
 import StatusBadge from "~/components/StatusBadge";
 import StatusMark from "~/components/StatusMark";
 import RunGantt, {
@@ -96,11 +104,90 @@ interface ScenarioStatusRow {
   status: string;
 }
 
+/**
+ * A run older than the store's window: extracted on demand and read straight
+ * from its own Parquet through the parameterized view builders (see
+ * E2eStore.outOfWindowRun). Cross-run data is deliberately absent - the
+ * neighbouring runs aren't loaded either - so there's no previous-run comparison
+ * and no service DIFF, just this run's own deployed versions.
+ */
+async function loadOutOfWindow(runId: string) {
+  const empty = {
+    run: null,
+    outOfWindow: false,
+    scenarios: [] as ScenarioRow[],
+    steps: [] as StepRow[],
+    prevAll: [] as ScenarioStatusRow[],
+    prevNightly: [] as ScenarioStatusRow[],
+    svcAll: [] as SvcRow[],
+    svcNightly: [] as SvcRow[],
+  };
+  // 404, not 200: by the time we get here the run isn't in the window AND isn't
+  // in the bucket, so it doesn't exist. The component still renders its "not
+  // found" card - `data()` sets the status without swapping in an error page.
+  const notFound = () => data(empty, { status: 404 });
+
+  const loaded = await loadOutOfWindowRun(runId);
+  if (!loaded) return notFound();
+
+  const features = loaded.features;
+  const scenariosRel = `(${buildScenariosSelectSql(features)})`;
+  const [runRows, scenarios, steps, svc] = await Promise.all([
+    query<RunRow>(
+      // Every runs column is derived from the run_id, so one VALUES row gives
+      // the same shape the `runs` table would have. The cross-run columns are
+      // NULL: there's no loaded neighbour to point at.
+      `SELECT run_id, run_time, updated, status_token, failed_count, total_count, is_nightly,
+              CAST(NULL AS VARCHAR) AS newest_run_id,
+              CAST(NULL AS VARCHAR) AS prev_all_run_id,
+              CAST(NULL AS VARCHAR) AS prev_nightly_run_id
+         FROM (${buildRunsTableSql([loaded.run])})`,
+    ),
+    query<ScenarioRow>(
+      `WITH sc AS ${scenariosRel}, ti AS (${buildTestIdsSelectSql(features)})
+       SELECT sc.feature_uri, sc.feature_name, sc.scenario_id, sc.scenario_name, sc.ordinal,
+              sc.tag_names, sc.duration_s, epoch_ms(sc.started_at)::DOUBLE AS started_ms,
+              sc.status, ti.test_id
+         FROM sc LEFT JOIN ti ON ti.run_id = sc.run_id AND ti.scenario_id = sc.scenario_id`,
+    ),
+    query<StepRow>(
+      `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status,
+              duration_s, has_error, error_message, is_background, glue_location
+         FROM (${buildStepsSelectSql(scenariosRel)})
+        ORDER BY scenario_id, step_ordinal`,
+    ),
+    query<SvcRow>(
+      // Shaped like buildServiceDiffSql's rows but with no baseline, so
+      // buildServiceVersionsModel renders a plain list instead of a diff.
+      `SELECT service, spec AS cur_spec, version AS cur_version, pipeline_version AS cur_pv,
+              CAST(NULL AS VARCHAR) AS prev_spec, CAST(NULL AS VARCHAR) AS prev_version,
+              CAST(NULL AS VARCHAR) AS prev_pv,
+              true AS in_cur, false AS in_prev, CAST(NULL AS VARCHAR) AS prev_run_id,
+              n_scenarios, distinct_blocks
+         FROM (${buildServiceVersionsSelectSql(features)})
+        ORDER BY service`,
+    ),
+  ]);
+
+  const run = runRows[0] ?? null;
+  if (!run) return notFound();
+  return {
+    run,
+    outOfWindow: true,
+    scenarios,
+    steps,
+    prevAll: [] as ScenarioStatusRow[],
+    prevNightly: [] as ScenarioStatusRow[],
+    svcAll: svc,
+    svcNightly: svc,
+  };
+}
+
 /** Load one run's detail (run row, scenarios, steps, previous-run scenario
- *  statuses for both scopes, and the service-version diff for both scopes) for
- *  the current window. The nightly/all-runs toggle picks between the two scopes
- *  client-side, so both are fetched. Returns run:null when the run isn't in the
- *  window (the component then offers to widen it). */
+ *  statuses for both scopes, and the service-version diff for both scopes) from
+ *  the store's window. The nightly/all-runs toggle picks between the two scopes
+ *  client-side, so both are fetched. A run older than the window falls through to
+ *  loadOutOfWindow; run:null means no such run exists at all. */
 export async function loader({ params }: Route.LoaderArgs) {
   await ensureData();
   const runId = params.runId ?? "";
@@ -114,17 +201,7 @@ export async function loader({ params }: Route.LoaderArgs) {
        FROM runs WHERE run_id = ${runIdLit}`,
   );
   const run = runRows[0] ?? null;
-  if (!run) {
-    return {
-      run: null,
-      scenarios: [] as ScenarioRow[],
-      steps: [] as StepRow[],
-      prevAll: [] as ScenarioStatusRow[],
-      prevNightly: [] as ScenarioStatusRow[],
-      svcAll: [] as SvcRow[],
-      svcNightly: [] as SvcRow[],
-    };
-  }
+  if (!run) return loadOutOfWindow(runId);
 
   const statusesSql = (prevId: string | null) =>
     prevId
@@ -154,7 +231,16 @@ export async function loader({ params }: Route.LoaderArgs) {
       query<SvcRow>(buildServiceDiffSql(runId, true)),
     ]);
 
-  return { run, scenarios, steps, prevAll, prevNightly, svcAll, svcNightly };
+  return {
+    run,
+    outOfWindow: false,
+    scenarios,
+    steps,
+    prevAll,
+    prevNightly,
+    svcAll,
+    svcNightly,
+  };
 }
 
 interface ScenarioRow {
@@ -907,7 +993,7 @@ function ScenarioLog({
    *  every scenario's log in a single query, so this is a run-level flag
    *  shared by all open log panels; only meaningful while `isLogOpen`. */
   logsLoading: boolean;
-  logsError: Error | null;
+  logsError: string | null;
   /** This scenario's decoded log text, once loaded; undefined if not (yet)
    *  loaded, null if loaded but this scenario had none. */
   log: string | null | undefined;
@@ -919,7 +1005,11 @@ function ScenarioLog({
         <div className="flex items-center gap-2 py-2 text-xs text-muted-foreground">
           <Spinner size={12} /> Loading log…
         </div>
-      ) : logsError || log == null ? (
+      ) : logsError ? (
+        <p className="py-2 text-xs text-muted-foreground">
+          {logsError} Click Log again to retry.
+        </p>
+      ) : log == null ? (
         <p className="py-2 text-xs text-muted-foreground">Log unavailable.</p>
       ) : (
         <pre className="max-h-96 overflow-auto rounded border bg-background/60 p-2 text-xs whitespace-pre-wrap">
@@ -962,7 +1052,7 @@ function ScenarioRow_({
   /** Whether THIS scenario's log panel is open. */
   isLogOpen: boolean;
   logsLoading: boolean;
-  logsError: Error | null;
+  logsError: string | null;
   log: string | null | undefined;
   onToggleLog: () => void;
 }) {
@@ -1098,8 +1188,16 @@ function ScenarioRow_({
 let hasCelebrated = false;
 
 export default function RunDetail() {
-  const { run, scenarios, steps, prevAll, prevNightly, svcAll, svcNightly } =
-    useLoaderData<typeof loader>();
+  const {
+    run,
+    outOfWindow,
+    scenarios,
+    steps,
+    prevAll,
+    prevNightly,
+    svcAll,
+    svcNightly,
+  } = useLoaderData<typeof loader>();
   const { runId: rawRunId } = useParams();
   const requestedRunId = rawRunId ? decodeURIComponent(rawRunId) : "";
   const runId = run?.run_id ?? requestedRunId;
@@ -1140,7 +1238,9 @@ export default function RunDetail() {
   // Re-fetched when the run changes; `logsRunIdRef` tracks which run the current
   // fetch belongs to.
   const logsFetcher = useFetcher<{
+    runId: string;
     logs: { scenario_id: string; log: string | null }[];
+    error: string | null;
   }>();
   const logsRunIdRef = useRef<string | null>(null);
   const [scenarioLogs, setScenarioLogs] = useState<Map<
@@ -1154,7 +1254,9 @@ export default function RunDetail() {
     new Set(),
   );
   const logsLoading = logsFetcher.state !== "idle";
-  const logsError: Error | null = null;
+  // The logs route reports failures in its payload rather than throwing (a
+  // thrown loader error would take out this whole page), so read it from there.
+  const logsError = logsFetcher.data?.error ?? null;
 
   // Reset the log panels/cache whenever the run changes.
   useEffect(() => {
@@ -1165,12 +1267,20 @@ export default function RunDetail() {
 
   // Build the scenario_id -> log map once the fetcher settles.
   useEffect(() => {
-    if (logsFetcher.state === "idle" && logsFetcher.data) {
-      setScenarioLogs(
-        new Map(logsFetcher.data.logs.map((r) => [r.scenario_id, r.log])),
-      );
+    if (logsFetcher.state !== "idle" || !logsFetcher.data) return;
+    const { runId: loadedRunId, logs, error } = logsFetcher.data;
+    // The response carries the run it belongs to: open a log on run A, navigate
+    // to run B before it lands, and this would otherwise install A's logs under
+    // B (the reset effect above can't cancel an in-flight fetcher).
+    if (loadedRunId !== runId) return;
+    if (error) {
+      // Clear the guard so the next click retries instead of the panels staying
+      // stuck on a failed fetch forever.
+      logsRunIdRef.current = null;
+      return;
     }
-  }, [logsFetcher.state, logsFetcher.data]);
+    setScenarioLogs(new Map(logs.map((r) => [r.scenario_id, r.log])));
+  }, [logsFetcher.state, logsFetcher.data, runId]);
 
   function handleToggleLog(scenarioId: string) {
     const willOpen = !openLogScenarioIds.has(scenarioId);
@@ -1183,7 +1293,8 @@ export default function RunDetail() {
     // Fetch once per run, on first open (one request covers all scenarios).
     if (willOpen && logsRunIdRef.current !== runId) {
       logsRunIdRef.current = runId;
-      logsFetcher.load(`/runs/${encodeURIComponent(runId)}/logs`);
+      // ?fetch=1 marks this as a fetcher call - see the logs route.
+      logsFetcher.load(`/runs/${encodeURIComponent(runId)}/logs?fetch=1`);
     }
   }
 
@@ -1638,8 +1749,8 @@ export default function RunDetail() {
   }, [run, runId]);
 
   if (!run) {
-    // The server holds every run, so an absent run genuinely doesn't exist
-    // (bad id / typo / deleted folder).
+    // Runs outside the window are loaded on demand (see loadOutOfWindow), so an
+    // absent run genuinely isn't in the bucket (bad id / typo / deleted folder).
     return (
       <div className="mx-auto max-w-4xl space-y-4 p-6">
         <div className="rounded-lg border bg-card p-6">
@@ -1653,6 +1764,20 @@ export default function RunDetail() {
 
   return (
     <div className="mx-auto max-w-4xl space-y-4 p-6">
+      {outOfWindow && (
+        // This run is older than the window the dashboard keeps loaded, so it was
+        // read on demand from its own report. Everything about the run itself is
+        // here; only comparisons against neighbouring runs are missing, because
+        // those runs aren't loaded either.
+        <div className="flex items-start gap-2 rounded-lg border border-dashed bg-muted/40 p-3 text-sm text-muted-foreground">
+          <History className="mt-0.5 size-4 shrink-0" aria-hidden />
+          <span>
+            This run is older than the dashboard&rsquo;s loaded window and was
+            loaded on demand. Comparisons with earlier runs (the pass/fail trend
+            and the deployment diff) aren&rsquo;t available for it.
+          </span>
+        </div>
+      )}
       <div className="rounded-lg border bg-card p-6">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>

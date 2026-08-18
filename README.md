@@ -37,14 +37,33 @@ JSON is exposed as clean SQL over `read_json` + `UNNEST` — all of it built in
 | `v_features`, `v_scenarios`     | views            | over the per-run cached Parquet                            |
 | `v_steps`                       | view             | **not materialized** — queried on demand (see below)       |
 
-The store (`server/data/store.ts`) holds the **whole dataset** — there's no rolling window.
-`ensure()` (re)builds those tables over every run, serialized so concurrent requests can't race,
-and reused within a short TTL so request bursts don't rebuild.
+The store (`server/data/store.ts`) holds a **rolling window** of runs — `E2E_WINDOW_DAYS`, 90 by
+default. `ensure()` (re)builds those tables over that window, serialized so concurrent requests
+can't race, and reused within a short TTL so request bursts don't rebuild.
+
+A rebuild is **one transaction on its own connection**: DuckDB's DDL is transactional, so readers see
+either the whole previous model or the whole new one — never a re-warm's half-applied state (new run
+rows with blank scenario counts, matrix columns with no cells) — and a rebuild doesn't occupy the
+connection every loader query takes its turn on.
+
+The window is what keeps this cheap. The bucket is append-only since 2023 (~1200 runs and counting),
+and both the GCS listing and the per-rebuild analysis pass are proportional to the number of runs
+held — so without a window they'd grow with the lifetime of the project rather than with what anyone
+actually looks at. A dashboard of "what happened recently" doesn't need the tail.
+
+Runs **older** than the window are still reachable by direct link: `outOfWindowRun()` resolves the
+run in the bucket, extracts it if it isn't cached yet, and hands back a relation over just that run's
+Parquet, which the run-detail route queries through the same (parameterized) view builders. Such a
+run is deliberately *not* folded into the model — that would leak an ancient run into the run list,
+the header's date range and the "previous run" subqueries behind the diffs, and cost a full rebuild
+per deep link. The trade-off is that cross-run comparisons (pass/fail trend, deployment diff) aren't
+available for it, because its neighbours aren't loaded either; the page says so.
 
 `steps` is deliberately left as a view: it's ~90% of all rows, and it's only ever needed for **one
 run** (run detail) or **one scenario** (step history) at a time. Keeping it out of memory holds the
-resident footprint at roughly 0.1 MB/run instead of ~1 MB/run
-(`scripts/measure-footprint.ts` reproduces those numbers).
+resident model at ~0.2 MB/run (DuckDB's own accounting: 12.9 MiB for 60 runs, so ~26 MB for a 90-day
+window) instead of ~1 MB/run. `scripts/measure-footprint.ts` reproduces those numbers — read its
+*held* figure, not its cold-build RSS peak, which is dominated by one-off report parsing.
 
 ### The report cache
 
@@ -66,6 +85,19 @@ new runs cost anything. All analysis (`v_scenarios` / `v_steps` / `test_ids` / `
 A background **warmer** (`server/data/warm.ts`) materializes at startup and re-runs on an interval,
 so new runs are extracted proactively rather than in a user's request.
 
+Extraction is **never** in the request path: `ensure()` materializes over the runs whose Parquet is
+already cached and hands the rest to the warmer's background pass, so a cold instance serves the run
+list immediately and fills in scenario data as runs land (rather than blocking every request —
+including `/` — on a full extraction and getting killed by Cloud Run's request timeout).
+`ensureComplete()` is the waiting variant, used by the warmer and the measurement scripts.
+
+While that's happening the UI says so: the shell loader reports `cachedRunCount` / `pendingRunCount`
+and `app/components/BuildProgress.tsx` shows a "Building data model — N / M runs ready" banner,
+revalidating every 5 s until nothing is pending. Runs that aren't extracted yet render with an em
+dash instead of counts, so a half-built dashboard reads as *building* rather than as a dataset with
+holes in it. Because the cache lives on a shared mount, a new instance usually starts warm and the
+banner never appears.
+
 > **Cache invalidation:** `CACHE_VERSION` in `app/lib/e2e-views.ts` is a hand-bumped constant.
 > **Bump it whenever you change the extraction** (what/how we store in the Parquet). Files then land
 > in a fresh `<CACHE_VERSION>/` directory and the old one is simply never read again — orphaned dirs
@@ -81,9 +113,10 @@ so new runs are extracted proactively rather than in a user's request.
 
 ### View scope vs. data scope
 
-The server holds all runs, but the two **wide** views (Scenarios matrix, Services timeline) render
-one column per run, so they bound how many recent runs they *display* via `?runs=N` (default 60,
-with a "show all" link). That's a UI/payload bound, not a cache window — see `app/lib/view.ts`.
+Two separate bounds. The **data** scope is the store's window (`E2E_WINDOW_DAYS`). Within it, the two
+**wide** views (Scenarios matrix, Services timeline) render one column per run, so they bound how many
+recent runs they *display* via `?runs=N` (default 60, hard cap 2000, with a "show all" link that keeps
+the page's other filters) — a UI/payload bound, see `app/lib/view.ts`.
 
 The **nightly / all-runs** toggle is a client-side view preference over already-loaded data
 (`app/contexts/RunScopeContext.tsx`), not a query parameter.
@@ -182,7 +215,11 @@ npx tsx scripts/measure-footprint.ts  # memory/disk footprint of the full datase
 | `PORT`                   | `3001`                           |                                                           |
 | `E2E_SOURCE`             | `gcs` in prod, `local` otherwise | `gcs` \| `local`; explicit value always wins              |
 | `E2E_BUCKET`             | `infra-e2e-test-reports`         | used when the source is `gcs`                              |
-| `E2E_CACHE_DIR`          | `./.cache`                       | per-run Parquet cache; point at the gcsfuse mount in prod  |
+| `E2E_CACHE_DIR`          | `./.cache` (`/app/.cache` in the image) | per-run Parquet cache; point at the gcsfuse mount in prod |
+| `E2E_WINDOW_DAYS`        | `90`                             | how far back the model reaches; `0` = every run since 2023  |
+| `E2E_DUCKDB_TEMP_DIR`    | `<os tmp>/e2e-explorer-duckdb`   | where DuckDB spills; never point this at the cache mount    |
+| `E2E_DUCKDB_MEMORY_LIMIT`| (DuckDB default)                 | e.g. `2GB`; set it to fit the container's memory limit      |
+| `UV_THREADPOOL_SIZE`     | `8` in the image (`4` otherwise) | must exceed the extraction concurrency, or COPYs starve requests |
 | `E2E_WARM_INTERVAL_MS`   | `300000`                         | background re-warm interval; `0` disables re-warming       |
 | `E2E_WARM`               | (enabled)                        | set to `0` to disable warming entirely                     |
 | `CLUECUMBER_BASE_URL`    | `http://e2e-test-reports.pilot-1`| host serving the per-run Cluecumber HTML reports           |
@@ -190,8 +227,14 @@ npx tsx scripts/measure-footprint.ts  # memory/disk footprint of the full datase
 `E2E_SOURCE` defaults to `gcs` when `NODE_ENV=production` on purpose: the image does **not** contain
 `public/data`, so defaulting to the local snapshot there would fail at the first request.
 
-`CLUECUMBER_BASE_URL` is injected at **serve** time via `/config.js` (not baked into the bundle), so
-one built image can be deployed to several environments.
+`CLUECUMBER_BASE_URL` is read at **serve** time and handed to the client by the shell loader
+(`app/layout.tsx`), so one built image can be deployed to several environments. It deliberately does
+*not* go through a `window` global: under SSR there's no `window` while rendering, so the server would
+emit the default host in every report link and then mismatch on hydration.
+
+DuckDB's `temp_directory` is set explicitly (`E2E_DUCKDB_TEMP_DIR`) because its default is the process
+CWD — the repo root in dev, `/app` in the image, which `USER node` can't write. Spill files can reach
+tens of GB, so they belong on local temp, never on the gcsfuse cache mount.
 
 GCS access uses `new Storage()` — Application Default Credentials only, never a hardcoded key.
 Locally that's your `gcloud` user; in Cloud Run/GKE it's the attached workload identity.
@@ -204,9 +247,15 @@ but two mount details matter:
 
 - Enable gcsfuse's **`file-cache`**: materializing reads a glob of per-run Parquet files, so a
   local content cache turns repeat reads into local-disk reads.
-- The directory must be **writable** (extraction writes `<run_id>.parquet` + a sidecar).
+- The directory must be **writable** (extraction writes `<run_id>.parquet` + a sidecar). This is
+  checked once at startup and is **fatal** if it fails: per-run extraction failures are non-fatal by
+  design, so an unwritable cache would otherwise boot "fine" and serve zero scenarios everywhere.
 
 There is no other state: the store writes no scratch files, so nothing churns through the mount.
+
+Cached files for runs that have aged out of `E2E_WINDOW_DAYS` are never read again (until someone
+deep-links to one), so — like orphaned `CACHE_VERSION/` dirs — they're worth reaping with a GCS
+lifecycle rule rather than kept forever. At ~120 KB/run that's slow-growing, not urgent.
 
 ## Deployment
 

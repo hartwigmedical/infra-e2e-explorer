@@ -1,14 +1,16 @@
-import { Link, Outlet, useLocation } from "react-router";
+import { Link, Outlet, useLoaderData, useLocation } from "react-router";
 import type { Route } from "./+types/layout";
 import { RunScopeProvider } from "~/contexts/RunScopeContext";
+import BuildProgress from "~/components/BuildProgress";
 import DateRangeControl from "~/components/DateRangeControl";
 import { cn } from "~/lib/utils";
 import { ensureData, query } from "~/lib/data.server";
+import { DEFAULT_CLUECUMBER_BASE_URL } from "~/lib/format";
 
 /**
- * Shell loader: the server holds the full dataset, so this just reports the
- * loaded-run range + daily density + total count for the header. Runs for every
- * route, so the header always has data without a client round-trip. The
+ * Shell loader: reports the loaded-run range + daily density + counts for the
+ * header, plus how much of the window is extracted so far (BuildProgress). Runs
+ * for every route, so the header always has data without a client round-trip. The
  * nightly/all-runs scope stays a client view preference (see RunScopeContext).
  */
 export async function loader() {
@@ -23,6 +25,13 @@ export async function loader() {
 
   return {
     runCount: state.runCount,
+    /** Runs whose report is extracted and queryable (the rest are pending). */
+    cachedRunCount: state.cachedRunCount,
+    pendingRunCount: state.pendingRunCount,
+    /** Cluecumber report host for this deployment. Server-side env var, handed
+     *  to the client here so SSR and hydration agree (see ~/lib/format.ts). */
+    cluecumberBaseUrl:
+      process.env.CLUECUMBER_BASE_URL || DEFAULT_CLUECUMBER_BASE_URL,
     range: range ?? { oldest: null, newest: null },
     daily,
   };
@@ -75,6 +84,7 @@ function NavLinks() {
 export default function Layout() {
   // All data now comes from server loaders. The only client context left is the
   // nightly/all-runs view preference (a client-side filter over loader data).
+  const { runCount, cachedRunCount } = useLoaderData<typeof loader>();
   return (
     <RunScopeProvider>
       <div className="min-h-screen bg-background text-foreground">
@@ -88,6 +98,7 @@ export default function Layout() {
           </div>
         </header>
         <main className="p-4">
+          <BuildProgress ready={cachedRunCount} total={runCount} />
           <Outlet />
         </main>
       </div>

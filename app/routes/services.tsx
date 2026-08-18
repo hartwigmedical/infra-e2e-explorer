@@ -4,7 +4,7 @@ import { Boxes, TriangleAlert } from "lucide-react";
 import type { Route } from "./+types/services";
 import { useRunScope } from "~/contexts/RunScopeContext";
 import { ensureData, query } from "~/lib/data.server";
-import { recentRunsFromRequest, RUNS_PARAM } from "~/lib/view";
+import { recentRunsFromRequest, RUNS_PARAM, showAllRunCount } from "~/lib/view";
 import StatusMark from "~/components/StatusMark";
 import { statusKindFromRunToken } from "~/lib/status";
 import { makeIsSuspectDeploy } from "~/lib/deployments";
@@ -166,6 +166,17 @@ export default function Services() {
   // or a click outside the outlined date (see below).
   const [searchParams, setSearchParams] = useSearchParams();
   const focusRun = searchParams.get("run");
+
+  // "Show all" keeps every other param (filters, metric, selection, ?run=): the
+  // old `?runs=N` template dropped them, silently resetting the page. Capped at
+  // what `?runs=` will actually honour (see showAllRunCount).
+  const showAllRuns = showAllRunCount(totalRuns);
+  const showAllTo = useMemo(() => {
+    const next = new URLSearchParams(searchParams);
+    next.set(RUNS_PARAM, String(showAllRuns));
+    return `?${next}`;
+  }, [searchParams, showAllRuns]);
+
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const clearFocus = useCallback(() => {
@@ -407,14 +418,14 @@ export default function Services() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {totalRuns > recentRuns && (
+          {showAllRuns > recentRuns && (
             <Link
-              to={`?${RUNS_PARAM}=${totalRuns}`}
+              to={showAllTo}
               preventScrollReset
               className="rounded-md border px-2.5 py-1.5 text-sm text-muted-foreground hover:bg-muted/50 hover:text-foreground"
               title={`Showing the ${recentRuns} most recent runs`}
             >
-              Show all {totalRuns} runs
+              Show all {showAllRuns} runs
             </Link>
           )}
           {changedCount < lanes.length && (

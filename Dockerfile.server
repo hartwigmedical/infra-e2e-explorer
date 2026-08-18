@@ -40,6 +40,20 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./package.json
 COPY --from=builder /app/build ./build
 
+# The slim-Parquet cache (server/data/cache.ts). Everything COPY'd above is
+# root-owned, so the dir must be created and handed to `node` explicitly —
+# otherwise every extraction fails with EACCES. Set explicitly rather than left
+# to the code's default so a deployment that mounts a shared (gcsfuse) cache
+# overrides one obvious variable.
+ENV E2E_CACHE_DIR=/app/.cache
+RUN mkdir -p /app/.cache && chown node:node /app/.cache
+
+# libuv's threadpool (default 4) is shared by every fs operation AND by DuckDB's
+# work: extraction runs up to 6 concurrent COPY statements, which would otherwise
+# leave nothing for the loader queries and cache reads a request needs. Keep this
+# above the extraction concurrency in server/data/cache.ts.
+ENV UV_THREADPOOL_SIZE=8
+
 # Drop root: the node:alpine image ships an unprivileged `node` user (uid 1000).
 USER node
 

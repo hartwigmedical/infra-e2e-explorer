@@ -10,9 +10,19 @@
 
 import { getStore } from "@/server/data/store";
 
-/** Ensure the full dataset is materialized (idempotent within a short TTL). */
+/** Ensure the windowed dataset is materialized (idempotent within a short TTL). */
 export async function ensureData() {
   return getStore().ensure();
+}
+
+/**
+ * Load a run that's OUTSIDE the store's window, extracting it if needed, so a
+ * deep link to an older run still works. Returns null when no such run exists.
+ * Callers query the returned `features` relation instead of the materialized
+ * tables - see E2eStore.outOfWindowRun and app/routes/runs.$runId.tsx.
+ */
+export async function loadOutOfWindowRun(runId: string) {
+  return getStore().outOfWindowRun(runId);
 }
 
 /** Run a SELECT against the materialized tables (runs/scenarios/…) or views
