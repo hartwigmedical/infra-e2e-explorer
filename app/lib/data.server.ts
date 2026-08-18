@@ -25,6 +25,13 @@ export async function loadOutOfWindowRun(runId: string) {
   return getStore().outOfWindowRun(runId);
 }
 
+/** A relation over one run's own cached Parquet (null if not extracted yet).
+ *  Single-run reads use this instead of the whole-window views - see
+ *  E2eStore.runRelation. */
+export function runRelation(runId: string) {
+  return getStore().runRelation(runId);
+}
+
 /** Run a SELECT against the materialized tables (runs/scenarios/…) or views
  *  (v_steps). */
 export function query<T = Record<string, unknown>>(sql: string): Promise<T[]> {

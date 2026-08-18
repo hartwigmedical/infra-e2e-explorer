@@ -105,6 +105,11 @@ export interface StoreState {
   pendingRunCount: number;
   /** The window's start date (YYYY-MM-DD), or null when it's disabled. */
   windowSince: string | null;
+  /** Bumped only when a rebuild actually changed the dataset, so a client can
+   *  tell "same data, re-materialized" from "there is something new". */
+  revision: number;
+  /** Newest run in the window, so a client can say WHAT changed. */
+  newestRunId: string | null;
 }
 
 const EMPTY_STATE: StoreState = {
@@ -112,6 +117,8 @@ const EMPTY_STATE: StoreState = {
   cachedRunCount: 0,
   pendingRunCount: 0,
   windowSince: null,
+  revision: 0,
+  newestRunId: null,
 };
 
 /** Identity of a run VERSION: a re-upload (new size/source) is a new key, so it
@@ -132,6 +139,12 @@ export class E2eStore {
   private attempted = new Set<string>();
   /** When `current` was last materialized (epoch ms); 0 = never. */
   private materializedAt = 0;
+  /** In-flight background refresh, so a burst of stale requests starts one. */
+  private refreshing: Promise<unknown> | null = null;
+  /** Content fingerprint of the last materialization + a counter that only moves
+   *  when it changes (see rebuild). */
+  private fingerprint = "";
+  private revision = 0;
   /** How long a materialization is reused before a rebuild picks up new runs.
    *  Short, like the old run-list cache - the bucket is append-only. */
   private readonly refreshTtlMs = 60_000;
@@ -146,16 +159,29 @@ export class E2eStore {
   }
 
   /**
-   * Ensure the dataset is materialized over everything currently cached, reusing
-   * it within refreshTtlMs. Concurrent loaders in one SSR request (layout +
-   * route) both call this; because the freshness check runs inside the serialized
-   * chain, only the first rebuilds and the rest are no-ops. Pass `force` to
-   * bypass the TTL (the warmer uses this to pick up new runs on its own cadence).
+   * The materialized dataset. Once one exists this NEVER waits: a request past
+   * refreshTtlMs is served from what we have and kicks off the rebuild behind
+   * itself (stale-while-revalidate), because that rebuild costs ~3s over a
+   * 100-run window in-cluster and used to land on whichever unlucky request
+   * arrived first after a quiet minute. Clients notice the new revision and
+   * offer a refresh instead (see routes/api.data-version.tsx).
    *
-   * Returns as soon as the tables exist - runs still being extracted show up in
-   * `pendingRunCount` and land in a later rebuild.
+   * Only two things wait: the very first request on a cold process (there is
+   * nothing to serve) and `force` (the warmer and the measurement scripts).
+   *
+   * Concurrent loaders in one SSR request (layout + route) both call this; the
+   * freshness check inside the serialized chain makes all but the first a no-op.
+   * Runs still being extracted show up in `pendingRunCount`.
    */
   ensure(force = false): Promise<StoreState> {
+    const current = this.current;
+    if (!force && current) {
+      if (Date.now() - this.materializedAt >= this.refreshTtlMs) {
+        this.refreshInBackground();
+      }
+      return Promise.resolve(current);
+    }
+
     this.chain = this.chain
       .catch(() => EMPTY_STATE)
       .then(() => {
@@ -169,6 +195,21 @@ export class E2eStore {
         return this.rebuild();
       });
     return this.chain;
+  }
+
+  /** Rebuild off the request path, one at a time. */
+  private refreshInBackground(): void {
+    if (this.refreshing) return;
+    this.refreshing = this.ensure(true)
+      .catch((err) =>
+        console.warn(
+          `[store] background refresh failed:`,
+          (err as Error)?.message ?? err,
+        ),
+      )
+      .finally(() => {
+        this.refreshing = null;
+      });
   }
 
   /**
@@ -206,11 +247,23 @@ export class E2eStore {
     const { cached, missing } = await this.cache.partition(runs);
     await this.materialize(runs, cached);
 
+    // Only call it a new revision when the dataset actually differs: the warmer
+    // re-materializes every few minutes, and a client shouldn't be nudged to
+    // refresh for data it already has. runs is newest-first (see listRuns).
+    const newestRunId = runs[0]?.run_id ?? null;
+    const fingerprint = `${runs.length}:${cached.length}:${newestRunId}`;
+    if (fingerprint !== this.fingerprint) {
+      this.fingerprint = fingerprint;
+      this.revision++;
+    }
+
     this.current = {
       runCount: runs.length,
       cachedRunCount: cached.length,
       pendingRunCount: missing.length,
       windowSince: since === ALL_SINCE ? null : since,
+      revision: this.revision,
+      newestRunId,
     };
     this.materializedAt = Date.now();
     this.startExtraction(missing);
@@ -344,6 +397,23 @@ export class E2eStore {
     if (!run) return null;
     const file = await this.cache.ensure(run);
     return { run, features: readParquetSql([file]) };
+  }
+
+  /**
+   * A SQL relation over ONE run's cached Parquet, or null when that run isn't
+   * extracted (yet).
+   *
+   * Run detail and the logs route only ever want a single run, but v_steps and
+   * v_features are views over EVERY file in the window, and DuckDB can't push a
+   * `run_id` filter through the UNNEST + window functions in v_scenarios - so it
+   * reads them all. Measured over 60 runs: 36ms vs 10ms for a run's steps, 30ms
+   * vs 4ms for its logs. Reading the one file is not just cheaper, it stops the
+   * cost growing with the window.
+   */
+  runRelation(runId: string): string | null {
+    if (!isRunIdShaped(runId)) return null;
+    const file = this.cache.cachedFileFor(runId);
+    return file ? readParquetSql([file]) : null;
   }
 
   /** Run a SELECT against the materialized tables / views. */

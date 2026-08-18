@@ -2,6 +2,7 @@ import { Link, Outlet, useLoaderData, useLocation } from "react-router";
 import type { Route } from "./+types/layout";
 import { RunScopeProvider } from "~/contexts/RunScopeContext";
 import BuildProgress from "~/components/BuildProgress";
+import UpdateWatcher from "~/components/UpdateWatcher";
 import DateRangeControl from "~/components/DateRangeControl";
 import { cn } from "~/lib/utils";
 import { ensureData, query } from "~/lib/data.server";
@@ -28,6 +29,10 @@ export async function loader() {
     /** Runs whose report is extracted and queryable (the rest are pending). */
     cachedRunCount: state.cachedRunCount,
     pendingRunCount: state.pendingRunCount,
+    /** Which materialization this page was rendered from, so the client can spot
+     *  a newer one and offer a refresh (see UpdateWatcher). */
+    revision: state.revision,
+    newestRunId: state.newestRunId,
     /** Cluecumber report host for this deployment. Server-side env var, handed
      *  to the client here so SSR and hydration agree (see ~/lib/format.ts). */
     cluecumberBaseUrl:
@@ -84,7 +89,8 @@ function NavLinks() {
 export default function Layout() {
   // All data now comes from server loaders. The only client context left is the
   // nightly/all-runs view preference (a client-side filter over loader data).
-  const { runCount, cachedRunCount } = useLoaderData<typeof loader>();
+  const { runCount, cachedRunCount, pendingRunCount, revision, newestRunId } =
+    useLoaderData<typeof loader>();
   return (
     <RunScopeProvider>
       <div className="min-h-screen bg-background text-foreground">
@@ -99,6 +105,11 @@ export default function Layout() {
         </header>
         <main className="p-4">
           <BuildProgress ready={cachedRunCount} total={runCount} />
+          <UpdateWatcher
+            revision={revision}
+            newestRunId={newestRunId}
+            pendingRunCount={pendingRunCount}
+          />
           <Outlet />
         </main>
       </div>

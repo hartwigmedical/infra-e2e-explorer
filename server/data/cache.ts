@@ -93,6 +93,13 @@ export class ReportCache {
   fileFor(runId: string): string {
     return path.join(this.dir, `${runId}.parquet`);
   }
+
+  /** Path to a run's cached Parquet, or null when it isn't extracted yet - for
+   *  callers that want to read ONE run instead of the whole-window view. */
+  cachedFileFor(runId: string): string | null {
+    const parquet = this.fileFor(runId);
+    return existsSync(parquet) ? parquet : null;
+  }
   private sidecarPath(runId: string): string {
     return path.join(this.dir, `${runId}.json`);
   }

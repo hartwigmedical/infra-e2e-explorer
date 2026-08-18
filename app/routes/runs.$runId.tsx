@@ -32,7 +32,12 @@ import {
 import { toast } from "sonner";
 import type { Route } from "./+types/runs.$runId";
 import { useRunScope } from "~/contexts/RunScopeContext";
-import { ensureData, loadOutOfWindowRun, query } from "~/lib/data.server";
+import {
+  ensureData,
+  loadOutOfWindowRun,
+  query,
+  runRelation,
+} from "~/lib/data.server";
 import {
   buildRunsTableSql,
   buildScenariosSelectSql,
@@ -203,6 +208,22 @@ export async function loader({ params }: Route.LoaderArgs) {
   const run = runRows[0] ?? null;
   if (!run) return loadOutOfWindow(runId);
 
+  // Steps are read on demand rather than materialized (see store.ts). Read THIS
+  // run's Parquet directly when it's cached: v_steps is a view over every file in
+  // the window and the run_id filter doesn't prune it, so going through it costs
+  // 3-4x more and gets worse as the window grows. The view remains the fallback
+  // for a run that is listed but not extracted yet (it returns nothing, same as
+  // the file would).
+  const ownFeatures = runRelation(runId);
+  const stepsSql = ownFeatures
+    ? `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status,
+              duration_s, has_error, error_message, is_background, glue_location
+         FROM (${buildStepsSelectSql(`(${buildScenariosSelectSql(ownFeatures)})`)})
+        ORDER BY scenario_id, step_ordinal`
+    : `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status,
+              duration_s, has_error, error_message, is_background, glue_location
+         FROM v_steps WHERE run_id = ${runIdLit} ORDER BY scenario_id, step_ordinal`;
+
   const statusesSql = (prevId: string | null) =>
     prevId
       ? `SELECT feature_uri, scenario_id, status FROM scenarios WHERE run_id = ${sqlLit(prevId)}`
@@ -215,12 +236,7 @@ export async function loader({ params }: Route.LoaderArgs) {
                 epoch_ms(started_at)::DOUBLE AS started_ms, status, test_id
          FROM scenarios WHERE run_id = ${runIdLit}`,
       ),
-      query<StepRow>(
-        // Steps come from the v_steps VIEW (cached Parquet, read on demand), not a
-        // materialized table - see server/data/store.ts.
-        `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status, duration_s, has_error, error_message, is_background, glue_location
-         FROM v_steps WHERE run_id = ${runIdLit} ORDER BY scenario_id, step_ordinal`,
-      ),
+      query<StepRow>(stepsSql),
       run.prev_all_run_id
         ? query<ScenarioStatusRow>(statusesSql(run.prev_all_run_id)!)
         : Promise.resolve([] as ScenarioStatusRow[]),

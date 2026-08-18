@@ -1,6 +1,11 @@
 import { redirect } from "react-router";
 import type { Route } from "./+types/runs.$runId.logs";
-import { ensureData, loadOutOfWindowRun, query } from "~/lib/data.server";
+import {
+  ensureData,
+  loadOutOfWindowRun,
+  query,
+  runRelation,
+} from "~/lib/data.server";
 
 /**
  * Resource route (loader only, no component) for a run's per-scenario logs -
@@ -31,12 +36,19 @@ export async function loader({ params, request }: Route.LoaderArgs) {
     await ensureData();
     const lit = `'${runId.replace(/'/g, "''")}'`;
 
-    const inWindow = await query<{ x: number }>(
-      `SELECT 1 AS x FROM runs WHERE run_id = ${lit}`,
-    );
-    const features = inWindow.length
-      ? "v_features"
-      : (await loadOutOfWindowRun(runId))?.features;
+    // This run's own Parquet when it's cached - v_features is a view over every
+    // file in the window and the run_id filter doesn't prune it (measured 30ms vs
+    // 4ms over 60 runs). Falls back to the on-demand path for a run outside the
+    // window, and to the view for one that's listed but not extracted yet.
+    const features =
+      runRelation(runId) ??
+      ((
+        await query<{ x: number }>(
+          `SELECT 1 AS x FROM runs WHERE run_id = ${lit}`,
+        )
+      ).length
+        ? "v_features"
+        : (await loadOutOfWindowRun(runId))?.features);
     if (!features) {
       return { runId, logs: [], error: `Run ${runId} not found.` };
     }
