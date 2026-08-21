@@ -10,8 +10,6 @@ steps:
       - 'europe-west4-docker.pkg.dev/hmf-build/hmf-docker/e2e-explorer'
       - '$TAG_NAME'
       - 'Dockerfile.server'
-      - '--build-arg'
-      - 'SHORT_SHA=$SHORT_SHA'
 
 logsBucket: 'hmf-build-logs'
 # TODO: this build service account is copied from middle-layer/cloudbuild.yaml as a

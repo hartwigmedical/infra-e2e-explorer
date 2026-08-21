@@ -307,7 +307,6 @@ Registry, `europe-west4`). Everything is compiled inside the Dockerfile, so no l
    ```bash
    docker build -f Dockerfile.server \
      --platform linux/amd64 \
-     --build-arg SHORT_SHA=$(git rev-parse --short HEAD) \
      -t $IMAGE:$TAG -t $IMAGE:latest .
    ```
 
@@ -338,7 +337,7 @@ A `cloudbuild.yaml` mirroring middle-layer's is included (same image). It bumps 
 
 ```bash
 gcloud builds submit --config=cloudbuild.yaml \
-  --substitutions=TAG_NAME=$(node -p "require('./package.json').version"),SHORT_SHA=$(git rev-parse --short HEAD) \
+  --substitutions=TAG_NAME=$(node -p "require('./package.json').version") \
   --project=hmf-build
 ```
 
@@ -348,9 +347,11 @@ local flow above sidesteps that.
 
 ## Not done yet (deferred)
 
-- **The Docker image has not been built or deployed yet.** The SSR rework has only been verified
-  locally (dev + `npm start` against a production build). Building the image (alpine + the native
-  DuckDB musl bindings) and a Cloud Run deploy are the remaining unknowns.
+- **Not deployed to Cloud Run yet.** The image itself is validated as of 0.6.0: it builds for
+  `linux/amd64` (~100 MB) and a local smoke test against the live bucket exercised GCS listing,
+  download, DuckDB extraction (the alpine musl bindings) and every SSR route as the non-root user.
+  What's untested is the deploy: Cloud Run memory sizing (~330 MB RSS with `E2E_WINDOW_DAYS=3`, and
+  production defaults to 90) plus the gcsfuse cache mount.
 - **No durable cache mirror beyond the mount**: with `E2E_CACHE_DIR` on gcsfuse this is covered, but
   on plain local disk a fresh instance starts cold and re-extracts from the bucket.
 - **Dedicated reader service account**: today bucket read rides on the broad project-Viewer grant.

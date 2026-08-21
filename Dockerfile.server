@@ -2,14 +2,19 @@
 # SSR shim, then run a non-root runtime carrying a PRODUCTION node_modules, the
 # build output, and the shim. See README "Docker".
 #
-# NOTE (SSR experiment, Phase 2): under SSR the runtime must ship the app's
-# production deps (react, react-dom, react-router, @react-router/*, native
-# @duckdb/node-api, @google-cloud/storage, …) — the shim (build/index.mjs) and
-# the RR server build (build/server) both resolve react-router from node_modules
-# at runtime, so bundling is no longer possible. Alpine is kept because DuckDB
-# ships musl bindings (@duckdb/node-bindings-linux-*-musl), which npm resolves
-# for this platform automatically. This Dockerfile is NOT yet built/validated in
-# CI — that's Phase 5 (base-image + Cloud Run memory sizing).
+# NOTE: under SSR the runtime must ship the app's production deps (react,
+# react-dom, react-router, @react-router/*, native @duckdb/node-api,
+# @google-cloud/storage, …) — the shim (build/index.mjs) and the RR server build
+# (build/server) both resolve react-router from node_modules at runtime, so
+# bundling is no longer possible. Alpine is kept because DuckDB ships musl
+# bindings (@duckdb/node-bindings-linux-*-musl), which npm resolves for this
+# platform automatically.
+#
+# Validated for the 0.6.0 release: built --platform linux/amd64 (~100 MB) and
+# smoke-tested against the live bucket — GCS listing, download, DuckDB
+# extraction and all SSR routes work under the non-root user. Not yet run in
+# Cloud Build, and Cloud Run memory is still unsized (~330 MB RSS with a 3-day
+# window; production defaults to 90 days).
 
 # ---------- Builder ----------
 FROM node:24-alpine AS builder
