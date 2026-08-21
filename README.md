@@ -307,8 +307,12 @@ Registry, `europe-west4`). Everything is compiled inside the Dockerfile, so no l
    ```bash
    docker build -f Dockerfile.server \
      --platform linux/amd64 \
-     -t $IMAGE:$TAG -t $IMAGE:latest .
+     -t $IMAGE:$TAG -t ${IMAGE}:latest .
    ```
+
+   The braces on `${IMAGE}:latest` are load-bearing in zsh (macOS default): `$IMAGE:latest` is
+   parsed as the `:l` lowercase modifier plus a literal `atest`, which silently tags a repo named
+   `e2e-exploreratest` instead.
 
 5. **Smoke-test the built image** before pushing:
 
@@ -321,7 +325,7 @@ Registry, `europe-west4`). Everything is compiled inside the Dockerfile, so no l
 
    ```bash
    docker push $IMAGE:$TAG
-   docker push $IMAGE:latest
+   docker push ${IMAGE}:latest
    ```
 
 7. **Verify:**
@@ -348,7 +352,8 @@ local flow above sidesteps that.
 ## Not done yet (deferred)
 
 - **Not deployed to Cloud Run yet.** The image itself is validated as of 0.6.0: it builds for
-  `linux/amd64` (~100 MB) and a local smoke test against the live bucket exercised GCS listing,
+  `linux/amd64` (~100 MB compressed, ~364 MB on disk — 202 MB of that is the production
+  `node_modules` SSR must ship) and a local smoke test against the live bucket exercised GCS listing,
   download, DuckDB extraction (the alpine musl bindings) and every SSR route as the non-root user.
   What's untested is the deploy: Cloud Run memory sizing (~330 MB RSS with `E2E_WINDOW_DAYS=3`, and
   production defaults to 90) plus the gcsfuse cache mount.

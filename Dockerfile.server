@@ -10,11 +10,12 @@
 # bindings (@duckdb/node-bindings-linux-*-musl), which npm resolves for this
 # platform automatically.
 #
-# Validated for the 0.6.0 release: built --platform linux/amd64 (~100 MB) and
-# smoke-tested against the live bucket — GCS listing, download, DuckDB
-# extraction and all SSR routes work under the non-root user. Not yet run in
-# Cloud Build, and Cloud Run memory is still unsized (~330 MB RSS with a 3-day
-# window; production defaults to 90 days).
+# Validated for the 0.6.0 release: built --platform linux/amd64 and smoke-tested
+# against the live bucket — GCS listing, download, DuckDB extraction and all SSR
+# routes work under the non-root user. ~100 MB compressed / ~364 MB on disk, of
+# which 202 MB is the production node_modules the note above explains. Not yet
+# run in Cloud Build, and Cloud Run memory is still unsized (~330 MB RSS with a
+# 3-day window; production defaults to 90 days).
 
 # ---------- Builder ----------
 FROM node:24-alpine AS builder
