@@ -8,6 +8,7 @@
     "build": "react-router build",
     "build:server": "node scripts/build-server.mjs",
     "start": "NODE_ENV=production node --import tsx/esm server/index.ts",
+    "test": "node --import tsx/esm --test",
     "typecheck": "react-router typegen && tsc",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

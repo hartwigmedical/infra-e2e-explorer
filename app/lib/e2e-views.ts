@@ -136,8 +136,28 @@ const SLIM_FEATURES_COLUMNS = `{'uri': 'VARCHAR', 'name': 'VARCHAR', 'keyword': 
 // text/plain log as `log`. list_filter narrows to the text/plain embedding
 // BEFORE from_base64, so the zip blob is
 // never decoded, and NULL-safe (no `after`/no text/plain embedding -> NULL log).
-const SLIM_ELEMENTS_REBUILD = `list_transform(elements, e -> struct_pack(
-    id := e.id,
+//
+// This is ALSO where a scenario's id is made unique. Cucumber's legacy JSON
+// formatter emits the SAME id for every example of a Scenario Outline that has
+// more than one unnamed Examples block; the source line is the only per-example
+// identity in that format. So a scenario whose id already appeared EARLIER in
+// this feature's element list gets its line appended (`<id>;;line-<n>`), while
+// the first occurrence keeps the bare id - preserving its cross-run history.
+//
+// Doing it here, over one feature's `elements` array, is what makes `e.id`
+// unique by construction in the cached Parquet: every consumer (v_scenarios,
+// test_ids, the logs route) reads a scenario identity that is already correct
+// and none of them has to re-derive it. `elements[1:i - 1]` is the prefix before
+// the current element (empty when i = 1), and backgrounds - which carry a NULL
+// id - are excluded from both sides of the comparison.
+const SLIM_ELEMENTS_REBUILD = `list_transform(elements, (e, i) -> struct_pack(
+    id := CASE
+            WHEN e."type" = 'scenario'
+             AND len(list_filter(elements[1:i - 1],
+                                 p -> p."type" = 'scenario' AND p.id = e.id)) > 0
+            THEN e.id || ';;line-' || cast(e.line AS VARCHAR)
+            ELSE e.id
+          END,
     name := e.name,
     line := e.line,
     "type" := e."type",
@@ -175,7 +195,7 @@ const SLIM_ELEMENTS_REBUILD = `list_transform(elements, e -> struct_pack(
  * cached data (status/background/test-id/service-version logic, the
  * scenarios/steps derivation) - that re-runs against the cache every rebuild.
  */
-export const CACHE_VERSION = "1";
+export const CACHE_VERSION = "2";
 
 /** One entry of the run list, used to build the `runs` table in memory. */
 export interface RunListEntry {
@@ -373,7 +393,7 @@ export function buildStepsSelectSql(scenariosRelation: string): string {
   return `
 SELECT sc.run_id, sc.feature_uri, sc.scenario_id, sc.scenario_name,
   trim(s.keyword) || ' ' || s.name AS step_label, s.name AS step_name, trim(s.keyword) AS step_keyword,
-  row_number() OVER (PARTITION BY sc.run_id, sc.scenario_id ORDER BY s.line) AS step_ordinal,
+  row_number() OVER (PARTITION BY sc.run_id, sc.feature_uri, sc.scenario_id ORDER BY s.line) AS step_ordinal,
   s.is_background AS is_background,
   s.result.status AS status,
   s.result.duration / 1e9 AS duration_s,
@@ -393,11 +413,17 @@ CREATE OR REPLACE VIEW v_steps AS ${buildStepsSelectSql("v_scenarios")};`;
 }
 
 /**
- * Build the (run_id, scenario_id, test_id) SELECT, pulling the "Log of test
- * <id>" id out of each scenario's after-hook text/plain log embedding NAME.
+ * Build the (run_id, feature_uri, scenario_id, test_id) SELECT, pulling the
+ * "Log of test <id>" id out of each scenario's after-hook text/plain log
+ * embedding NAME.
  * Reads from v_features (the cached Parquet) - which already dropped the base64
  * `data` - so this is a single cheap pass over all runs, no batching needed
  * (unlike the old raw-JSON extraction, which had to batch to bound parse memory).
+ *
+ * The inner subquery projects only `e.id`/`e.after` rather than selecting the
+ * whole element struct: that lets DuckDB prune the other struct fields at the
+ * Parquet reader, so the heavy `steps` list and the decoded `log` are never read
+ * off disk for this pass (measured ~13x faster than unnesting the full element).
  *
  * nullif('') because regexp_extract returns '' (not NULL) when the embedding
  * name doesn't match, so a scenario whose log name didn't parse becomes NULL
@@ -409,13 +435,14 @@ CREATE OR REPLACE VIEW v_steps AS ${buildStepsSelectSql("v_scenarios")};`;
  */
 export function buildTestIdsSelectSql(featuresRelation = "v_features"): string {
   return `
-SELECT f.run_id,
-       e.id AS scenario_id,
+SELECT run_id,
+       feature_uri,
+       scenario_id,
        nullif(
          regexp_extract(
            list_extract(
              list_filter(
-               flatten(list_transform(coalesce(e.after, []), h -> coalesce(h.embeddings, []))),
+               flatten(list_transform(coalesce(after_hooks, []), h -> coalesce(h.embeddings, []))),
                emb -> emb.mime_type = 'text/plain'
              ),
              1
@@ -423,9 +450,14 @@ SELECT f.run_id,
            'Log of test ([0-9]+)', 1
          ), ''
        ) AS test_id
-FROM ${featuresRelation} f,
-     UNNEST(f.elements) AS t(e)
-WHERE e.type = 'scenario'`;
+FROM (
+  SELECT run_id, feature_uri, e.id AS scenario_id, e.after AS after_hooks
+  FROM (
+    SELECT f.run_id, f.feature_uri, unnest(f.elements) AS e
+    FROM ${featuresRelation} f
+  )
+  WHERE e.type = 'scenario'
+)`;
 }
 
 // ---------------------------------------------------------------------------

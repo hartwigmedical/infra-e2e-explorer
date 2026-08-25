@@ -322,7 +322,7 @@ export class E2eStore {
           CREATE OR REPLACE TABLE scenarios AS
             SELECT sr.* EXCLUDE (steps), ti.test_id
             FROM v_scenarios sr
-            LEFT JOIN test_ids ti USING (run_id, scenario_id);
+            LEFT JOIN test_ids ti USING (run_id, feature_uri, scenario_id);
         `);
 
         // service_versions: analysis over the stored logs.

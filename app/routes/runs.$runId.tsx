@@ -153,7 +153,7 @@ async function loadOutOfWindow(runId: string) {
        SELECT sc.feature_uri, sc.feature_name, sc.scenario_id, sc.scenario_name, sc.ordinal,
               sc.tag_names, sc.duration_s, epoch_ms(sc.started_at)::DOUBLE AS started_ms,
               sc.status, ti.test_id
-         FROM sc LEFT JOIN ti ON ti.run_id = sc.run_id AND ti.scenario_id = sc.scenario_id`,
+         FROM sc LEFT JOIN ti USING (run_id, feature_uri, scenario_id)`,
     ),
     query<StepRow>(
       `SELECT feature_uri, scenario_id, scenario_name, step_label, step_ordinal, status,
