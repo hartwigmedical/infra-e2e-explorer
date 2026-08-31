@@ -1,12 +1,19 @@
 import {
   Fragment,
+  memo,
   useCallback,
+  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
-import { Link, useLoaderData, useSearchParams } from "react-router";
+import {
+  Link,
+  useLoaderData,
+  useSearchParams,
+  type ShouldRevalidateFunctionArgs,
+} from "react-router";
 import {
   ArrowRight,
   ChevronRight,
@@ -428,6 +435,14 @@ function buildScenarioIdentitySql(
   `;
 }
 
+/** Whether a URL needs the stability metric's extra data. `status` vs
+ *  `duration` is a purely client-side rendering choice over rows the loader
+ *  already returns; only `stability` pulls the service-version rows. Shared
+ *  with `shouldRevalidate` so the two can't drift apart. */
+function needsStabilityData(params: URLSearchParams): boolean {
+  return params.get("metric") === "stability";
+}
+
 /**
  * Load matrix + (optionally) a selected scenario's history server-side. Mirrors
  * the SPA's conditional loading, keyed on the URL (feature/scenario/metric are
@@ -442,7 +457,7 @@ export async function loader({ request }: Route.LoaderArgs) {
   const feature = safeDecodeURIComponent(url.searchParams.get("feature"));
   const scenario = safeDecodeURIComponent(url.searchParams.get("scenario"));
   const wantsSelection = feature !== null && scenario !== null;
-  const needsStability = url.searchParams.get("metric") === "stability";
+  const needsStability = needsStabilityData(url.searchParams);
   const recentRuns = recentRunsFromRequest(request);
 
   const matrix =
@@ -468,6 +483,40 @@ export async function loader({ request }: Route.LoaderArgs) {
   }
 
   return { matrix, versions, identity, history, steps, recentRuns, totalRuns };
+}
+
+/** The only search params the loader above reads. Everything else this page
+ *  puts in the URL - the search box, the run x status filter, tags, the focused
+ *  step - is applied CLIENT-SIDE over data the loader already returned. */
+const LOADER_PARAMS = ["feature", "scenario", RUNS_PARAM];
+
+/** What a URL is worth re-fetching for: the params the loader reads, plus the
+ *  one metric distinction it actually branches on. */
+function loaderKey(url: URL): string {
+  return [
+    ...LOADER_PARAMS.map((p) => url.searchParams.get(p) ?? ""),
+    String(needsStabilityData(url.searchParams)),
+  ].join("\u0000");
+}
+
+/**
+ * Don't re-run the loader for a navigation that only changed a client-side
+ * filter. By default any change to the search string revalidates, which made
+ * the search box cost a server round-trip PER KEYSTROKE - re-running the matrix
+ * query to return byte-identical data - and, because the input was bound to the
+ * URL, made every character wait on that response (the dropped keys).
+ */
+export function shouldRevalidate({
+  currentUrl,
+  nextUrl,
+  defaultShouldRevalidate,
+}: ShouldRevalidateFunctionArgs) {
+  // An unchanged URL means an explicit revalidation (UpdateWatcher's Refresh,
+  // BuildProgress) rather than a navigation - never suppress those.
+  if (currentUrl.toString() === nextUrl.toString())
+    return defaultShouldRevalidate;
+  if (currentUrl.pathname !== nextUrl.pathname) return defaultShouldRevalidate;
+  return loaderKey(currentUrl) !== loaderKey(nextUrl);
 }
 
 function formatRunDateTime(runId: string): string {
@@ -570,7 +619,12 @@ interface HeaderMenu {
 
 const MENU_W = 208;
 
-function ScenarioMatrix({
+/** How long typing has to settle before the search box writes `?q=` to the URL.
+ *  Long enough that a burst of typing is one navigation, short enough that the
+ *  URL is shareable by the time anyone reaches for it. */
+const SEARCH_URL_DEBOUNCE_MS = 300;
+
+function ScenarioMatrixImpl({
   groups,
   runIds,
   metric,
@@ -982,6 +1036,12 @@ function ScenarioMatrix({
     </>
   );
 }
+
+/** The matrix is ~2.5k cells (scenarios x runs), each with its own <Link>, so
+ *  re-rendering it is the page's dominant cost. Memoised on props: while the
+ *  deferred search value is unchanged, `groups` keeps its identity and a
+ *  keystroke re-renders only the toolbar. */
+const ScenarioMatrix = memo(ScenarioMatrixImpl);
 
 interface StepGridRow {
   step_ordinal: number;
@@ -1772,7 +1832,7 @@ export default function Scenarios() {
   // from the params; `patchFilters` (their only writer) uses replace so
   // typing/toggling doesn't pile up history. `nightly` defaults on, so its
   // param records only the off state (?nightly=0); `metric` defaults to status.
-  const search = searchParams.get("q") ?? "";
+  const urlSearch = searchParams.get("q") ?? "";
   // Nightly/all-runs scope is a global preference shared across pages (context,
   // not the URL), so it isn't reset when navigating here.
   const { nightlyOnly } = useRunScope();
@@ -1818,6 +1878,34 @@ export default function Scenarios() {
       patchFilters((p) => (value ? p.set("q", value) : p.delete("q"))),
     [patchFilters],
   );
+
+  // The search box is deliberately NOT bound straight to the URL. Writing `?q=`
+  // per keystroke makes every character a navigation, and a controlled input
+  // that can only echo once that navigation commits drops keys typed in the
+  // meantime. So: the input is local state (echoes immediately), the URL is
+  // written on a debounce (deep links, Back and ?q= sharing all still work),
+  // and the matrix filters off a DEFERRED copy - so the expensive table
+  // re-renders at low priority, behind the keystroke, instead of blocking it.
+  const [searchInput, setSearchInput] = useState(urlSearch);
+  const search = useDeferredValue(searchInput);
+  // The last value we ourselves wrote to the URL. Lets the sync below tell an
+  // external change (Back/Forward, a deep link) - which should adopt the URL -
+  // from our own debounced write landing, which must not clobber anything
+  // typed since it was scheduled.
+  const pushedSearch = useRef(urlSearch);
+  useEffect(() => {
+    if (urlSearch === pushedSearch.current) return;
+    pushedSearch.current = urlSearch;
+    setSearchInput(urlSearch);
+  }, [urlSearch]);
+  useEffect(() => {
+    if (searchInput === pushedSearch.current) return;
+    const timer = setTimeout(() => {
+      pushedSearch.current = searchInput;
+      setSearch(searchInput);
+    }, SEARCH_URL_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [searchInput, setSearch]);
   const setRunFilter = useCallback(
     (runId: string | null, s: StatusKind | null) =>
       patchFilters((p) => {
@@ -1873,7 +1961,12 @@ export default function Scenarios() {
     () => (rawMatrix ?? []).filter((r) => !nightlyOnly || r.is_nightly),
     [rawMatrix, nightlyOnly],
   );
-  const versionRows = rawVersions ?? [];
+  // Memoised, not a bare `rawVersions ?? []`: that fallback allocates a fresh
+  // array on EVERY render, which invalidated `runFlagsByRunId` below, which
+  // changed the `runFlags` prop, which defeated ScenarioMatrix's memo - so the
+  // whole ~1.7k-cell table re-reconciled on every keystroke even though nothing
+  // it renders had changed.
+  const versionRows = useMemo(() => rawVersions ?? [], [rawVersions]);
 
   // Selected scenario's per-run history + step history, nightly-filtered here so
   // the detail panel stays presentational.
@@ -1889,7 +1982,10 @@ export default function Scenarios() {
   // Identity is resolved by the loader independently of nightly/search/tag
   // filters, so a deep-linked scenario stays selected even when those filters
   // would hide it from the matrix.
-  const identityRows = identity ?? [];
+  // Memoised for the same reason as `versionRows` above: `selected` and
+  // `selectedTagsList` derive from it, and a fresh array each render would make
+  // both change identity on every render of the detail view.
+  const identityRows = useMemo(() => identity ?? [], [identity]);
 
   const selected = useMemo<SelectedScenario | null>(() => {
     const row = identityRows[0];
@@ -2184,8 +2280,8 @@ export default function Scenarios() {
               <input
                 type="text"
                 name="scenario-search"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
                 placeholder="Search scenarios…"
                 className="w-full rounded border bg-background px-2 py-1.5 pl-7 text-sm outline-none focus:ring-1 focus:ring-ring"
               />

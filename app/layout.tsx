@@ -1,4 +1,10 @@
-import { Link, Outlet, useLoaderData, useLocation } from "react-router";
+import {
+  Link,
+  Outlet,
+  useLoaderData,
+  useLocation,
+  type ShouldRevalidateFunctionArgs,
+} from "react-router";
 import type { Route } from "./+types/layout";
 import { RunScopeProvider } from "~/contexts/RunScopeContext";
 import BuildProgress from "~/components/BuildProgress";
@@ -40,6 +46,24 @@ export async function loader() {
     range: range ?? { oldest: null, newest: null },
     daily,
   };
+}
+
+/**
+ * The shell loader takes no request - its data describes the DATASET, not the
+ * page - so a navigation that only changes search params has nothing to
+ * re-fetch. Without this, every filter change on a page (the Scenarios search
+ * box especially) still paid for a shell round-trip. Page-to-page navigation
+ * and explicit revalidations (BuildProgress's poll, UpdateWatcher's Refresh -
+ * both same-URL) still refresh it.
+ */
+export function shouldRevalidate({
+  currentUrl,
+  nextUrl,
+  defaultShouldRevalidate,
+}: ShouldRevalidateFunctionArgs) {
+  if (currentUrl.toString() === nextUrl.toString())
+    return defaultShouldRevalidate;
+  return currentUrl.pathname !== nextUrl.pathname;
 }
 
 export type ShellData = Awaited<ReturnType<typeof loader>>;
