@@ -14,6 +14,7 @@ import {
   useLoaderData,
   useParams,
   useSearchParams,
+  type ShouldRevalidateFunctionArgs,
 } from "react-router";
 import {
   Boxes,
@@ -32,6 +33,7 @@ import {
 import { toast } from "sonner";
 import type { Route } from "./+types/runs.$runId";
 import { useRunScope } from "~/contexts/RunScopeContext";
+import { useUrlBackedTextFilter } from "~/hooks/useUrlBackedTextFilter";
 import {
   ensureData,
   loadOutOfWindowRun,
@@ -257,6 +259,29 @@ export async function loader({ params }: Route.LoaderArgs) {
     svcAll,
     svcNightly,
   };
+}
+
+/**
+ * The loader above takes `params` only - it reads NOTHING from the URL's search
+ * string. Every filter this page puts there (the test-id box, tags, status and
+ * change filters, the `?scenario=`/`?step=` focus) is applied client-side over
+ * data it already returned, so re-running it for those was pure waste: the
+ * test-id box cost a full run reload - scenarios, steps, two previous-run
+ * comparisons and two service diffs - on every keystroke.
+ *
+ * Only a different run needs new data. An unchanged URL means an explicit
+ * revalidation (UpdateWatcher's Refresh, BuildProgress) - never suppress those.
+ */
+export function shouldRevalidate({
+  currentUrl,
+  nextUrl,
+  currentParams,
+  nextParams,
+  defaultShouldRevalidate,
+}: ShouldRevalidateFunctionArgs) {
+  if (currentUrl.toString() === nextUrl.toString())
+    return defaultShouldRevalidate;
+  return currentParams.runId !== nextParams.runId;
 }
 
 interface ScenarioRow {
@@ -1355,7 +1380,7 @@ export default function RunDetail() {
         ),
     [searchParams],
   );
-  const testIdQuery = searchParams.get("testId") ?? "";
+  const urlTestIdQuery = searchParams.get("testId") ?? "";
   const selectedTags = useMemo(
     () => searchParams.getAll("tag"),
     [searchParams],
@@ -1405,6 +1430,12 @@ export default function RunDetail() {
         value ? p.set("testId", value) : p.delete("testId"),
       ),
     [patchFilters],
+  );
+  // `testIdQuery` is the DEFERRED value the scenario list filters on;
+  // `testIdInput` is what the box shows. See the hook for why they differ.
+  const [testIdInput, setTestIdInput, testIdQuery] = useUrlBackedTextFilter(
+    urlTestIdQuery,
+    setTestIdQuery,
   );
   const setSelectedTags = useCallback(
     (tags: string[]) =>
@@ -2053,8 +2084,8 @@ export default function RunDetail() {
               ref={testIdInputRef}
               type="text"
               name="test-id-search"
-              value={testIdQuery}
-              onChange={(e) => setTestIdQuery(e.target.value)}
+              value={testIdInput}
+              onChange={(e) => setTestIdInput(e.target.value)}
               placeholder="Search test ID…"
               className="w-40 rounded-md border bg-background py-1 pr-2 pl-7 text-sm outline-none focus:ring-1 focus:ring-ring"
             />

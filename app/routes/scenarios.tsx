@@ -2,7 +2,6 @@ import {
   Fragment,
   memo,
   useCallback,
-  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
@@ -42,6 +41,7 @@ import {
   type RunDeployFlags,
 } from "~/lib/deployments";
 import { cn } from "~/lib/utils";
+import { useUrlBackedTextFilter } from "~/hooks/useUrlBackedTextFilter";
 
 /** Which metric the matrix body shows: run pass/fail status, run duration, or
  *  "stability" — annotating each scenario's status changes as flaky or not. */
@@ -618,11 +618,6 @@ interface HeaderMenu {
 }
 
 const MENU_W = 208;
-
-/** How long typing has to settle before the search box writes `?q=` to the URL.
- *  Long enough that a burst of typing is one navigation, short enough that the
- *  URL is shareable by the time anyone reaches for it. */
-const SEARCH_URL_DEBOUNCE_MS = 300;
 
 function ScenarioMatrixImpl({
   groups,
@@ -1879,33 +1874,12 @@ export default function Scenarios() {
     [patchFilters],
   );
 
-  // The search box is deliberately NOT bound straight to the URL. Writing `?q=`
-  // per keystroke makes every character a navigation, and a controlled input
-  // that can only echo once that navigation commits drops keys typed in the
-  // meantime. So: the input is local state (echoes immediately), the URL is
-  // written on a debounce (deep links, Back and ?q= sharing all still work),
-  // and the matrix filters off a DEFERRED copy - so the expensive table
-  // re-renders at low priority, behind the keystroke, instead of blocking it.
-  const [searchInput, setSearchInput] = useState(urlSearch);
-  const search = useDeferredValue(searchInput);
-  // The last value we ourselves wrote to the URL. Lets the sync below tell an
-  // external change (Back/Forward, a deep link) - which should adopt the URL -
-  // from our own debounced write landing, which must not clobber anything
-  // typed since it was scheduled.
-  const pushedSearch = useRef(urlSearch);
-  useEffect(() => {
-    if (urlSearch === pushedSearch.current) return;
-    pushedSearch.current = urlSearch;
-    setSearchInput(urlSearch);
-  }, [urlSearch]);
-  useEffect(() => {
-    if (searchInput === pushedSearch.current) return;
-    const timer = setTimeout(() => {
-      pushedSearch.current = searchInput;
-      setSearch(searchInput);
-    }, SEARCH_URL_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
-  }, [searchInput, setSearch]);
+  // `search` is the DEFERRED value the matrix filters on; `searchInput` is what
+  // the box shows. See the hook for why the two are separate.
+  const [searchInput, setSearchInput, search] = useUrlBackedTextFilter(
+    urlSearch,
+    setSearch,
+  );
   const setRunFilter = useCallback(
     (runId: string | null, s: StatusKind | null) =>
       patchFilters((p) => {

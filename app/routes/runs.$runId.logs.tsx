@@ -1,4 +1,4 @@
-import { redirect } from "react-router";
+import { redirect, type ShouldRevalidateFunctionArgs } from "react-router";
 import type { Route } from "./+types/runs.$runId.logs";
 import {
   ensureData,
@@ -67,4 +67,24 @@ export async function loader({ params, request }: Route.LoaderArgs) {
       error: "Could not load logs for this run.",
     };
   }
+}
+
+/**
+ * Fetcher loads revalidate after a navigation by default, and run detail turns
+ * every filter change into one - so with a log panel open, each keystroke in the
+ * test-id box re-downloaded this whole payload (the decoded logs for every
+ * scenario in the run). Nothing here reads the search string beyond the
+ * `?fetch=1` marker, so only a different run is worth re-reading; the run-detail
+ * component clears its log panels on a run change anyway.
+ */
+export function shouldRevalidate({
+  currentUrl,
+  nextUrl,
+  currentParams,
+  nextParams,
+  defaultShouldRevalidate,
+}: ShouldRevalidateFunctionArgs) {
+  if (currentUrl.toString() === nextUrl.toString())
+    return defaultShouldRevalidate;
+  return currentParams.runId !== nextParams.runId;
 }
