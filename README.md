@@ -275,79 +275,39 @@ docker run -p 3001:3001 -e PORT=3001 -e E2E_SOURCE=gcs e2e-explorer
 
 In production, attach credentials via workload identity (Cloud Run/GKE) rather than a key file.
 
-### Shipping a local build to Artifact Registry
+### Releasing
 
-The registry image is `europe-west4-docker.pkg.dev/hmf-build/hmf-docker/e2e-explorer` (Artifact
-Registry, `europe-west4`). Everything is compiled inside the Dockerfile, so no local build first.
+Pushing a version tag `X.Y.Z` starts the `infra-e2e-explorer` Cloud Build trigger in `hmf-build`. It runs
+`cloudbuild.yaml`, which sets the version from the tag and publishes
+`europe-west4-docker.pkg.dev/hmf-build/hmf-docker/e2e-explorer:X.Y.Z` through docker-tag. Tags in
+`hmf-docker` are immutable, so a published version can't be rebuilt: release the next one instead.
 
-1. **Authenticate once per machine:**
-
-   ```bash
-   gcloud auth login                                        # if not already logged in
-   gcloud auth configure-docker europe-west4-docker.pkg.dev # one-time Docker credential helper
-   ```
-
-2. **Bump the version** if this is a new release. Use `npm version` (it updates the lockfile and
-   creates a matching `vX.Y.Z` git tag, which the Cloud Build path keys off). It refuses a dirty
-   tree, so commit or stash first:
+1. **Smoke-test a local build.** On Apple silicon add `--platform linux/amd64` to match the runtime:
 
    ```bash
-   npm version patch   # 0.5.0 -> 0.5.1  (minor/major for features/breaking)
-   ```
-
-3. **Set the image and tag:**
-
-   ```bash
-   IMAGE=europe-west4-docker.pkg.dev/hmf-build/hmf-docker/e2e-explorer
-   TAG=$(node -p "require('./package.json').version")
-   ```
-
-4. **Build.** On Apple silicon add `--platform linux/amd64` to match the runtime:
-
-   ```bash
-   docker build -f Dockerfile.server \
-     --platform linux/amd64 \
-     -t $IMAGE:$TAG -t ${IMAGE}:latest .
-   ```
-
-   The braces on `${IMAGE}:latest` are load-bearing in zsh (macOS default): `$IMAGE:latest` is
-   parsed as the `:l` lowercase modifier plus a literal `atest`, which silently tags a repo named
-   `e2e-exploreratest` instead.
-
-5. **Smoke-test the built image** before pushing:
-
-   ```bash
-   docker run --rm -p 3001:3001 -e PORT=3001 $IMAGE:$TAG
+   docker build -f Dockerfile.server --platform linux/amd64 -t e2e-explorer .
+   docker run --rm -p 3001:3001 -e PORT=3001 e2e-explorer
    # open http://localhost:3001 — Ctrl-C to stop
    ```
 
-6. **Push both tags:**
+2. **Bump the version.** `npm version` updates the lockfile, commits, and creates a matching `X.Y.Z`
+   git tag. It refuses a dirty tree, so commit or stash first:
 
    ```bash
-   docker push $IMAGE:$TAG
-   docker push ${IMAGE}:latest
+   npm version patch   # 0.6.3 -> 0.6.4  (minor/major for features/breaking)
    ```
 
-7. **Verify:**
+3. **Push the commit and the tag:**
 
    ```bash
-   gcloud artifacts docker tags list $IMAGE --project=hmf-build
+   git push && git push origin "$(node -p "require('./package.json').version")"
    ```
 
-### Cloud Build (CI alternative)
+4. **Verify** once the build has finished:
 
-A `cloudbuild.yaml` mirroring middle-layer's is included (same image). It bumps the version to
-`$TAG_NAME`, then builds and pushes:
-
-```bash
-gcloud builds submit --config=cloudbuild.yaml \
-  --substitutions=TAG_NAME=$(node -p "require('./package.json').version") \
-  --project=hmf-build
-```
-
-⚠️ Its `serviceAccount:` is a placeholder copied from middle-layer's — **TODO**: create/verify the
-equivalent Cloud Build service account for this repo before relying on it; it hasn't been run. The
-local flow above sidesteps that.
+   ```bash
+   gcloud artifacts docker tags list europe-west4-docker.pkg.dev/hmf-build/hmf-docker/e2e-explorer --project=hmf-build
+   ```
 
 ## Not done yet (deferred)
 
